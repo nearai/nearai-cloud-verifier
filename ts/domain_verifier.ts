@@ -374,8 +374,8 @@ async function checkCertificate(attestation: DomainAttestation) {
   }
 }
 
-async function checkDnsCAA(attestation: DomainAttestation) {
-  console.log('\n🔐 DNS CAA');
+async function checkDomainProtection(attestation: DomainAttestation) {
+  console.log('\n🔐 Domain protection');
   try {
     const acmeAccountUri = JSON.parse(attestation.acmeAccount).uri;
     const verified = await verifyDnsCAA(attestation.domain, acmeAccountUri);
@@ -448,8 +448,8 @@ async function verifyDomainAttestation(attestation: DomainAttestation): Promise<
   // 4. Verify SSL certificate
   await checkCertificate(attestation);
 
-  // 5. Verify ACME account URI (optional)
-  await checkDnsCAA(attestation);
+  // 5. Verify domain protection with DNS CAA record
+  await checkDomainProtection(attestation);
 }
 
 /**
