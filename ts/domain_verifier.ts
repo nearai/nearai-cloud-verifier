@@ -418,8 +418,6 @@ function checkReportData(attestation: DomainAttestation, intelResult: IntelResul
  * Verify domain attestation
  */
 async function verifyDomainAttestation(attestation: DomainAttestation): Promise<void> {
-  console.log('🔐 Attestation');
-
   if (!attestation.domain) {
     throw new Error(`Invalid domain: ${attestation.domain}`);
   }
