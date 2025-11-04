@@ -9,7 +9,7 @@ import socket
 import ssl
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 from urllib.parse import urlparse
 
 import requests
