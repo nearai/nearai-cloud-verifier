@@ -254,7 +254,6 @@ Verifies domain attestations for custom domain deployments. Fetches evidence fro
 3. **Docker Compose Manifest** - Displays compose manifest and verifies it matches the mr_config measurement
 4. **Sigstore Provenance** - Checks container image provenance links
 5. **SSL Certificate** - Verifies certificate chain integrity, validity period, and matches live server certificate fingerprint
-6. **DNS CAA Records** (TypeScript only) - Verifies DNS Certificate Authority Authorization records for domain control
 
 ### Setup
 
