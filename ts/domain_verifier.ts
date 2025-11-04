@@ -374,8 +374,8 @@ async function checkCertificate(attestation: DomainAttestation) {
   }
 }
 
-async function checkDomainProtection(attestation: DomainAttestation) {
-  console.log('\n🔐 Domain protection');
+async function checkDnsCAA(attestation: DomainAttestation) {
+  console.log('\n🔐 DNS CAA record');
   try {
     const acmeAccountUri = JSON.parse(attestation.acmeAccount).uri;
     const verified = await verifyDnsCAA(attestation.domain, acmeAccountUri);
@@ -386,7 +386,8 @@ async function checkDomainProtection(attestation: DomainAttestation) {
 }
 
 /**
- * Verify that TDX report data binds the signing address and request nonce
+ * Verify that the TDX report data binds the ACME account and certificate hashes (sha256sum).
+ * This ensures the attestation is cryptographically tied to the provided ACME account and certificate.
  */
 function checkReportData(attestation: DomainAttestation, intelResult: IntelResult): ReportDataResult {
   // Get expected report data from attestation
@@ -448,15 +449,15 @@ async function verifyDomainAttestation(attestation: DomainAttestation): Promise<
   // 4. Verify SSL certificate
   await checkCertificate(attestation);
 
-  // 5. Verify domain protection with DNS CAA record
-  await checkDomainProtection(attestation);
+  // 5. Verify DNS CAA record
+  await checkDnsCAA(attestation);
 }
 
 /**
  * Fetch domain attestations from /evidences/ directory
  */
 async function fetchDomainAttestation(): Promise<DomainAttestation> {
-  const domain = API_BASE.split('/').pop();
+  const domain = new URL(API_BASE).hostname;
   const evidencesUrl = `${API_BASE}/evidences/`;
 
   const sha256sumUrl = `${evidencesUrl}sha256sum.txt`;
