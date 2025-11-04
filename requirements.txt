@@ -1,3 +1,4 @@
 requests>=2.31.0
 eth-account>=0.11.0
 dcap-qvl>=0.3.2
+cryptography>=46.0.0
