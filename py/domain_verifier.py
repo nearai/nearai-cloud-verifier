@@ -571,9 +571,6 @@ async def verify_domain_attestation(attestation: DomainAttestation) -> None:
     # 4. Verify SSL certificate
     await check_certificate(attestation)
 
-    # 5. Verify DNS CAA record
-    await check_dns_caa(attestation)
-
 
 async def fetch_domain_attestation() -> DomainAttestation:
     """Fetch domain attestations from /evidences/ directory."""

@@ -448,9 +448,6 @@ async function verifyDomainAttestation(attestation: DomainAttestation): Promise<
 
   // 4. Verify SSL certificate
   await checkCertificate(attestation);
-
-  // 5. Verify DNS CAA record
-  await checkDnsCAA(attestation);
 }
 
 /**
