@@ -5,6 +5,7 @@
  */
 
 import * as crypto from 'crypto';
+import { Buffer } from 'buffer';
 
 import {
   js_verify,
@@ -15,15 +16,18 @@ const API_BASE = process.env.BASE_URL || "https://cloud-api.near.ai";
 const GPU_VERIFIER_API = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 const SIGSTORE_SEARCH_BASE = "https://search.sigstore.dev/?hash=";
 
-interface AttestationReport {
-  signing_address: string;
+interface AttestationBaseInfo {
   intel_quote: string;
-  nvidia_payload: string;
   info: {
     tcb_info: string | {
       app_compose: string;
     };
   };
+}
+
+interface AttestationReport extends AttestationBaseInfo {
+  signing_address: string;
+  nvidia_payload: string;
   signing_algo?: string;
   all_attestations?: AttestationReport[];
   model_attestations?: AttestationReport[];
@@ -199,7 +203,7 @@ async function checkGpu(attestation: AttestationReport, requestNonce: string): P
   };
 }
 
-async function checkTdxQuote(attestation: AttestationReport): Promise<IntelResult> {
+async function checkTdxQuote(attestation: AttestationBaseInfo): Promise<IntelResult> {
   try {
     const rawQuote = Buffer.from(attestation.intel_quote, 'hex');
     const now = BigInt(Math.floor(Date.now() / 1000));
@@ -303,7 +307,7 @@ async function checkSigstoreLinks(links: string[]): Promise<Array<[string, boole
 /**
  * Extract and display Sigstore provenance links from attestation
  */
-async function showSigstoreProvenance(attestation: AttestationReport): Promise<void> {
+async function showSigstoreProvenance(attestation: AttestationBaseInfo): Promise<void> {
   let tcbInfo = attestation.info.tcb_info;
   if (typeof tcbInfo === 'string') {
     tcbInfo = JSON.parse(tcbInfo);
@@ -335,7 +339,7 @@ async function showSigstoreProvenance(attestation: AttestationReport): Promise<v
 /**
  * Display the Docker compose manifest and verify against mr_config from verified quote
  */
-function showCompose(attestation: AttestationReport, intelResult: IntelResult): void {
+function showCompose(attestation: AttestationBaseInfo, intelResult: IntelResult): void {
   let tcbInfo = attestation.info.tcb_info;
   if (typeof tcbInfo === 'string') {
     tcbInfo = JSON.parse(tcbInfo);
@@ -443,6 +447,7 @@ export {
   verifyAttestation,
   showSigstoreProvenance,
   showCompose,
+  AttestationBaseInfo,
   AttestationReport,
   IntelResult,
   ReportDataResult,
