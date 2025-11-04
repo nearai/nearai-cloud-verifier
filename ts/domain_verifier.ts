@@ -374,6 +374,16 @@ async function checkCertificate(attestation: DomainAttestation) {
   }
 }
 
+async function checkDnsCAA(attestation: DomainAttestation) {
+  console.log('\n🔐 DNS CAA');
+  try {
+    const verified = await verifyDnsCAA(attestation.domain, attestation.acmeAccount);
+    console.log('DNS CAA verified:', verified);
+  } catch (error) {
+    console.log('Failed to verify DNS CAA:', error);
+  }
+}
+
 /**
  * Verify that TDX report data binds the signing address and request nonce
  */
@@ -438,8 +448,7 @@ async function verifyDomainAttestation(attestation: DomainAttestation): Promise<
   await checkCertificate(attestation);
 
   // 5. Verify ACME account URI (optional)
-
-
+  await checkDnsCAA(attestation);
 }
 
 /**
