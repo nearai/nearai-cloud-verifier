@@ -377,7 +377,8 @@ async function checkCertificate(attestation: DomainAttestation) {
 async function checkDnsCAA(attestation: DomainAttestation) {
   console.log('\n🔐 DNS CAA');
   try {
-    const verified = await verifyDnsCAA(attestation.domain, attestation.acmeAccount);
+    const acmeAccountUri = JSON.parse(attestation.acmeAccount).uri;
+    const verified = await verifyDnsCAA(attestation.domain, acmeAccountUri);
     console.log('DNS CAA verified:', verified);
   } catch (error) {
     console.log('Failed to verify DNS CAA:', error);
