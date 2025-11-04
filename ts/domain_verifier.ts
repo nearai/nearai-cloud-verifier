@@ -17,57 +17,6 @@ interface ReportDataResult {
   empty_bytes_matches: boolean;
 }
 
-/**
- * Verifies DNS CAA records for domain control.
- */
-export async function verifyDnsCAA(
-  domainName: string,
-  acmeAccountUri: string,
-): Promise<boolean> {
-  const dnsUrl = `https://dns.google/resolve?name=${domainName}&type=CAA`
-  try {
-    const dnsResponse = await fetch(dnsUrl)
-
-    if (!dnsResponse.ok) {
-      throw new Error(
-        `DNS CAA query failed for domain '${domainName}': ${dnsResponse.status} ${dnsResponse.statusText} (URL: ${dnsUrl})`,
-      )
-    }
-
-    const { Answer: dnsRecords } = (await dnsResponse.json()) as {
-      Answer?: Array<{ type: number; data?: string }>
-    }
-
-    const caaRecords = dnsRecords?.filter((record) => record.type === 257) ?? []
-
-    if (caaRecords.length === 0) {
-      throw new Error(
-        `No CAA records found for domain '${domainName}' - domain does not have Certificate Authority Authorization configured`,
-      )
-    }
-
-    const hasMatchingRecord = caaRecords.every((record) =>
-      record.data?.includes(acmeAccountUri),
-    )
-    if (!hasMatchingRecord) {
-      throw new Error(
-        `CAA records for domain '${domainName}' do not authorize ACME account '${acmeAccountUri}' - found records: ${JSON.stringify(caaRecords.map((r) => r.data))}`,
-      )
-    }
-
-    return true
-  } catch (error) {
-    const errorMessage =
-      error instanceof Error
-        ? error.message
-        : `Unknown DNS CAA verification error for domain '${domainName}'`
-    console.error('DNS CAA verification error:', errorMessage)
-    throw new Error(`DNS CAA verification failed: ${errorMessage}`)
-  }
-}
-
-// Helper functions
-
 function parseCertificateChain(certChainPem: string): X509Certificate[] {
   const pemCertificateRegex =
     /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g
@@ -371,6 +320,56 @@ async function checkCertificate(attestation: DomainAttestation) {
     );
   } catch (error) {
     console.error('Failed to compare certificate fingerprints:', error);
+  }
+}
+
+
+/**
+ * Verifies DNS CAA records for domain control.
+ */
+export async function verifyDnsCAA(
+  domainName: string,
+  acmeAccountUri: string,
+): Promise<boolean> {
+  const dnsUrl = `https://dns.google/resolve?name=${domainName}&type=CAA`
+  try {
+    const dnsResponse = await fetch(dnsUrl)
+
+    if (!dnsResponse.ok) {
+      throw new Error(
+        `DNS CAA query failed for domain '${domainName}': ${dnsResponse.status} ${dnsResponse.statusText} (URL: ${dnsUrl})`,
+      )
+    }
+
+    const { Answer: dnsRecords } = (await dnsResponse.json()) as {
+      Answer?: Array<{ type: number; data?: string }>
+    }
+
+    const caaRecords = dnsRecords?.filter((record) => record.type === 257) ?? []
+
+    if (caaRecords.length === 0) {
+      throw new Error(
+        `No CAA records found for domain '${domainName}' - domain does not have Certificate Authority Authorization configured`,
+      )
+    }
+
+    const hasMatchingRecord = caaRecords.every((record) =>
+      record.data?.includes(acmeAccountUri),
+    )
+    if (!hasMatchingRecord) {
+      throw new Error(
+        `CAA records for domain '${domainName}' do not authorize ACME account '${acmeAccountUri}' - found records: ${JSON.stringify(caaRecords.map((r) => r.data))}`,
+      )
+    }
+
+    return true
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error
+        ? error.message
+        : `Unknown DNS CAA verification error for domain '${domainName}'`
+    console.error('DNS CAA verification error:', errorMessage)
+    throw new Error(`DNS CAA verification failed: ${errorMessage}`)
   }
 }
 

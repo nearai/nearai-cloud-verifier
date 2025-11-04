@@ -57,48 +57,6 @@ class ReportDataResult:
         self.empty_bytes_matches = empty_bytes_matches
 
 
-async def verify_dns_caa(domain_name: str, acme_account_uri: str) -> bool:
-    """Verify DNS CAA records for domain control."""
-    dns_url = f"https://dns.google/resolve?name={domain_name}&type=CAA"
-    try:
-        dns_response = requests.get(dns_url, timeout=10)
-
-        if not dns_response.ok:
-            raise Exception(
-                f"DNS CAA query failed for domain '{domain_name}': "
-                f"{dns_response.status_code} {dns_response.reason} (URL: {dns_url})"
-            )
-
-        dns_data = dns_response.json()
-        dns_records = dns_data.get("Answer", [])
-
-        caa_records = [record for record in dns_records if record.get("type") == 257]
-
-        if len(caa_records) == 0:
-            raise Exception(
-                f"No CAA records found for domain '{domain_name}' - "
-                "domain does not have Certificate Authority Authorization configured"
-            )
-
-        has_matching_record = all(
-            acme_account_uri in record.get("data", "") for record in caa_records
-        )
-        if not has_matching_record:
-            raise Exception(
-                f"CAA records for domain '{domain_name}' do not authorize "
-                f"ACME account '{acme_account_uri}' - found records: "
-                f"{json.dumps([r.get('data') for r in caa_records])}"
-            )
-
-        return True
-    except Exception as error:
-        error_message = (
-            str(error) if isinstance(error, Exception) else f"Unknown DNS CAA verification error for domain '{domain_name}'"
-        )
-        print(f"DNS CAA verification error: {error_message}")
-        raise Exception(f"DNS CAA verification failed: {error_message}")
-
-
 def parse_certificate_chain(cert_chain_pem: str) -> List[x509.Certificate]:
     """Parse PEM certificate chain into list of X509 certificates."""
     pem_certificate_regex = r"-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----"
@@ -476,6 +434,48 @@ async def check_certificate(attestation: DomainAttestation) -> None:
         await compare_certificate_fingerprints(attestation.domain, attestation.cert)
     except Exception as error:
         print(f"Failed to compare certificate fingerprints: {error}")
+
+
+async def verify_dns_caa(domain_name: str, acme_account_uri: str) -> bool:
+    """Verify DNS CAA records for domain control."""
+    dns_url = f"https://dns.google/resolve?name={domain_name}&type=CAA"
+    try:
+        dns_response = requests.get(dns_url, timeout=10)
+
+        if not dns_response.ok:
+            raise Exception(
+                f"DNS CAA query failed for domain '{domain_name}': "
+                f"{dns_response.status_code} {dns_response.reason} (URL: {dns_url})"
+            )
+
+        dns_data = dns_response.json()
+        dns_records = dns_data.get("Answer", [])
+
+        caa_records = [record for record in dns_records if record.get("type") == 257]
+
+        if len(caa_records) == 0:
+            raise Exception(
+                f"No CAA records found for domain '{domain_name}' - "
+                "domain does not have Certificate Authority Authorization configured"
+            )
+
+        has_matching_record = all(
+            acme_account_uri in record.get("data", "") for record in caa_records
+        )
+        if not has_matching_record:
+            raise Exception(
+                f"CAA records for domain '{domain_name}' do not authorize "
+                f"ACME account '{acme_account_uri}' - found records: "
+                f"{json.dumps([r.get('data') for r in caa_records])}"
+            )
+
+        return True
+    except Exception as error:
+        error_message = (
+            str(error) if isinstance(error, Exception) else f"Unknown DNS CAA verification error for domain '{domain_name}'"
+        )
+        print(f"DNS CAA verification error: {error_message}")
+        raise Exception(f"DNS CAA verification failed: {error_message}")
 
 
 async def check_dns_caa(attestation: DomainAttestation) -> None:
