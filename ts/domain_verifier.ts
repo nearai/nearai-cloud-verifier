@@ -411,7 +411,7 @@ function checkReportData(attestation: DomainAttestation, intelResult: IntelResul
   if (!sha256sumFileMatches) {
     console.log('sha256sum.txt file:', 'expected:', expectedSha256sumFile, 'actual:', attestation.sha256sum);
   }
-  console.log('Report data binds sha256sum:', sha256sumMatches);
+  console.log('Report data embeds sha256sum:', sha256sumMatches);
   if (!sha256sumMatches) {
     console.log('Report data sha256sum:', 'expected:', expectedSha256sum, 'actual:', embeddedSha256sum);
   }

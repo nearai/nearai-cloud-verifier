@@ -16,7 +16,8 @@ Python and TypeScript tools for validating NEAR AI Cloud attestation reports and
 - ✅ **Intel TDX Quote Validation** - Verify CPU TEE measurements
 - 🔑 **ECDSA Signature Verification** - Validate signed AI responses
 - 📦 **Sigstore Provenance** - Container supply chain verification
-- 🌐 **Multi-Server Support** - Load balancer attestation aggregation
+- 🌐 **Domain Verification** - Verify custom domain SSL certificates
+- 🔗 **Multi-Server Support** - Load balancer attestation aggregation
 
 ## 📋 Requirements
 
@@ -24,7 +25,7 @@ Python and TypeScript tools for validating NEAR AI Cloud attestation reports and
 
 ### Python
 - Python 3.10+
-- `requests`, `eth-account`, `dcap-qvl`
+- `requests`, `eth-account`, `dcap-qvl`, `cryptography`
 
 ### TypeScript
 - Node.js 20+
@@ -71,6 +72,18 @@ python3 py/chat_verifier.py --model deepseek-v3.1
 
 # TypeScript
 pnpm run chat -- --model deepseek-v3.1
+```
+
+### Domain Verification
+
+```bash
+export BASE_URL=https://cloud-api.near.ai  # or your custom domain
+
+# Python
+python3 py/domain_verifier.py
+
+# TypeScript
+pnpm run domain
 ```
 
 ## 🔐 Model Verifier
@@ -232,6 +245,95 @@ pnpm run model -- [--model MODEL_NAME]
 - ✅ **GPU Attestation** - Passes NVIDIA verification
 - ✅ **Intel TDX Quote** - Valid CPU TEE measurements
 
+## 🌐 Domain Verifier
+
+Verifies domain attestations for custom domain deployments. Fetches evidence from the `/evidences/` directory and validates:
+
+1. **Intel TDX Quote** - Verifies TDX quote with [`dcap-qvl`](https://github.com/Phala-Network/dcap-qvl) library
+2. **TDX Report Data** - Validates that report data binds the ACME account and certificate hashes (sha256sum)
+3. **Docker Compose Manifest** - Displays compose manifest and verifies it matches the mr_config measurement
+4. **Sigstore Provenance** - Checks container image provenance links
+5. **SSL Certificate** - Verifies certificate chain integrity, validity period, and matches live server certificate fingerprint
+6. **DNS CAA Records** (TypeScript only) - Verifies DNS Certificate Authority Authorization records for domain control
+
+### Setup
+
+Set the base URL environment variable (defaults to `https://cloud-api.near.ai`):
+
+```bash
+export BASE_URL=https://your-domain.near.ai
+```
+
+Or create a `.env` file:
+
+```bash
+BASE_URL=https://your-domain.near.ai
+```
+
+Then run:
+
+```bash
+# Python
+python3 py/domain_verifier.py
+
+# TypeScript
+pnpm run domain
+```
+
+### What It Verifies
+
+- ✅ **TDX Quote Integrity** - Valid CPU TEE measurements via Intel TDX
+- ✅ **Report Data Binding** - ACME account and certificate hashes cryptographically bound to hardware
+- ✅ **Certificate Chain** - Valid SSL certificate chain with trusted root CA
+- ✅ **Certificate Validity** - Certificate is not expired and within validity period
+- ✅ **Live Certificate Match** - Evidence certificate fingerprint matches live server certificate
+- ✅ **Compose Manifest** - Docker compose hash matches mr_config measurement
+- ✅ **Container Provenance** - Sigstore links accessible for container images
+
+### Example Output
+
+```
+========================================
+🔐 Domain Attestation
+========================================
+
+🔐 TDX report data
+sha256sum.txt file matches: True
+Report data embeds sha256sum: True
+Report data embeds empty bytes: True
+
+Docker compose manifest attested by the enclave:
+services:
+  dstack-ingress:
+    image: nearaidev/dstack-ingress-vpc@sha256:cf9f52ec3e3a45750b88f71ba6d057dab0b4fee0d0e7dc78c42bcc5ce34094ee
+    ...
+
+Compose sha256: abc123...
+mr_config (from verified quote): 0x01abc123...
+mr_config matches compose hash: True
+
+🔐 Sigstore provenance
+Checking Sigstore accessibility for container images...
+  ✓ https://search.sigstore.dev/?hash=sha256:cf9f52ec... (HTTP 200)
+
+🔐 SSL certificate
+Certificate public key: 3059301306072a8648ce3d0...
+Certificate verified: True
+Fetching certificate from live server: cloud-api.near.ai:443
+Fingerprints match: True
+```
+
+### Evidence Files
+
+The domain verifier fetches the following evidence files from `/evidences/`:
+
+- `sha256sum.txt` - SHA256 checksums of ACME account and certificate
+- `acme-account.json` - ACME account information
+- `cert-{domain}.pem` - SSL certificate chain in PEM format
+- `quote.json` - Intel TDX quote
+- `info.json` - TCB information including Docker compose manifest
+
+These files are served by the TEE-protected ingress service and cryptographically bound to the hardware via TDX report data.
 
 ## 📦 Sigstore Provenance
 
@@ -354,6 +456,18 @@ python3 py/chat_verifier.py --model deepseek-v3.1
 pnpm run chat -- --model deepseek-v3.1
 ```
 
+### Domain Verification
+
+```bash
+export BASE_URL=https://your-domain.near.ai
+
+# Python
+python3 py/domain_verifier.py
+
+# TypeScript
+pnpm run domain
+```
+
 ### Programmatic Usage
 
 #### Python
@@ -409,6 +523,7 @@ These verifiers work with [NEAR AI Cloud Gateway](https://github.com/nearai-clou
 
 - `GET /v1/attestation/report` - Get TEE attestation
 - `GET /v1/signature/{chat_id}` - Get response signature
+- `GET /evidences/{file}` - Get domain attestation evidence files (sha256sum.txt, acme-account.json, cert-{domain}.pem, quote.json, info.json)
 
 ## 🤝 Contributing
 
@@ -425,10 +540,12 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 # Test Python verifiers
 python3 py/model_verifier.py --model deepseek-v3.1
 python3 py/chat_verifier.py --model deepseek-v3.1
+python3 py/domain_verifier.py
 
 # Test TypeScript verifiers
 pnpm run model -- --model deepseek-v3.1
 pnpm run chat -- --model deepseek-v3.1
+pnpm run domain
 ```
 
 5. Commit your changes (`git commit -m 'Add amazing feature'`)

@@ -522,7 +522,7 @@ def check_report_data(
             "actual:",
             attestation.sha256sum,
         )
-    print("Report data binds sha256sum:", sha256sum_matches)
+    print("Report data embeds sha256sum:", sha256sum_matches)
     if not sha256sum_matches:
         print(
             "Report data sha256sum:",
