@@ -138,7 +138,7 @@ function fetchLiveCertificate(domain: string, port: number = 443): Promise<X509C
       resolved = true;
 
       try {
-        let cert = socket.getPeerX509Certificate();
+        const cert = socket.getPeerX509Certificate();
         socket.end();
 
         if (!cert) {
