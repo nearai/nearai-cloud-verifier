@@ -129,25 +129,51 @@ function fetchLiveCertificate(domain: string, port: number = 443): Promise<X509C
     const socket = tls.connect(port, domain, {
       servername: domain,
       rejectUnauthorized: false, // We're just fetching the cert, not verifying it
-    }, () => {
+    });
+
+    let resolved = false;
+
+    socket.on('secureConnect', () => {
+      if (resolved) return;
+      resolved = true;
+
       try {
-        let x509Certificate = socket.getPeerX509Certificate();
-        if (!x509Certificate) {
+        let cert = socket.getPeerX509Certificate();
+        socket.end();
+
+        if (!cert) {
           reject(new Error('Failed to get certificate from server'));
           return;
         }
+
+        const base64 = cert.raw.toString('base64');
+        const base64Lines = base64.match(/.{1,64}/g);
+        if (!base64Lines) {
+          reject(new Error('Failed to encode certificate in PEM format'));
+          return;
+        }
+
         const pem = '-----BEGIN CERTIFICATE-----\n' +
-          x509Certificate.raw.toString('base64').match(/.{1,64}/g)?.join('\n') +
+          base64Lines.join('\n') +
           '\n-----END CERTIFICATE-----';
-        const x509Cert = new X509Certificate(pem);
-        resolve(x509Cert);
+        resolve(new X509Certificate(pem));
       } catch(error) {
-        reject(new Error(`Failed to parse certificate from server: 
-          ${error instanceof Error ? error.message : 'Unknown error'}`
-        ));
-      } finally {
-        socket.destroy();
+        socket.end();
+        reject(new Error(`Failed to parse certificate from server: ${error instanceof Error ? error.message : 'Unknown error'}`));
       }
+    });
+
+    socket.on('error', (error) => {
+      if (resolved) return;
+      resolved = true;
+      reject(new Error(`TLS connection failed: ${error.message}`));
+    });
+
+    socket.setTimeout(10000, () => {
+      if (resolved) return;
+      resolved = true;
+      socket.destroy();
+      reject(new Error('TLS connection timeout'));
     });
   });
 }
