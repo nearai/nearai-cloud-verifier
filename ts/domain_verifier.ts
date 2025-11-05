@@ -139,12 +139,14 @@ function fetchLiveCertificate(domain: string, port: number = 443): Promise<X509C
 
       try {
         const cert = socket.getPeerX509Certificate();
-        socket.end();
 
         if (!cert) {
+          socket.end();
           reject(new Error('Failed to get certificate from server'));
           return;
         }
+
+        socket.end();
 
         const base64 = cert.raw.toString('base64');
         const base64Lines = base64.match(/.{1,64}/g);
@@ -157,7 +159,7 @@ function fetchLiveCertificate(domain: string, port: number = 443): Promise<X509C
           base64Lines.join('\n') +
           '\n-----END CERTIFICATE-----';
         resolve(new X509Certificate(pem));
-      } catch(error) {
+      } catch (error) {
         socket.end();
         reject(new Error(`Failed to parse certificate from server: ${error instanceof Error ? error.message : 'Unknown error'}`));
       }
