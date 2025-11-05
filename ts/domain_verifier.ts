@@ -1,7 +1,7 @@
 import { AttestationBaseInfo, checkTdxQuote, IntelResult, showCompose, showSigstoreProvenance } from "./model_verifier";
-import { createHash, X509Certificate } from 'node:crypto'
+import { createHash, X509Certificate } from 'crypto'
 import { Buffer } from 'buffer';
-import * as tls from 'node:tls';
+import * as tls from 'tls';
 
 const API_BASE: string = process.env.BASE_URL || "https://cloud-api.near.ai";
 
@@ -124,7 +124,7 @@ function getCertificateFingerprint(cert: X509Certificate): string {
 /**
  * Fetches the certificate from a live server via TLS connection
  */
-async function fetchLiveCertificate(domain: string, port: number = 443): Promise<X509Certificate> {
+function fetchLiveCertificate(domain: string, port: number = 443): Promise<X509Certificate> {
   return new Promise((resolve, reject) => {
     const socket = tls.connect(port, domain, {
       servername: domain,
@@ -138,9 +138,8 @@ async function fetchLiveCertificate(domain: string, port: number = 443): Promise
       resolved = true;
 
       try {
-        // Get the peer certificate (leaf certificate)
-        const cert = socket.getPeerCertificate(false); // false = just the peer cert
-        
+        const cert = socket.getPeerX509Certificate();
+
         if (!cert) {
           socket.end();
           reject(new Error('Failed to get certificate from server'));
@@ -149,28 +148,17 @@ async function fetchLiveCertificate(domain: string, port: number = 443): Promise
 
         socket.end();
 
-        // The cert object from Node.js TLS can be converted to PEM string
-        // Convert certificate object to PEM string
-        let pem: string;
-        if (typeof cert === 'string') {
-          pem = cert;
-        } else if ((cert as any).raw) {
-          // If raw Buffer is available, convert DER to PEM
-          const raw = (cert as any).raw as Buffer;
-          pem = '-----BEGIN CERTIFICATE-----\n' +
-            raw.toString('base64').match(/.{1,64}/g)?.join('\n') +
-            '\n-----END CERTIFICATE-----';
-        } else {
-          throw new Error('Certificate object format not recognized');
+        const base64 = cert.raw.toString('base64');
+        const base64Lines = base64.match(/.{1,64}/g);
+        if (!base64Lines) {
+          reject(new Error('Failed to encode certificate in PEM format'));
+          return;
         }
 
-        // Ensure PEM format is correct
-        if (!pem.includes('BEGIN CERTIFICATE')) {
-          throw new Error('Certificate is not in PEM format');
-        }
-        
-        const x509Cert = new X509Certificate(pem);
-        resolve(x509Cert);
+        const pem = '-----BEGIN CERTIFICATE-----\n' +
+          base64Lines.join('\n') +
+          '\n-----END CERTIFICATE-----';
+        resolve(new X509Certificate(pem));
       } catch (error) {
         socket.end();
         reject(new Error(`Failed to parse certificate from server: ${error instanceof Error ? error.message : 'Unknown error'}`));
@@ -476,15 +464,18 @@ async function fetchDomainAttestation(): Promise<DomainAttestation> {
     fetch(infoUrl),
   ]);
 
-  const intelQuote = (await intelQuoteResponse.json()).quote;
+  const intelQuoteData = await intelQuoteResponse.json() as { quote: string };
+  const infoData = await infoResponse.json() as {
+    tcb_info: string | { app_compose: string };
+  };
 
   return {
     domain: domain ?? "",
     sha256sum: await sha256sumResponse.text(),
     acmeAccount: await acmeAccountResponse.text(),
     cert: await certResponse.text(),
-    intel_quote: intelQuote,
-    info: await infoResponse.json(),
+    intel_quote: intelQuoteData.quote,
+    info: infoData,
   };
 }
 
