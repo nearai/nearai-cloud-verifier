@@ -21,7 +21,16 @@ SIGSTORE_SEARCH_BASE = "https://search.sigstore.dev/?hash="
 
 
 def fetch_report(model, nonce, signing_algo="ecdsa"):
-    """Fetch attestation report from the API."""
+    """Fetch attestation report from the API.
+
+    Args:
+        model: The model name to fetch the report for
+        nonce: The nonce for the request
+        signing_algo: The signing algorithm to use (defaults to "ecdsa")
+
+    Returns:
+        dict: The attestation report
+    """
     url = f"{BASE_URL}/v1/attestation/report?model={model}&nonce={nonce}&signing_algo={signing_algo}"
     return requests.get(url, timeout=30, headers={"Authorization": f"Bearer {API_KEY}"}).json()
 

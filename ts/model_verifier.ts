@@ -100,6 +100,9 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
 
 /**
  * Fetch attestation report from the API
+ * @param model - The model name to fetch the report for
+ * @param nonce - The nonce for the request
+ * @param signingAlgo - The signing algorithm to use (defaults to 'ecdsa')
  */
 async function fetchReport(model: string, nonce: string, signingAlgo: string = 'ecdsa'): Promise<AttestationReport> {
   const url = `${API_BASE}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=${signingAlgo}`;
