@@ -101,8 +101,8 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
 /**
  * Fetch attestation report from the API
  */
-async function fetchReport(model: string, nonce: string): Promise<AttestationReport> {
-  const url = `${API_BASE}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}`;
+async function fetchReport(model: string, nonce: string, signingAlgo: string = 'ecdsa'): Promise<AttestationReport> {
+  const url = `${API_BASE}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=${signingAlgo}`;
   return await makeRequest(url, {
     headers: {
       'Authorization': `Bearer ${process.env.API_KEY || ''}`,
@@ -145,10 +145,10 @@ function base64urlDecodeJwtPayload(jwtToken: string): string {
 /**
  * Verify that TDX report data binds the signing address and request nonce
  */
-function checkReportData(attestation: AttestationReport, requestNonce: string, intelResult: IntelResult, verifyModel: boolean = false): ReportDataResult {
+function checkReportData(attestation: AttestationReport, requestNonce: string, intelResult: IntelResult): ReportDataResult {
   const reportDataHex = intelResult.quote.body.reportdata;
   const reportData = Buffer.from(reportDataHex.replace('0x', ''), 'hex');
-  const signingAddress = verifyModel ? attestation.signing_address : '0x' + '0'.repeat(64);
+  const signingAddress = attestation.signing_address;
   const signingAlgo = (attestation.signing_algo || 'ecdsa').toLowerCase();
 
   // Parse signing address bytes based on algorithm
@@ -379,7 +379,7 @@ async function verifyAttestation(attestation: AttestationReport, requestNonce: s
   const intelResult = await checkTdxQuote(attestation);
 
   console.log('\n🔐 TDX report data');
-  checkReportData(attestation, requestNonce, intelResult, verifyModel);
+  checkReportData(attestation, requestNonce, intelResult);
 
   if (verifyModel) {
     console.log('\n🔐 GPU attestation');
@@ -406,7 +406,7 @@ async function main(): Promise<void> {
   }
 
   const requestNonce = crypto.randomBytes(32).toString('hex');
-  const report = await fetchReport(model, requestNonce);
+  const report = await fetchReport(model, requestNonce, 'ecdsa');
 
   if (!report.gateway_attestation) {
     console.log('No gateway attestation found');
