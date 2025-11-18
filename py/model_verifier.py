@@ -20,9 +20,18 @@ GPU_VERIFIER_API = "https://nras.attestation.nvidia.com/v3/attest/gpu"
 SIGSTORE_SEARCH_BASE = "https://search.sigstore.dev/?hash="
 
 
-def fetch_report(model, nonce):
-    """Fetch attestation report from the API."""
-    url = f"{BASE_URL}/v1/attestation/report?model={model}&nonce={nonce}"
+def fetch_report(model, nonce, signing_algo="ecdsa"):
+    """Fetch attestation report from the API.
+
+    Args:
+        model: The model name to fetch the report for
+        nonce: The nonce for the request
+        signing_algo: The signing algorithm to use (defaults to "ecdsa")
+
+    Returns:
+        dict: The attestation report
+    """
+    url = f"{BASE_URL}/v1/attestation/report?model={model}&nonce={nonce}&signing_algo={signing_algo}"
     return requests.get(url, timeout=30, headers={"Authorization": f"Bearer {API_KEY}"}).json()
 
 def fetch_nvidia_verification(payload):
@@ -37,15 +46,14 @@ def base64url_decode_jwt_payload(jwt_token):
     return base64.urlsafe_b64decode(padded).decode()
 
 
-def check_report_data(attestation, request_nonce, intel_result, verify_model=False):
+def check_report_data(attestation, request_nonce, intel_result):
     """Verify that TDX report data binds the signing address and request nonce.
 
     Returns dict with verification results.
     """
     report_data_hex = intel_result["quote"]["body"]["reportdata"]
     report_data = bytes.fromhex(report_data_hex.removeprefix("0x"))
-    # If verify_model is False, set the signing address to the zero address
-    signing_address = attestation["signing_address"] if verify_model else "0x0000000000000000000000000000000000000000000000000000000000000000"
+    signing_address = attestation["signing_address"]
     signing_algo = attestation.get("signing_algo", "ecdsa").lower()
 
     # Parse signing address bytes based on algorithm
@@ -234,7 +242,7 @@ async def verify_attestation(attestation, request_nonce, verify_model=False):
     intel_result = await check_tdx_quote(attestation)
 
     print("\n🔐 TDX report data")
-    check_report_data(attestation, request_nonce, intel_result, verify_model)
+    check_report_data(attestation, request_nonce, intel_result)
 
     if verify_model:
         print("\n🔐 GPU attestation")
@@ -250,7 +258,7 @@ async def main() -> None:
     args = parser.parse_args()
 
     request_nonce = secrets.token_hex(32)
-    report = fetch_report(args.model, request_nonce)
+    report = fetch_report(args.model, request_nonce, signing_algo="ecdsa")
 
     print("========================================")
     print("🔐 Gateway attestation")
