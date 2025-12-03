@@ -26,10 +26,6 @@ interface AttestationBaseInfo {
 }
 
 interface AttestationReport extends AttestationBaseInfo {
-  signing_address: string;
-  nvidia_payload: string;
-  signing_algo?: string;
-  all_attestations?: AttestationReport[];
   model_attestations?: AttestationReport[];
   gateway_attestation?: AttestationReport;
 }

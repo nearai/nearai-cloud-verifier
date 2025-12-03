@@ -115,14 +115,14 @@ function recoverSigner(text: string, signature: string): string {
  */
 async function fetchAttestationFor(signingAddress: string, model: string): Promise<[AttestationReport, string]> {
   const nonce = crypto.randomBytes(32).toString('hex');
-  const url = `${BASE_URL}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_address=${signingAddress}`;
+  const url = `${BASE_URL}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=ecdsa&signing_address=${signingAddress}`;
   const report = await makeRequest(url);
 
   // Handle both single attestation and multi-node response formats
   let attestation: AttestationReport;
-  if (report.all_attestations) {
+  if (report.model_attestations) {
     // Multi-node format: find the attestation matching the signing address
-    attestation = report.all_attestations.find(
+    attestation = report.model_attestations.find(
       (item: AttestationReport) => item.signing_address.toLowerCase() === signingAddress.toLowerCase()
     )!;
   } else {
