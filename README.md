@@ -56,10 +56,10 @@ pnpm install
 export API_KEY=sk-your-api-key-here
 
 # Python
-python3 py/model_verifier.py --model deepseek-v3.1
+python3 py/model_verifier.py --model deepseek-ai/DeepSeek-V3.1
 
 # TypeScript
-pnpm run model -- --model deepseek-v3.1
+pnpm run model -- --model deepseek-ai/DeepSeek-V3.1
 ```
 
 ### Chat Verification
@@ -68,10 +68,10 @@ pnpm run model -- --model deepseek-v3.1
 export API_KEY=sk-your-api-key-here
 
 # Python
-python3 py/chat_verifier.py --model deepseek-v3.1
+python3 py/chat_verifier.py --model deepseek-ai/DeepSeek-V3.1
 
 # TypeScript
-pnpm run chat -- --model deepseek-v3.1
+pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1
 ```
 
 ### Domain Verification
@@ -114,9 +114,9 @@ python3 py/model_verifier.py [--model MODEL_NAME]
 pnpm run model -- [--model MODEL_NAME]
 ```
 
-**Default model**: `deepseek-v3.1`
+**Default model**: `deepseek-ai/DeepSeek-V3.1`
 
-API key is required. The verifier fetches attestations from the `/v1/attestation/report` endpoint.
+The verifier fetches attestations from the `/v1/attestation/report` endpoint. No API key is required for this endpoint.
 
 ### Example Output for Gateway Attestation
 
@@ -137,8 +137,8 @@ Intel TDX quote verified: True
 
 Docker compose manifest attested by the enclave:
 services:
-  nearai-cloud-server:
-    image: ghcr.io/nearai-cloud/nearai-cloud-server@sha256:xxxxx
+  cloud-api:
+    image: nearaidev/cloud-api@sha256:xxxxx
     ...
 
 Compose sha256: abc123...
@@ -234,7 +234,7 @@ python3 py/model_verifier.py [--model MODEL_NAME]
 pnpm run model -- [--model MODEL_NAME]
 ```
 
-**Default model**: `deepseek-v3.1`
+**Default model**: `deepseek-ai/DeepSeek-V3.1`
 
 ### What It Verifies
 
@@ -434,13 +434,13 @@ The verifier filters `model_attestations` to find the entry matching the signatu
 python3 py/model_verifier.py
 
 # Python - Verify specific model
-python3 py/model_verifier.py --model deepseek-3.1
+python3 py/model_verifier.py --model deepseek-ai/DeepSeek-V3.1
 
 # TypeScript - Verify default model
 pnpm run model
 
 # TypeScript - Verify specific model
-pnpm run model -- --model deepseek-3.1
+pnpm run model -- --model deepseek-ai/DeepSeek-V3.1
 ```
 
 ### Chat Verification with Custom Model
@@ -449,10 +449,10 @@ pnpm run model -- --model deepseek-3.1
 export API_KEY=sk-your-api-key-here
 
 # Python
-python3 py/chat_verifier.py --model deepseek-v3.1
+python3 py/chat_verifier.py --model deepseek-ai/DeepSeek-V3.1
 
 # TypeScript
-pnpm run chat -- --model deepseek-v3.1
+pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1
 ```
 
 ### Domain Verification
@@ -479,7 +479,7 @@ import secrets
 nonce = secrets.token_hex(32)
 
 # Fetch attestation
-attestation = fetch_report("deepseek-v3.1", nonce)
+attestation = fetch_report("deepseek-ai/DeepSeek-V3.1", nonce)
 
 # Verify all components
 intel_result = await check_tdx_quote(attestation)
@@ -505,7 +505,7 @@ import * as crypto from 'crypto';
 const nonce = crypto.randomBytes(32).toString('hex');
 
 // Fetch attestation
-const attestation: AttestationReport = await fetchReport('deepseek-v3.1', nonce);
+const attestation: AttestationReport = await fetchReport('deepseek-ai/DeepSeek-V3.1', nonce);
 
 // Verify all components
 const intelResult: IntelResult = await checkTdxQuote(attestation);
@@ -518,7 +518,7 @@ await showSigstoreProvenance(attestation);
 
 ### With NEAR AI Cloud Gateway
 
-These verifiers work with [NEAR AI Cloud Gateway](https://github.com/nearai-cloud/nearai-cloud-server) attestation endpoints:
+These verifiers work with [NEAR AI Cloud Gateway](https://github.com/nearai/cloud-api) attestation endpoints:
 
 - `GET /v1/attestation/report` - Get TEE attestation
 - `GET /v1/signature/{chat_id}` - Get response signature
@@ -537,13 +537,13 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 
 ```bash
 # Test Python verifiers
-python3 py/model_verifier.py --model deepseek-v3.1
-python3 py/chat_verifier.py --model deepseek-v3.1
+python3 py/model_verifier.py --model deepseek-ai/DeepSeek-V3.1
+python3 py/chat_verifier.py --model deepseek-ai/DeepSeek-V3.1
 python3 py/domain_verifier.py
 
 # Test TypeScript verifiers
-pnpm run model -- --model deepseek-v3.1
-pnpm run chat -- --model deepseek-v3.1
+pnpm run model -- --model deepseek-ai/DeepSeek-V3.1
+pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1
 pnpm run domain
 ```
 
@@ -562,4 +562,4 @@ Built with:
 - [Intel TDX](https://www.intel.com/content/www/us/en/developer/tools/trust-domain-extensions/overview.html) - CPU TEE technology
 - [Sigstore](https://www.sigstore.dev/) - Container supply chain verification
 
-Powered by [NEAR AI Cloud](https://github.com/nearai-cloud/nearai-cloud-server)
+Powered by [NEAR AI Cloud](https://github.com/nearai/cloud-api)

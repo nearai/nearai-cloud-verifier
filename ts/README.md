@@ -13,14 +13,14 @@ npm install
 ### Model Verification
 
 ```bash
-npm run model -- --model deepseek-v3.1
+npm run model -- --model deepseek-ai/DeepSeek-V3.1
 ```
 
 ### Chat Verification
 
 ```bash
 export API_KEY=sk-your-api-key-here
-npm run chat -- --model deepseek-v3.1
+npm run chat -- --model deepseek-ai/DeepSeek-V3.1
 ```
 
 ## Programmatic Usage
@@ -38,7 +38,7 @@ import {
 const nonce = crypto.randomBytes(32).toString('hex');
 
 // Fetch attestation
-const attestation = await fetchReport('deepseek-v3.1', nonce);
+const attestation = await fetchReport('deepseek-ai/DeepSeek-V3.1', nonce);
 
 // Verify all components
 const intelResult = await checkTdxQuote(attestation);
