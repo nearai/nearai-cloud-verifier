@@ -32,7 +32,7 @@ def fetch_report(model, nonce, signing_algo="ecdsa"):
         dict: The attestation report
     """
     url = f"{BASE_URL}/v1/attestation/report?model={model}&nonce={nonce}&signing_algo={signing_algo}"
-    return requests.get(url, timeout=30, headers={"Authorization": f"Bearer {API_KEY}"}).json()
+    return requests.get(url, timeout=30).json()
 
 def fetch_nvidia_verification(payload):
     """Submit GPU evidence to NVIDIA NRAS for verification."""
@@ -235,7 +235,8 @@ async def verify_attestation(attestation, request_nonce, verify_model=False):
 
     print("Request nonce:", request_nonce)
 
-    if verify_model:
+    # Check if signing_address exists (for both gateway and model attestations)
+    if "signing_address" in attestation:
         print("\nSigning address:", attestation["signing_address"])
 
     print("\n🔐 Intel TDX quote")
@@ -254,7 +255,7 @@ async def verify_attestation(attestation, request_nonce, verify_model=False):
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Verify NEAR AI Cloud TEE Attestation")
-    parser.add_argument("--model", default="deepseek-v3.1")
+    parser.add_argument("--model", default="deepseek-ai/DeepSeek-V3.1")
     args = parser.parse_args()
 
     request_nonce = secrets.token_hex(32)

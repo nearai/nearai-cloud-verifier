@@ -45,7 +45,7 @@ def fetch_attestation_for(signing_address, model):
     """Fetch attestation for a specific signing address."""
     nonce = secrets.token_hex(32)
     url = f"{BASE_URL}/v1/attestation/report?model={model}&nonce={nonce}&signing_address={signing_address}"
-    report = requests.get(url, headers={"Authorization": f"Bearer {API_KEY}"}, timeout=30).json()
+    report = requests.get(url, timeout=30).json()
 
     # Handle both single attestation and multi-node response formats
     if "all_attestations" in report:
@@ -144,7 +144,7 @@ async def non_streaming_example(model):
 async def main():
     """Run example verification of streaming and non-streaming chat completions."""
     parser = argparse.ArgumentParser(description="Verify NEAR AI Cloud Signed Chat Responses")
-    parser.add_argument("--model", default="deepseek-v3.1")
+    parser.add_argument("--model", default="deepseek-ai/DeepSeek-V3.1")
     args = parser.parse_args()
 
     if not API_KEY:

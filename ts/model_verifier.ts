@@ -106,11 +106,7 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
  */
 async function fetchReport(model: string, nonce: string, signingAlgo: string = 'ecdsa'): Promise<AttestationReport> {
   const url = `${API_BASE}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=${signingAlgo}`;
-  return await makeRequest(url, {
-    headers: {
-      'Authorization': `Bearer ${process.env.API_KEY || ''}`,
-    }
-  });
+  return await makeRequest(url);
 }
 
 /**
@@ -374,7 +370,8 @@ async function verifyAttestation(attestation: AttestationReport, requestNonce: s
   console.log('🔐 Attestation');
 
   console.log('Request nonce:', requestNonce);
-  if (verifyModel) {
+  // Check if signing_address exists (for both gateway and model attestations)
+  if (attestation.signing_address) {
     console.log('\nSigning address:', attestation.signing_address);
   }
 
@@ -399,14 +396,7 @@ async function verifyAttestation(attestation: AttestationReport, requestNonce: s
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const modelIndex = args.indexOf('--model');
-  const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'deepseek-v3.1';
-
-
-  if (!process.env.API_KEY) {
-    console.log('Error: API_KEY environment variable is required');
-    console.log('Set it with: export API_KEY=your-api-key');
-    return;
-  }
+  const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'deepseek-ai/DeepSeek-V3.1';
 
   const requestNonce = crypto.randomBytes(32).toString('hex');
   const report = await fetchReport(model, requestNonce, 'ecdsa');

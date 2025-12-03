@@ -116,8 +116,7 @@ function recoverSigner(text: string, signature: string): string {
 async function fetchAttestationFor(signingAddress: string, model: string): Promise<[AttestationReport, string]> {
   const nonce = crypto.randomBytes(32).toString('hex');
   const url = `${BASE_URL}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_address=${signingAddress}`;
-  const headers = { Authorization: `Bearer ${API_KEY}` };
-  const report = await makeRequest(url, { headers });
+  const report = await makeRequest(url);
 
   // Handle both single attestation and multi-node response formats
   let attestation: AttestationReport;
@@ -270,7 +269,7 @@ async function nonStreamingExample(model: string): Promise<void> {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const modelIndex = args.indexOf('--model');
-  const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'deepseek-v3.1';
+  const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'deepseek-ai/DeepSeek-V3.1';
 
   if (!API_KEY) {
     console.log('Error: API_KEY environment variable is required');
