@@ -18,6 +18,9 @@ const SIGSTORE_SEARCH_BASE = "https://search.sigstore.dev/?hash=";
 
 interface AttestationBaseInfo {
   intel_quote: string;
+  signing_address: string;
+  signing_algo: string;
+  nvidia_payload: string;
   info: {
     tcb_info: string | {
       app_compose: string;
