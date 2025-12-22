@@ -199,7 +199,6 @@ async function streamingExample(model: string): Promise<void> {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(bodyJson),
         'Authorization': `Bearer ${API_KEY}`
       },
       timeout: 30000
@@ -215,6 +214,7 @@ async function streamingExample(model: string): Promise<void> {
         res.on('end', () => {
           reject(new Error(`HTTP ${res.statusCode}: ${errorData}`));
         });
+        res.on('error', reject);
         return;
       }
 
