@@ -89,6 +89,9 @@ async def verify_chat(chat_id, request_body, response_text, label, model):
     print("Signature valid:", recovered.lower() == signing_address.lower())
 
     attestation, nonce = fetch_attestation_for(signing_address, model)
+    if attestation is None or "error" in attestation:
+        print("Attestation not found for signing address:", signing_address, ".", attestation)
+        return
     print("\nAttestation signer:", attestation["signing_address"])
     print("Attestation nonce:", nonce)
     await check_attestation(signing_address, attestation, nonce)

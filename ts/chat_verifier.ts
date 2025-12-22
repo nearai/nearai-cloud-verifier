@@ -165,6 +165,10 @@ async function verifyChat(chatId: string, requestBody: string, responseText: str
   console.log('Signature valid:', recovered.toLowerCase() === signingAddress.toLowerCase());
 
   const [attestation, nonce] = await fetchAttestationFor(signingAddress, model);
+  if (!attestation || "error" in attestation) {
+    console.log(`Attestation not found for signing address: ${signingAddress}.`, attestation);
+    return;
+  }
   console.log('\nAttestation signer:', attestation.signing_address);
   console.log('Attestation nonce:', nonce);
   await checkAttestation(signingAddress, attestation, nonce);
@@ -195,34 +199,76 @@ async function streamingExample(model: string): Promise<void> {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(bodyJson),
         'Authorization': `Bearer ${API_KEY}`
       },
       timeout: 30000
     };
 
     const req = client.request(requestOptions, (res) => {
+      // Check HTTP status code
+      if (res.statusCode !== 200) {
+        let errorData = '';
+        res.on('data', (chunk) => {
+          errorData += chunk.toString();
+        });
+        res.on('end', () => {
+          reject(new Error(`HTTP ${res.statusCode}: ${errorData}`));
+        });
+        return;
+      }
+
+      let buffer = '';
       let responseText = '';
       let chatId: string | null = null;
       
       res.on('data', (chunk) => {
-        const line = chunk.toString();
-        responseText += line + '\n';
+        buffer += chunk.toString();
+        responseText += chunk.toString();
         
-        if (line.startsWith('data: {') && chatId === null) {
-          try {
-            const data = JSON.parse(line.substring(6));
-            chatId = data.id;
-          } catch (error) {
-            // Ignore parsing errors for non-JSON lines
+        // Process complete lines from buffer
+        let newlineIndex;
+        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.substring(0, newlineIndex).trim();
+          buffer = buffer.substring(newlineIndex + 1);
+          
+          // Skip empty lines and comments
+          if (line.length === 0 || line.startsWith(':')) {
+            continue;
+          }
+          
+          // Parse SSE data lines
+          if (line.startsWith('data: ') && chatId === null) {
+            const dataStr = line.substring(6); // Skip "data: "
+            
+            // Handle [DONE] marker
+            if (dataStr === '[DONE]') {
+              continue;
+            }
+            
+            try {
+              const data = JSON.parse(dataStr);
+              if (data.id) {
+                chatId = data.id;
+              }
+            } catch (error) {
+              // Ignore parsing errors for non-JSON lines
+            }
           }
         }
       });
       
       res.on('end', async () => {
-        if (chatId) {
-          await verifyChat(chatId, bodyJson, responseText, 'Streaming example', model);
+        if (!chatId) {
+          reject(new Error('Failed to extract chat ID from streaming response'));
+          return;
         }
-        resolve();
+        try {
+          await verifyChat(chatId, bodyJson, responseText, 'Streaming example', model);
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
       });
     });
 
