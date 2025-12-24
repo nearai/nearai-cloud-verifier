@@ -7,13 +7,15 @@
   "scripts": {
     "build": "tsc",
     "chat": "tsx ts/chat_verifier.ts",
+    "chat-encryption": "tsx ts/chat_encryption.ts",
     "model": "tsx ts/model_verifier.ts",
     "domain": "tsx ts/domain_verifier.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
     "@phala/dcap-qvl-node": "^0.3.3",
-    "ethers": "^5.7.2"
+    "ethers": "^5.7.2",
+    "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
