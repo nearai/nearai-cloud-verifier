@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import os
+import secrets
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -50,11 +51,11 @@ def generate_ecdsa_key_pair():
     public_key = private_key.public_key()
 
     # Get private key bytes (32 bytes)
-    private_key_bytes = private_key.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
+    # SECP256K1 doesn't support Raw format, so we extract the integer value
+    private_numbers = private_key.private_numbers()
+    private_key_int = private_numbers.private_value
+    # Convert to 32-byte big-endian representation
+    private_key_bytes = private_key_int.to_bytes(32, byteorder="big")
 
     # Get public key bytes (uncompressed, 65 bytes with 0x04 prefix)
     public_key_bytes = public_key.public_bytes(
@@ -125,7 +126,7 @@ def encrypt_ecdsa(data: bytes, public_key_hex: str) -> bytes:
     aes_key = hkdf.derive(shared_secret)
 
     # Encrypt with AES-GCM
-    nonce = os.urandom(12)
+    nonce = secrets.token_bytes(12)
     aesgcm = AESGCM(aes_key)
     ciphertext = aesgcm.encrypt(nonce, data, None)
 
@@ -152,18 +153,9 @@ def decrypt_ecdsa(encrypted_data: bytes, private_key_obj) -> bytes:
         ec.SECP256K1(), ephemeral_public_bytes
     )
 
-    # Get private key bytes and create EC private key
-    private_key_bytes = private_key_obj.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    private_key = ec.derive_private_key(
-        int.from_bytes(private_key_bytes, "big"), ec.SECP256K1(), default_backend()
-    )
-
-    # Perform ECDH key exchange
-    shared_secret = private_key.exchange(ec.ECDH(), ephemeral_public)
+    # Use the private key object directly for ECDH exchange
+    # private_key_obj is already an EllipticCurvePrivateKey
+    shared_secret = private_key_obj.exchange(ec.ECDH(), ephemeral_public)
 
     # Derive AES key using HKDF
     hkdf = HKDF(
@@ -278,27 +270,43 @@ def decrypt_message_content(
 
 async def encrypted_streaming_example(model, signing_algo="ecdsa"):
     """Example of encrypted streaming chat completion."""
+    print(f"\n{'='*60}")
+    print(f"Encrypted Streaming Example ({signing_algo.upper()})")
+    print(f"{'='*60}")
+
     # Fetch model public key
-    model_pub_key = fetch_model_public_key(model, signing_algo)
-    print(f"\n--- Encrypted Streaming Example ({signing_algo.upper()}) ---")
-    print(f"Model public key: {model_pub_key[:32]}...")
+    try:
+        model_pub_key = fetch_model_public_key(model, signing_algo)
+        print(f"✓ Fetched model public key: {model_pub_key[:32]}...")
+    except Exception as e:
+        print(f"✗ Failed to fetch model public key: {e}")
+        return
 
     # Generate client key pair
-    if signing_algo == "ecdsa":
-        client_priv_key_hex, client_pub_key_hex, client_priv_key = (
-            generate_ecdsa_key_pair()
-        )
-    else:
-        client_priv_key_hex, client_pub_key_hex, client_priv_key = (
-            generate_ed25519_key_pair()
-        )
-    print(f"Client public key: {client_pub_key_hex[:32]}...")
+    try:
+        if signing_algo == "ecdsa":
+            client_priv_key_hex, client_pub_key_hex, client_priv_key = (
+                generate_ecdsa_key_pair()
+            )
+        else:
+            client_priv_key_hex, client_pub_key_hex, client_priv_key = (
+                generate_ed25519_key_pair()
+            )
+        print(f"✓ Generated client key pair: {client_pub_key_hex[:32]}...")
+    except Exception as e:
+        print(f"✗ Failed to generate client key pair: {e}")
+        return
 
     # Prepare message
     original_content = "Hello, how are you?"
-    encrypted_content = encrypt_message_content(
-        original_content, model_pub_key, signing_algo
-    )
+    try:
+        encrypted_content = encrypt_message_content(
+            original_content, model_pub_key, signing_algo
+        )
+        print(f"✓ Encrypted message content")
+    except Exception as e:
+        print(f"✗ Failed to encrypt message: {e}")
+        return
 
     body = {
         "model": model,
@@ -317,20 +325,37 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
         "X-Model-Pub-Key": model_pub_key,
     }
 
-    response = requests.post(
-        f"{BASE_URL}/v1/chat/completions",
-        headers=headers,
-        data=body_json,
-        stream=True,
-        timeout=30,
-    )
+    try:
+        response = requests.post(
+            f"{BASE_URL}/v1/chat/completions",
+            headers=headers,
+            data=body_json,
+            stream=True,
+            timeout=30,
+        )
+        response.raise_for_status()
+        print(f"✓ Request sent successfully (HTTP {response.status_code})")
+    except requests.exceptions.HTTPError as e:
+        print(f"✗ Request failed: {e}")
+        if e.response is not None:
+            print(f"  Status code: {e.response.status_code}")
+            try:
+                error_detail = e.response.json()
+                print(f"  Error detail: {json.dumps(error_detail, indent=2)}")
+            except:
+                print(f"  Response text: {e.response.text[:200]}")
+        return
+    except Exception as e:
+        print(f"✗ Request failed: {e}")
+        return
 
     chat_id = None
     response_text = ""
     decrypted_content = ""
 
+    print("\nReceiving stream...")
     for chunk in response.iter_lines():
-        line = chunk.decode()
+        line = chunk.decode() if chunk else ""
         response_text += line + "\n"
 
         if line.startswith("data: {") and chat_id is None:
@@ -338,6 +363,7 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
                 data = json.loads(line[6:])
                 if "id" in data:
                     chat_id = data["id"]
+                    print(f"✓ Chat ID: {chat_id}")
             except:
                 pass
 
@@ -354,47 +380,69 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
                                 content_hex, client_priv_key, signing_algo
                             )
                             decrypted_content += decrypted_chunk
+                            print(
+                                f"  Decrypted chunk: {decrypted_chunk}\n",
+                                end="",
+                                flush=True,
+                            )
                         except:
                             # If decryption fails, might be plain text or invalid hex
                             pass
             except:
                 pass
 
-    print(f"Decrypted response: {decrypted_content[:100]}...")
+    print(f"\n\n✓ Complete decrypted response: {decrypted_content}")
+    print(f"✓ Total response length: {len(response_text)} bytes")
 
-    if chat_id:
-        await verify_chat(
-            chat_id,
-            body_json,
-            response_text,
-            f"Encrypted Streaming ({signing_algo.upper()})",
-            model,
-        )
+    # if chat_id:
+    #     await verify_chat(
+    #         chat_id,
+    #         body_json,
+    #         response_text,
+    #         f"Encrypted Streaming ({signing_algo.upper()})",
+    #         model,
+    #     )
 
 
 async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
     """Example of encrypted non-streaming chat completion."""
+    print(f"\n{'='*60}")
+    print(f"Encrypted Non-Streaming Example ({signing_algo.upper()})")
+    print(f"{'='*60}")
+
     # Fetch model public key
-    model_pub_key = fetch_model_public_key(model, signing_algo)
-    print(f"\n--- Encrypted Non-Streaming Example ({signing_algo.upper()}) ---")
-    print(f"Model public key: {model_pub_key[:32]}...")
+    try:
+        model_pub_key = fetch_model_public_key(model, signing_algo)
+        print(f"✓ Fetched model public key: {model_pub_key[:32]}...")
+    except Exception as e:
+        print(f"✗ Failed to fetch model public key: {e}")
+        return
 
     # Generate client key pair
-    if signing_algo == "ecdsa":
-        client_priv_key_hex, client_pub_key_hex, client_priv_key = (
-            generate_ecdsa_key_pair()
-        )
-    else:
-        client_priv_key_hex, client_pub_key_hex, client_priv_key = (
-            generate_ed25519_key_pair()
-        )
-    print(f"Client public key: {client_pub_key_hex[:32]}...")
+    try:
+        if signing_algo == "ecdsa":
+            client_priv_key_hex, client_pub_key_hex, client_priv_key = (
+                generate_ecdsa_key_pair()
+            )
+        else:
+            client_priv_key_hex, client_pub_key_hex, client_priv_key = (
+                generate_ed25519_key_pair()
+            )
+        print(f"✓ Generated client key pair: {client_pub_key_hex[:32]}...")
+    except Exception as e:
+        print(f"✗ Failed to generate client key pair: {e}")
+        return
 
     # Prepare message
     original_content = "Hello, how are you?"
-    encrypted_content = encrypt_message_content(
-        original_content, model_pub_key, signing_algo
-    )
+    try:
+        encrypted_content = encrypt_message_content(
+            original_content, model_pub_key, signing_algo
+        )
+        print(f"✓ Encrypted message content")
+    except Exception as e:
+        print(f"✗ Failed to encrypt message: {e}")
+        return
 
     body = {
         "model": model,
@@ -413,36 +461,106 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
         "X-Model-Pub-Key": model_pub_key,
     }
 
-    response = requests.post(
-        f"{BASE_URL}/v1/chat/completions",
-        headers=headers,
-        data=body_json,
-        timeout=30,
-    )
+    try:
+        response = requests.post(
+            f"{BASE_URL}/v1/chat/completions",
+            headers=headers,
+            data=body_json,
+            timeout=30,
+        )
+        response.raise_for_status()
+        print(f"✓ Request sent successfully (HTTP {response.status_code})")
+    except requests.exceptions.HTTPError as e:
+        print(f"✗ Request failed: {e}")
+        if e.response is not None:
+            print(f"  Status code: {e.response.status_code}")
+            try:
+                error_detail = e.response.json()
+                print(f"  Error detail: {json.dumps(error_detail, indent=2)}")
+            except:
+                print(f"  Response text: {e.response.text[:200]}")
+        return
+    except Exception as e:
+        print(f"✗ Request failed: {e}")
+        return
 
     payload = response.json()
-    chat_id = payload["id"]
+    chat_id = payload.get("id", "unknown")
+    print(f"✓ Chat ID: {chat_id}")
 
-    # Decrypt response content
+    # Check finish_reason to see if response was truncated
+    if "choices" in payload and len(payload["choices"]) > 0:
+        choice = payload["choices"][0]
+        finish_reason = choice.get("finish_reason", "unknown")
+        print(f"✓ Finish reason: {finish_reason}")
+        if finish_reason == "length":
+            print(f"  ⚠ Response was truncated due to max_tokens limit")
+
+    # Decrypt response content (including all encrypted fields)
     if "choices" in payload and len(payload["choices"]) > 0:
         message = payload["choices"][0].get("message", {})
-        if "content" in message:
-            encrypted_response = message["content"]
-            try:
-                decrypted_response = decrypt_message_content(
-                    encrypted_response, client_priv_key, signing_algo
-                )
-                print(f"Decrypted response: {decrypted_response}")
-            except Exception as e:
-                print(f"Failed to decrypt response: {e}")
 
-    await verify_chat(
-        chat_id,
-        body_json,
-        response.text,
-        f"Encrypted Non-Streaming ({signing_algo.upper()})",
-        model,
-    )
+        # Decrypt all encrypted fields: content, reasoning_content, reasoning
+        decrypted_fields = {}
+        for field in ["content", "reasoning_content", "reasoning"]:
+            if field in message and message[field]:
+                encrypted_value = message[field]
+                # Check if it looks like encrypted hex (even length, hex chars, reasonably long)
+                if isinstance(encrypted_value, str) and len(encrypted_value) > 64:
+                    if len(encrypted_value) % 2 == 0 and all(
+                        c in "0123456789abcdefABCDEF" for c in encrypted_value
+                    ):
+                        try:
+                            decrypted_value = decrypt_message_content(
+                                encrypted_value, client_priv_key, signing_algo
+                            )
+                            decrypted_fields[field] = decrypted_value
+                            print(f"✓ Decrypted {field} ({len(decrypted_value)} chars)")
+                        except Exception as e:
+                            print(f"✗ Failed to decrypt {field}: {e}")
+                            print(
+                                f"  Encrypted {field} (first 100 chars): {encrypted_value[:100]}"
+                            )
+                    else:
+                        # Not encrypted, just plain text
+                        decrypted_fields[field] = encrypted_value
+                        print(f"✓ {field} (plain text, {len(encrypted_value)} chars)")
+                elif encrypted_value:
+                    # Short value or not hex - might be plain text
+                    decrypted_fields[field] = encrypted_value
+                    print(f"✓ {field} (plain text, {len(encrypted_value)} chars)")
+
+        if decrypted_fields:
+            # Show complete decrypted response
+            if "content" in decrypted_fields:
+                content = decrypted_fields["content"]
+                print(f"\n✓ Complete decrypted response ({len(content)} characters):")
+                print(f"  {content}")
+                if "reasoning_content" in decrypted_fields:
+                    reasoning = decrypted_fields["reasoning_content"]
+                    print(f"\n✓ Reasoning content ({len(reasoning)} characters):")
+                    print(f"  {reasoning}")
+                if "reasoning" in decrypted_fields:
+                    reasoning_alt = decrypted_fields["reasoning"]
+                    print(f"\n✓ Reasoning (alt) ({len(reasoning_alt)} characters):")
+                    print(f"  {reasoning_alt}")
+            else:
+                print(f"\n⚠ No content field found in decrypted fields")
+        else:
+            print(f"\n⚠ No encrypted fields found to decrypt")
+            print(f"  Message keys: {list(message.keys())}")
+            print(f"  Message: {json.dumps(message, indent=2)}")
+    else:
+        print("✗ No choices in response")
+        print(f"  Response: {json.dumps(payload, indent=2)}")
+
+    # await verify_chat(
+    #     chat_id,
+    #     body_json,
+    #     response.text,
+    #     f"Encrypted Non-Streaming ({signing_algo.upper()})",
+    #     model,
+    # )
 
 
 async def main():

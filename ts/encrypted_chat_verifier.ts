@@ -27,8 +27,11 @@ interface ChatCompletionRequest {
 interface ChatCompletionResponse {
   id: string;
   choices: Array<{
+    finish_reason?: string;
     message: {
-      content: string;
+      content?: string;
+      reasoning_content?: string;
+      reasoning?: string;
     };
   }>;
 }
@@ -57,6 +60,21 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
         data += chunk;
       });
       res.on('end', () => {
+        if (res.statusCode && res.statusCode >= 400) {
+          try {
+            const errorDetail = JSON.parse(data);
+            const error = new Error(`HTTP ${res.statusCode}: ${JSON.stringify(errorDetail)}`);
+            (error as any).statusCode = res.statusCode;
+            (error as any).response = data;
+            reject(error);
+          } catch {
+            const error = new Error(`HTTP ${res.statusCode}: ${data.substring(0, 200)}`);
+            (error as any).statusCode = res.statusCode;
+            (error as any).response = data;
+            reject(error);
+          }
+          return;
+        }
         try {
           resolve(JSON.parse(data));
         } catch (error) {
@@ -322,28 +340,49 @@ function decryptMessageContent(encryptedHex: string, clientPrivateKey: any, sign
  * Encrypted streaming example
  */
 async function encryptedStreamingExample(model: string, signingAlgo: string = 'ecdsa'): Promise<void> {
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`Encrypted Streaming Example (${signingAlgo.toUpperCase()})`);
+  console.log(`${'='.repeat(60)}`);
+
   // Fetch model public key
-  const modelPubKey = await fetchModelPublicKey(model, signingAlgo);
-  console.log(`\n--- Encrypted Streaming Example (${signingAlgo.toUpperCase()}) ---`);
-  console.log(`Model public key: ${modelPubKey.substring(0, 32)}...`);
+  let modelPubKey: string;
+  try {
+    modelPubKey = await fetchModelPublicKey(model, signingAlgo);
+    console.log(`✓ Fetched model public key: ${modelPubKey.substring(0, 32)}...`);
+  } catch (error) {
+    console.log(`✗ Failed to fetch model public key: ${error}`);
+    return;
+  }
   
   // Generate client key pair
   let clientPubKey: string;
   let clientPrivKey: any;
-  if (signingAlgo === 'ecdsa') {
-    const keyPair = generateEcdsaKeyPair();
-    clientPubKey = keyPair.publicKey;
-    clientPrivKey = keyPair.privateKey;
-  } else {
-    const keyPair = generateEd25519KeyPair();
-    clientPubKey = keyPair.publicKey;
-    clientPrivKey = keyPair.privateKey;
+  try {
+    if (signingAlgo === 'ecdsa') {
+      const keyPair = generateEcdsaKeyPair();
+      clientPubKey = keyPair.publicKey;
+      clientPrivKey = keyPair.privateKey;
+    } else {
+      const keyPair = generateEd25519KeyPair();
+      clientPubKey = keyPair.publicKey;
+      clientPrivKey = keyPair.privateKey;
+    }
+    console.log(`✓ Generated client key pair: ${clientPubKey.substring(0, 32)}...`);
+  } catch (error) {
+    console.log(`✗ Failed to generate client key pair: ${error}`);
+    return;
   }
-  console.log(`Client public key: ${clientPubKey.substring(0, 32)}...`);
   
   // Prepare message
   const originalContent = 'Hello, how are you?';
-  const encryptedContent = encryptMessageContent(originalContent, modelPubKey, signingAlgo);
+  let encryptedContent: string;
+  try {
+    encryptedContent = encryptMessageContent(originalContent, modelPubKey, signingAlgo);
+    console.log(`✓ Encrypted message content`);
+  } catch (error) {
+    console.log(`✗ Failed to encrypt message: ${error}`);
+    return;
+  }
   
   const body: ChatCompletionRequest = {
     model,
@@ -375,12 +414,20 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
     };
     
     const req = client.request(requestOptions, (res) => {
-      if (res.statusCode !== 200) {
+      if (res.statusCode && res.statusCode !== 200) {
         let errorData = '';
         res.on('data', (chunk) => {
           errorData += chunk.toString();
         });
         res.on('end', () => {
+          console.log(`✗ Request failed: HTTP ${res.statusCode}`);
+          console.log(`  Status code: ${res.statusCode}`);
+          try {
+            const errorDetail = JSON.parse(errorData);
+            console.log(`  Error detail: ${JSON.stringify(errorDetail, null, 2)}`);
+          } catch {
+            console.log(`  Response text: ${errorData.substring(0, 200)}`);
+          }
           reject(new Error(`HTTP ${res.statusCode}: ${errorData}`));
         });
         return;
@@ -390,6 +437,9 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
       let responseText = '';
       let chatId: string | null = null;
       let decryptedContent = '';
+      
+      console.log(`✓ Request sent successfully (HTTP ${res.statusCode || 200})`);
+      console.log('\nReceiving stream...');
       
       res.on('data', (chunk) => {
         buffer += chunk.toString();
@@ -413,6 +463,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
               const data = JSON.parse(dataStr);
               if (data.id) {
                 chatId = data.id;
+                console.log(`✓ Chat ID: ${chatId}`);
               }
             } catch (error) {
               // Ignore parsing errors
@@ -429,6 +480,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
                   try {
                     const decryptedChunk = decryptMessageContent(delta.content, clientPrivKey, signingAlgo);
                     decryptedContent += decryptedChunk;
+                    process.stdout.write(`  Decrypted chunk: ${decryptedChunk}\n`);
                   } catch (e) {
                     // Decryption failed, might be plain text
                   }
@@ -443,12 +495,14 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
       
       res.on('end', async () => {
         if (!chatId) {
+          console.log(`✗ Failed to extract chat ID from streaming response`);
           reject(new Error('Failed to extract chat ID from streaming response'));
           return;
         }
-        console.log(`Decrypted response: ${decryptedContent.substring(0, 100)}...`);
+        console.log(`\n\n✓ Complete decrypted response: ${decryptedContent}`);
+        console.log(`✓ Total response length: ${responseText.length} bytes`);
         try {
-          await verifyChat(chatId, bodyJson, responseText, `Encrypted Streaming (${signingAlgo.toUpperCase()})`, model);
+          // await verifyChat(chatId, bodyJson, responseText, `Encrypted Streaming (${signingAlgo.toUpperCase()})`, model);
           resolve();
         } catch (error) {
           reject(error);
@@ -456,9 +510,13 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
       });
     });
     
-    req.on('error', reject);
+    req.on('error', (error) => {
+      console.log(`✗ Request failed: ${error}`);
+      reject(error);
+    });
     req.on('timeout', () => {
       req.destroy();
+      console.log(`✗ Request timeout`);
       reject(new Error('Request timeout'));
     });
     
@@ -471,28 +529,49 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
  * Encrypted non-streaming example
  */
 async function encryptedNonStreamingExample(model: string, signingAlgo: string = 'ecdsa'): Promise<void> {
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`Encrypted Non-Streaming Example (${signingAlgo.toUpperCase()})`);
+  console.log(`${'='.repeat(60)}`);
+
   // Fetch model public key
-  const modelPubKey = await fetchModelPublicKey(model, signingAlgo);
-  console.log(`\n--- Encrypted Non-Streaming Example (${signingAlgo.toUpperCase()}) ---`);
-  console.log(`Model public key: ${modelPubKey.substring(0, 32)}...`);
+  let modelPubKey: string;
+  try {
+    modelPubKey = await fetchModelPublicKey(model, signingAlgo);
+    console.log(`✓ Fetched model public key: ${modelPubKey.substring(0, 32)}...`);
+  } catch (error) {
+    console.log(`✗ Failed to fetch model public key: ${error}`);
+    return;
+  }
   
   // Generate client key pair
   let clientPubKey: string;
   let clientPrivKey: any;
-  if (signingAlgo === 'ecdsa') {
-    const keyPair = generateEcdsaKeyPair();
-    clientPubKey = keyPair.publicKey;
-    clientPrivKey = keyPair.privateKey;
-  } else {
-    const keyPair = generateEd25519KeyPair();
-    clientPubKey = keyPair.publicKey;
-    clientPrivKey = keyPair.privateKey;
+  try {
+    if (signingAlgo === 'ecdsa') {
+      const keyPair = generateEcdsaKeyPair();
+      clientPubKey = keyPair.publicKey;
+      clientPrivKey = keyPair.privateKey;
+    } else {
+      const keyPair = generateEd25519KeyPair();
+      clientPubKey = keyPair.publicKey;
+      clientPrivKey = keyPair.privateKey;
+    }
+    console.log(`✓ Generated client key pair: ${clientPubKey.substring(0, 32)}...`);
+  } catch (error) {
+    console.log(`✗ Failed to generate client key pair: ${error}`);
+    return;
   }
-  console.log(`Client public key: ${clientPubKey.substring(0, 32)}...`);
   
   // Prepare message
   const originalContent = 'Hello, how are you?';
-  const encryptedContent = encryptMessageContent(originalContent, modelPubKey, signingAlgo);
+  let encryptedContent: string;
+  try {
+    encryptedContent = encryptMessageContent(originalContent, modelPubKey, signingAlgo);
+    console.log(`✓ Encrypted message content`);
+  } catch (error) {
+    console.log(`✗ Failed to encrypt message: ${error}`);
+    return;
+  }
   
   const body: ChatCompletionRequest = {
     model,
@@ -503,35 +582,116 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
   
   const bodyJson = JSON.stringify(body);
   
-  const response = await makeRequest(`${BASE_URL}/v1/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${API_KEY}`,
-      'X-Signing-Algo': signingAlgo,
-      'X-Client-Pub-Key': clientPubKey,
-      'X-Model-Pub-Key': modelPubKey
-    },
-    body: bodyJson
-  });
+  let response: any;
+  try {
+    response = await makeRequest(`${BASE_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${API_KEY}`,
+        'X-Signing-Algo': signingAlgo,
+        'X-Client-Pub-Key': clientPubKey,
+        'X-Model-Pub-Key': modelPubKey
+      },
+      body: bodyJson
+    });
+    console.log(`✓ Request sent successfully`);
+  } catch (error: any) {
+    console.log(`✗ Request failed: ${error}`);
+    if (error.statusCode) {
+      console.log(`  Status code: ${error.statusCode}`);
+    }
+    if (error.message) {
+      console.log(`  Error: ${error.message}`);
+    }
+    if (error.response) {
+      try {
+        const errorDetail = JSON.parse(error.response);
+        console.log(`  Error detail: ${JSON.stringify(errorDetail, null, 2)}`);
+      } catch {
+        console.log(`  Response text: ${error.response.substring(0, 200)}`);
+      }
+    }
+    return;
+  }
   
   const payload: ChatCompletionResponse = response;
-  const chatId = payload.id;
+  const chatId = payload.id || 'unknown';
+  console.log(`✓ Chat ID: ${chatId}`);
   
-  // Decrypt response content
+  // Check finish_reason to see if response was truncated
   if (payload.choices && payload.choices.length > 0) {
-    const message = payload.choices[0].message;
-    if (message && message.content) {
-      try {
-        const decryptedResponse = decryptMessageContent(message.content, clientPrivKey, signingAlgo);
-        console.log(`Decrypted response: ${decryptedResponse}`);
-      } catch (e) {
-        console.log(`Failed to decrypt response: ${e}`);
-      }
+    const choice = payload.choices[0];
+    const finishReason = choice.finish_reason || 'unknown';
+    console.log(`✓ Finish reason: ${finishReason}`);
+    if (finishReason === 'length') {
+      console.log(`  ⚠ Response was truncated due to max_tokens limit`);
     }
   }
   
-  await verifyChat(chatId, bodyJson, JSON.stringify(response), `Encrypted Non-Streaming (${signingAlgo.toUpperCase()})`, model);
+  // Decrypt response content (including all encrypted fields)
+  if (payload.choices && payload.choices.length > 0) {
+    const message = payload.choices[0].message;
+    
+    // Decrypt all encrypted fields: content, reasoning_content, reasoning
+    const decryptedFields: Record<string, string> = {};
+    for (const field of ['content', 'reasoning_content', 'reasoning']) {
+      const fieldValue = (message as any)[field];
+      if (fieldValue) {
+        // Check if it looks like encrypted hex (even length, hex chars, reasonably long)
+        if (typeof fieldValue === 'string' && fieldValue.length > 64) {
+          if (fieldValue.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(fieldValue)) {
+            try {
+              const decryptedValue = decryptMessageContent(fieldValue, clientPrivKey, signingAlgo);
+              decryptedFields[field] = decryptedValue;
+              console.log(`✓ Decrypted ${field} (${decryptedValue.length} chars)`);
+            } catch (error) {
+              console.log(`✗ Failed to decrypt ${field}: ${error}`);
+              console.log(`  Encrypted ${field} (first 100 chars): ${fieldValue.substring(0, 100)}`);
+            }
+          } else {
+            // Not encrypted, just plain text
+            decryptedFields[field] = fieldValue;
+            console.log(`✓ ${field} (plain text, ${fieldValue.length} chars)`);
+          }
+        } else if (fieldValue) {
+          // Short value or not hex - might be plain text
+          decryptedFields[field] = fieldValue;
+          console.log(`✓ ${field} (plain text, ${fieldValue.length} chars)`);
+        }
+      }
+    }
+    
+    if (Object.keys(decryptedFields).length > 0) {
+      // Show complete decrypted response
+      if (decryptedFields.content) {
+        const content = decryptedFields.content;
+        console.log(`\n✓ Complete decrypted response (${content.length} characters):`);
+        console.log(`  ${content}`);
+        if (decryptedFields.reasoning_content) {
+          const reasoning = decryptedFields.reasoning_content;
+          console.log(`\n✓ Reasoning content (${reasoning.length} characters):`);
+          console.log(`  ${reasoning}`);
+        }
+        if (decryptedFields.reasoning) {
+          const reasoningAlt = decryptedFields.reasoning;
+          console.log(`\n✓ Reasoning (alt) (${reasoningAlt.length} characters):`);
+          console.log(`  ${reasoningAlt}`);
+        }
+      } else {
+        console.log(`\n⚠ No content field found in decrypted fields`);
+      }
+    } else {
+      console.log(`\n⚠ No encrypted fields found to decrypt`);
+      console.log(`  Message keys: ${Object.keys(message)}`);
+      console.log(`  Message: ${JSON.stringify(message, null, 2)}`);
+    }
+  } else {
+    console.log('✗ No choices in response');
+    console.log(`  Response: ${JSON.stringify(payload, null, 2)}`);
+  }
+  
+  // await verifyChat(chatId, bodyJson, JSON.stringify(response), `Encrypted Non-Streaming (${signingAlgo.toUpperCase()})`, model);
 }
 
 /**

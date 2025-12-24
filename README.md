@@ -74,22 +74,22 @@ python3 py/chat_verifier.py --model deepseek-ai/DeepSeek-V3.1
 pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1
 ```
 
-### Chat Encryption Testing
+### Encrypted Chat Verification
 
 ```bash
 export API_KEY=sk-your-api-key-here
 
 # Python - Test ECDSA encryption
-python3 py/chat_encryption.py --model deepseek-ai/DeepSeek-V3.1
+python3 py/encrypted_chat_verifier.py --model deepseek-ai/DeepSeek-V3.1
 
 # Python - Test both ECDSA and Ed25519
-python3 py/chat_encryption.py --model deepseek-ai/DeepSeek-V3.1 --test-both
+python3 py/encrypted_chat_verifier.py --model deepseek-ai/DeepSeek-V3.1 --test-both
 
 # TypeScript - Test ECDSA encryption
-pnpm run chat-encryption -- --model deepseek-ai/DeepSeek-V3.1
+pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1
 
 # TypeScript - Test both algorithms
-pnpm run chat-encryption -- --model deepseek-ai/DeepSeek-V3.1 --test-both
+pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --test-both
 ```
 
 ### Domain Verification
@@ -263,7 +263,7 @@ pnpm run model -- [--model MODEL_NAME]
 - ✅ **GPU Attestation** - Passes NVIDIA verification
 - ✅ **Intel TDX Quote** - Valid CPU TEE measurements
 
-## 🔐 Chat Encryption Testing
+## 🔐 Encrypted Chat Verifier
 
 Tests end-to-end encryption for chat completions. Encrypts request messages and decrypts response content using ECDSA or Ed25519 signing algorithms.
 
@@ -279,22 +279,22 @@ export API_KEY=sk-your-api-key-here
 
 ```bash
 # Python - Test with ECDSA (default)
-python3 py/chat_encryption.py --model deepseek-ai/DeepSeek-V3.1
+python3 py/encrypted_chat_verifier.py --model deepseek-ai/DeepSeek-V3.1
 
 # Python - Test with Ed25519
-python3 py/chat_encryption.py --model deepseek-ai/DeepSeek-V3.1 --signing-algo ed25519
+python3 py/encrypted_chat_verifier.py --model deepseek-ai/DeepSeek-V3.1 --signing-algo ed25519
 
 # Python - Test both algorithms
-python3 py/chat_encryption.py --model deepseek-ai/DeepSeek-V3.1 --test-both
+python3 py/encrypted_chat_verifier.py --model deepseek-ai/DeepSeek-V3.1 --test-both
 
 # TypeScript - Test with ECDSA (default)
-pnpm run chat-encryption -- --model deepseek-ai/DeepSeek-V3.1
+pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1
 
 # TypeScript - Test with Ed25519
-pnpm run chat-encryption -- --model deepseek-ai/DeepSeek-V3.1 --signing-algo ed25519
+pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --signing-algo ed25519
 
 # TypeScript - Test both algorithms
-pnpm run chat-encryption -- --model deepseek-ai/DeepSeek-V3.1 --test-both
+pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --test-both
 ```
 
 **Default model**: `deepseek-ai/DeepSeek-V3.1`
