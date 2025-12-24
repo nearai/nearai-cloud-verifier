@@ -24,6 +24,7 @@ from chat_verifier import verify_chat
 
 API_KEY = os.environ.get("API_KEY", "")
 BASE_URL = os.environ.get("BASE_URL", "https://cloud-api.near.ai")
+MAX_TOKENS = 100
 
 
 def fetch_model_public_key(model, signing_algo="ecdsa"):
@@ -312,7 +313,7 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
         "model": model,
         "messages": [{"role": "user", "content": encrypted_content}],
         "stream": True,
-        "max_tokens": 10,
+        "max_tokens": MAX_TOKENS,
     }
     body_json = json.dumps(body)
 
@@ -448,7 +449,7 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
         "model": model,
         "messages": [{"role": "user", "content": encrypted_content}],
         "stream": False,
-        "max_tokens": 10,
+        "max_tokens": MAX_TOKENS,
     }
     body_json = json.dumps(body)
 

@@ -16,6 +16,7 @@ import {
 
 const API_KEY = process.env.API_KEY || '';
 const BASE_URL = process.env.BASE_URL || 'https://cloud-api.near.ai';
+const MAX_TOKENS = 100;
 
 interface ChatCompletionRequest {
   model: string;
@@ -44,7 +45,7 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
     const urlObj = new URL(url);
     const isHttps = urlObj.protocol === 'https:';
     const client = isHttps ? https : http;
-    
+
     const requestOptions = {
       hostname: urlObj.hostname,
       port: urlObj.port || (isHttps ? 443 : 80),
@@ -103,7 +104,7 @@ async function fetchModelPublicKey(model: string, signingAlgo: string = 'ecdsa')
   const url = `${BASE_URL}/v1/attestation/report?model=${encodeURIComponent(model)}&signing_algo=${encodeURIComponent(signingAlgo)}`;
   const headers = { Authorization: `Bearer ${API_KEY}` };
   const report = await makeRequest(url, { headers });
-  
+
   // Try to get signing_public_key from model_attestations
   if (report.model_attestations && Array.isArray(report.model_attestations)) {
     for (const attestation of report.model_attestations) {
@@ -114,7 +115,7 @@ async function fetchModelPublicKey(model: string, signingAlgo: string = 'ecdsa')
   } else if (report.signing_public_key) {
     return report.signing_public_key;
   }
-  
+
   throw new Error(`Could not find signing_public_key for model ${model} with algorithm ${signingAlgo}`);
 }
 
@@ -155,14 +156,14 @@ function encryptEcdsa(data: Buffer, publicKeyHex: string): Buffer {
   if (publicKeyBytes.length !== 64) {
     throw new Error(`ECDSA public key must be 64 bytes, got ${publicKeyBytes.length}`);
   }
-  
+
   // Create EC public key point (add 0x04 prefix for uncompressed)
   const publicKeyPoint = Buffer.concat([Buffer.from([0x04]), publicKeyBytes]);
-  
+
   // Generate ephemeral key pair
   const ephemeralWallet = ethers.Wallet.createRandom();
   const ephemeralPrivateKey = Buffer.from(ephemeralWallet.privateKey.slice(2), 'hex');
-  
+
   // Perform ECDH using Node.js crypto
   const ecdh = crypto.createECDH('secp256k1');
   ecdh.setPrivateKey(ephemeralPrivateKey);
@@ -177,19 +178,19 @@ function encryptEcdsa(data: Buffer, publicKeyHex: string): Buffer {
       .update(publicKeyBytes)
       .digest();
   }
-  
+
   // Derive AES key using HKDF (simplified HKDF using HMAC)
   const hkdf = crypto.createHmac('sha256', Buffer.alloc(0));
   hkdf.update(sharedSecret);
   hkdf.update(Buffer.from('ecdsa_encryption'));
   const aesKey = hkdf.digest();
-  
+
   // Encrypt with AES-GCM
   const nonce = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, nonce);
   const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
   const authTag = cipher.getAuthTag();
-  
+
   // Format: [ephemeral_public_key (65 bytes)][nonce (12 bytes)][ciphertext][auth_tag (16 bytes)]
   const ephemeralPublicKeyFull = Buffer.from(ephemeralWallet.publicKey.slice(2), 'hex');
   return Buffer.concat([ephemeralPublicKeyFull, nonce, encrypted, authTag]);
@@ -202,13 +203,13 @@ function decryptEcdsa(encryptedData: Buffer, privateKey: string): Buffer {
   if (encryptedData.length < 93) {
     throw new Error('Encrypted data too short');
   }
-  
+
   // Extract components
   const ephemeralPublicKey = encryptedData.slice(0, 65);
   const nonce = encryptedData.slice(65, 77);
   const ciphertext = encryptedData.slice(77, encryptedData.length - 16);
   const authTag = encryptedData.slice(encryptedData.length - 16);
-  
+
   // Perform ECDH using Node.js crypto
   const wallet = new ethers.Wallet(privateKey);
   const privateKeyBytes = Buffer.from(wallet.privateKey.slice(2), 'hex');
@@ -224,13 +225,13 @@ function decryptEcdsa(encryptedData: Buffer, privateKey: string): Buffer {
       .update(ephemeralPublicKey.slice(1)) // Remove 0x04 prefix
       .digest();
   }
-  
+
   // Derive AES key using HKDF
   const hkdf = crypto.createHmac('sha256', Buffer.alloc(0));
   hkdf.update(sharedSecret);
   hkdf.update(Buffer.from('ecdsa_encryption'));
   const aesKey = hkdf.digest();
-  
+
   // Decrypt with AES-GCM
   const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, nonce);
   decipher.setAuthTag(authTag);
@@ -245,7 +246,7 @@ function encryptEd25519(data: Buffer, publicKeyHex: string): Buffer {
   if (publicKeyBytes.length !== 32) {
     throw new Error(`Ed25519 public key must be 32 bytes, got ${publicKeyBytes.length}`);
   }
-  
+
   // Convert Ed25519 public key to X25519 using nacl
   // nacl.box.keyPair.fromSecretKey can convert Ed25519 keys
   // We need to create a temporary keypair to get the conversion
@@ -253,14 +254,14 @@ function encryptEd25519(data: Buffer, publicKeyHex: string): Buffer {
   // For public key conversion, we use the public key directly
   // Note: This is a simplified conversion - proper conversion uses curve25519 conversion
   const x25519PublicKey = nacl.box.keyPair.fromSecretKey(tempKeyPair.secretKey).publicKey;
-  
+
   // Generate ephemeral key pair
   const ephemeralKeyPair = nacl.box.keyPair();
-  
+
   // Encrypt using Box
   const nonce = nacl.randomBytes(24);
   const encrypted = nacl.box(data, nonce, x25519PublicKey, ephemeralKeyPair.secretKey);
-  
+
   // Format: [ephemeral_public_key (32 bytes)][nonce (24 bytes)][ciphertext]
   return Buffer.concat([
     Buffer.from(ephemeralKeyPair.publicKey),
@@ -276,19 +277,19 @@ function decryptEd25519(encryptedData: Buffer, privateKey: Uint8Array): Buffer {
   if (encryptedData.length < 72) {
     throw new Error('Encrypted data too short');
   }
-  
+
   // Extract components
   const ephemeralPublicKey = encryptedData.slice(0, 32);
   const nonce = encryptedData.slice(32, 56);
   const ciphertext = encryptedData.slice(56);
-  
+
   // Convert Ed25519 private key to X25519
   // The private key should be 32 bytes (seed) or 64 bytes (seed + public key)
   // For nacl, we need to create a signing keypair first, then convert to box keypair
   const seed = privateKey.slice(0, 32);
   const signingKeyPair = nacl.sign.keyPair.fromSeed(seed);
   const x25519KeyPair = nacl.box.keyPair.fromSecretKey(signingKeyPair.secretKey);
-  
+
   // Decrypt using Box
   const decrypted = nacl.box.open(
     new Uint8Array(ciphertext),
@@ -296,11 +297,11 @@ function decryptEd25519(encryptedData: Buffer, privateKey: Uint8Array): Buffer {
     new Uint8Array(ephemeralPublicKey),
     x25519KeyPair.secretKey
   );
-  
+
   if (!decrypted) {
     throw new Error('Decryption failed');
   }
-  
+
   return Buffer.from(decrypted);
 }
 
@@ -353,7 +354,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
     console.log(`✗ Failed to fetch model public key: ${error}`);
     return;
   }
-  
+
   // Generate client key pair
   let clientPubKey: string;
   let clientPrivKey: any;
@@ -372,7 +373,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
     console.log(`✗ Failed to generate client key pair: ${error}`);
     return;
   }
-  
+
   // Prepare message
   const originalContent = 'Hello, how are you?';
   let encryptedContent: string;
@@ -383,21 +384,21 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
     console.log(`✗ Failed to encrypt message: ${error}`);
     return;
   }
-  
+
   const body: ChatCompletionRequest = {
     model,
     messages: [{ role: 'user', content: encryptedContent }],
     stream: true,
-    max_tokens: 10
+    max_tokens: MAX_TOKENS
   };
-  
+
   const bodyJson = JSON.stringify(body);
-  
+
   return new Promise((resolve, reject) => {
     const urlObj = new URL(`${BASE_URL}/v1/chat/completions`);
     const isHttps = urlObj.protocol === 'https:';
     const client = isHttps ? https : http;
-    
+
     const requestOptions = {
       hostname: urlObj.hostname,
       port: urlObj.port || (isHttps ? 443 : 80),
@@ -412,7 +413,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
       },
       timeout: 30000
     };
-    
+
     const req = client.request(requestOptions, (res) => {
       if (res.statusCode && res.statusCode !== 200) {
         let errorData = '';
@@ -432,28 +433,28 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
         });
         return;
       }
-      
+
       let buffer = '';
       let responseText = '';
       let chatId: string | null = null;
       let decryptedContent = '';
-      
+
       console.log(`✓ Request sent successfully (HTTP ${res.statusCode || 200})`);
       console.log('\nReceiving stream...');
-      
+
       res.on('data', (chunk) => {
         buffer += chunk.toString();
         responseText += chunk.toString();
-        
+
         let newlineIndex;
         while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
           const line = buffer.substring(0, newlineIndex).trim();
           buffer = buffer.substring(newlineIndex + 1);
-          
+
           if (line.length === 0 || line.startsWith(':')) {
             continue;
           }
-          
+
           if (line.startsWith('data: ') && chatId === null) {
             const dataStr = line.substring(6);
             if (dataStr === '[DONE]') {
@@ -469,7 +470,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
               // Ignore parsing errors
             }
           }
-          
+
           // Try to decrypt content
           if (line.startsWith('data: {') && !line.includes('[DONE]')) {
             try {
@@ -492,7 +493,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
           }
         }
       });
-      
+
       res.on('end', async () => {
         if (!chatId) {
           console.log(`✗ Failed to extract chat ID from streaming response`);
@@ -509,7 +510,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
         }
       });
     });
-    
+
     req.on('error', (error) => {
       console.log(`✗ Request failed: ${error}`);
       reject(error);
@@ -519,7 +520,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
       console.log(`✗ Request timeout`);
       reject(new Error('Request timeout'));
     });
-    
+
     req.write(bodyJson);
     req.end();
   });
@@ -542,7 +543,7 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
     console.log(`✗ Failed to fetch model public key: ${error}`);
     return;
   }
-  
+
   // Generate client key pair
   let clientPubKey: string;
   let clientPrivKey: any;
@@ -561,7 +562,7 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
     console.log(`✗ Failed to generate client key pair: ${error}`);
     return;
   }
-  
+
   // Prepare message
   const originalContent = 'Hello, how are you?';
   let encryptedContent: string;
@@ -572,16 +573,16 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
     console.log(`✗ Failed to encrypt message: ${error}`);
     return;
   }
-  
+
   const body: ChatCompletionRequest = {
     model,
     messages: [{ role: 'user', content: encryptedContent }],
     stream: false,
-    max_tokens: 10
+    max_tokens: MAX_TOKENS
   };
-  
+
   const bodyJson = JSON.stringify(body);
-  
+
   let response: any;
   try {
     response = await makeRequest(`${BASE_URL}/v1/chat/completions`, {
@@ -614,11 +615,11 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
     }
     return;
   }
-  
+
   const payload: ChatCompletionResponse = response;
   const chatId = payload.id || 'unknown';
   console.log(`✓ Chat ID: ${chatId}`);
-  
+
   // Check finish_reason to see if response was truncated
   if (payload.choices && payload.choices.length > 0) {
     const choice = payload.choices[0];
@@ -628,11 +629,11 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
       console.log(`  ⚠ Response was truncated due to max_tokens limit`);
     }
   }
-  
+
   // Decrypt response content (including all encrypted fields)
   if (payload.choices && payload.choices.length > 0) {
     const message = payload.choices[0].message;
-    
+
     // Decrypt all encrypted fields: content, reasoning_content, reasoning
     const decryptedFields: Record<string, string> = {};
     for (const field of ['content', 'reasoning_content', 'reasoning']) {
@@ -661,7 +662,7 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
         }
       }
     }
-    
+
     if (Object.keys(decryptedFields).length > 0) {
       // Show complete decrypted response
       if (decryptedFields.content) {
@@ -690,7 +691,7 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
     console.log('✗ No choices in response');
     console.log(`  Response: ${JSON.stringify(payload, null, 2)}`);
   }
-  
+
   // await verifyChat(chatId, bodyJson, JSON.stringify(response), `Encrypted Non-Streaming (${signingAlgo.toUpperCase()})`, model);
 }
 
