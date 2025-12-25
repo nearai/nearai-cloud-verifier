@@ -400,7 +400,7 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
             chat_id,
             body_json,
             response_text,
-            f"Encrypted Streaming ({signing_algo.upper()})",
+            f"Verifying Encrypted Streaming ({signing_algo.upper()})",
             model,
         )
 
@@ -559,7 +559,7 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
         chat_id,
         body_json,
         response.text,
-        f"Encrypted Non-Streaming ({signing_algo.upper()})",
+        f"Verifying Encrypted Non-Streaming ({signing_algo.upper()})",
         model,
     )
 
