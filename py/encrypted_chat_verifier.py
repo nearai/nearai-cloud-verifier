@@ -395,14 +395,14 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
     print(f"\n\n✓ Complete decrypted response: {decrypted_content}")
     print(f"✓ Total response length: {len(response_text)} bytes")
 
-    # if chat_id:
-    #     await verify_chat(
-    #         chat_id,
-    #         body_json,
-    #         response_text,
-    #         f"Encrypted Streaming ({signing_algo.upper()})",
-    #         model,
-    #     )
+    if chat_id:
+        await verify_chat(
+            chat_id,
+            body_json,
+            response_text,
+            f"Encrypted Streaming ({signing_algo.upper()})",
+            model,
+        )
 
 
 async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
@@ -555,13 +555,13 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
         print("✗ No choices in response")
         print(f"  Response: {json.dumps(payload, indent=2)}")
 
-    # await verify_chat(
-    #     chat_id,
-    #     body_json,
-    #     response.text,
-    #     f"Encrypted Non-Streaming ({signing_algo.upper()})",
-    #     model,
-    # )
+    await verify_chat(
+        chat_id,
+        body_json,
+        response.text,
+        f"Encrypted Non-Streaming ({signing_algo.upper()})",
+        model,
+    )
 
 
 async def main():
