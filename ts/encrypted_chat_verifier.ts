@@ -576,7 +576,7 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
   let modelPubKey: string;
   try {
     modelPubKey = await fetchModelPublicKey(model, signingAlgo);
-    console.log(`✓ Fetched model public key: ${modelPubKey.substring(0, 32)}...`);
+    console.log(`✓ Fetched model public key: ${modelPubKey}`);
   } catch (error) {
     console.log(`✗ Failed to fetch model public key: ${error}`);
     return;

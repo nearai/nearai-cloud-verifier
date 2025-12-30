@@ -341,7 +341,8 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
             try:
                 error_detail = e.response.json()
                 print(f"  Error detail: {json.dumps(error_detail, indent=2)}")
-            except:
+            except Exception as e:
+                print(f"✗ Failed to parse error detail: {e}")
                 print(f"  Response text: {e.response.text[:200]}")
         return
     except Exception as e:
@@ -363,8 +364,9 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
                 if "id" in data:
                     chat_id = data["id"]
                     print(f"✓ Chat ID: {chat_id}")
-            except:
-                pass
+            except Exception as e:
+                print(f"✗ Failed to parse chat ID: {e}")
+                print(f"  Line: {line}")
 
         # Try to decrypt content from streaming chunks
         if line.startswith("data: {") and not line.endswith("[DONE]"):
@@ -384,11 +386,13 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
                                 end="",
                                 flush=True,
                             )
-                        except:
+                        except Exception as e:
+                            print(f"✗ Failed to decrypt content: {e}")
                             # If decryption fails, might be plain text or invalid hex
-                            pass
-            except:
-                pass
+                            print(f"  Encrypted content: {content_hex}")
+            except Exception as e:
+                print(f"✗ Failed to decrypt content: {e}")
+                print(f"  Encrypted content: {line}")
 
     print(f"\n\n✓ Complete decrypted response: {decrypted_content}")
     print(f"✓ Total response length: {len(response_text)} bytes")
@@ -412,7 +416,7 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
     # Fetch model public key
     try:
         model_pub_key = fetch_model_public_key(model, signing_algo)
-        print(f"✓ Fetched model public key: {model_pub_key[:32]}...")
+        print(f"✓ Fetched model public key: {model_pub_key}")
     except Exception as e:
         print(f"✗ Failed to fetch model public key: {e}")
         return
@@ -476,7 +480,8 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
             try:
                 error_detail = e.response.json()
                 print(f"  Error detail: {json.dumps(error_detail, indent=2)}")
-            except:
+            except Exception as e:
+                print(f"✗ Failed to parse error detail: {e}")
                 print(f"  Response text: {e.response.text[:200]}")
         return
     except Exception as e:
