@@ -10,6 +10,7 @@ import * as http from 'http';
 import { URL } from 'url';
 import { ethers } from 'ethers';
 import * as nacl from 'tweetnacl';
+import * as ed2curve from 'ed2curve';
 import {
   verifyChat,
 } from './chat_verifier';
@@ -136,15 +137,34 @@ function generateEcdsaKeyPair(): { privateKey: string; publicKey: string; wallet
 
 /**
  * Generate Ed25519 key pair
+ * Returns Ed25519 keys (not X25519) - these can be converted to X25519 for Box encryption
  */
-function generateEd25519KeyPair(): { privateKey: Uint8Array; publicKey: string; keyPair: nacl.BoxKeyPair } {
-  const keyPair = nacl.box.keyPair();
+function generateEd25519KeyPair(): { privateKey: Uint8Array; publicKey: string; keyPair: nacl.SignKeyPair } {
+  const keyPair = nacl.sign.keyPair();
   const publicKeyHex = Buffer.from(keyPair.publicKey).toString('hex');
   return {
-    privateKey: keyPair.secretKey,
-    publicKey: publicKeyHex,
+    privateKey: keyPair.secretKey, // 64 bytes: seed (32) + public key (32)
+    publicKey: publicKeyHex, // 32 bytes Ed25519 public key
     keyPair
   };
+}
+
+/**
+ * HKDF implementation matching vllm-proxy's implementation
+ * When salt is null/None, use a zero-filled salt of hash length (32 bytes for SHA256)
+ */
+function hkdf(ikm: Buffer, salt: Buffer | null, info: Buffer, length: number): Buffer {
+  const hashLength = 32; // SHA256 output length
+  const saltBuffer = salt || Buffer.alloc(hashLength); // Zero-filled if null
+
+  // Extract: PRK = HMAC-SHA256(salt, IKM)
+  const prk = crypto.createHmac('sha256', saltBuffer).update(ikm).digest();
+
+  // Expand: OKM = HMAC-SHA256(PRK, info || 0x01) truncated to length
+  const hmac = crypto.createHmac('sha256', prk);
+  hmac.update(info);
+  hmac.update(Buffer.from([0x01])); // Counter byte
+  return hmac.digest().slice(0, length);
 }
 
 /**
@@ -179,11 +199,14 @@ function encryptEcdsa(data: Buffer, publicKeyHex: string): Buffer {
       .digest();
   }
 
-  // Derive AES key using HKDF (simplified HKDF using HMAC)
-  const hkdf = crypto.createHmac('sha256', Buffer.alloc(0));
-  hkdf.update(sharedSecret);
-  hkdf.update(Buffer.from('ecdsa_encryption'));
-  const aesKey = hkdf.digest();
+  // Derive AES key using HKDF
+  // HKDF(algorithm=SHA256, length=32, salt=None, info=b"ecdsa_encryption")
+  const aesKey = hkdf(
+    sharedSecret,
+    null, // salt (zero-filled 32 bytes)
+    Buffer.from('ecdsa_encryption'), // info
+    32 // length
+  );
 
   // Encrypt with AES-GCM
   const nonce = crypto.randomBytes(12);
@@ -191,9 +214,11 @@ function encryptEcdsa(data: Buffer, publicKeyHex: string): Buffer {
   const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
   const authTag = cipher.getAuthTag();
 
-  // Format: [ephemeral_public_key (65 bytes)][nonce (12 bytes)][ciphertext][auth_tag (16 bytes)]
+  // Format: [ephemeral_public_key (65 bytes)][nonce (12 bytes)][ciphertext + auth_tag]
+  // vllm-proxy's AESGCM.encrypt() includes auth tag in ciphertext, so we append it here
+  const ciphertextWithAuthTag = Buffer.concat([encrypted, authTag]);
   const ephemeralPublicKeyFull = Buffer.from(ephemeralWallet.publicKey.slice(2), 'hex');
-  return Buffer.concat([ephemeralPublicKeyFull, nonce, encrypted, authTag]);
+  return Buffer.concat([ephemeralPublicKeyFull, nonce, ciphertextWithAuthTag]);
 }
 
 /**
@@ -205,10 +230,11 @@ function decryptEcdsa(encryptedData: Buffer, privateKey: string): Buffer {
   }
 
   // Extract components
+  // Format: [ephemeral_public_key (65 bytes)][nonce (12 bytes)][ciphertext_with_auth_tag]
+  // vllm-proxy's AESGCM.encrypt() includes auth tag in ciphertext (last 16 bytes)
   const ephemeralPublicKey = encryptedData.slice(0, 65);
   const nonce = encryptedData.slice(65, 77);
-  const ciphertext = encryptedData.slice(77, encryptedData.length - 16);
-  const authTag = encryptedData.slice(encryptedData.length - 16);
+  const ciphertextWithAuthTag = encryptedData.slice(77);
 
   // Perform ECDH using Node.js crypto
   const wallet = new ethers.Wallet(privateKey);
@@ -227,12 +253,18 @@ function decryptEcdsa(encryptedData: Buffer, privateKey: string): Buffer {
   }
 
   // Derive AES key using HKDF
-  const hkdf = crypto.createHmac('sha256', Buffer.alloc(0));
-  hkdf.update(sharedSecret);
-  hkdf.update(Buffer.from('ecdsa_encryption'));
-  const aesKey = hkdf.digest();
+  // HKDF(algorithm=SHA256, length=32, salt=None, info=b"ecdsa_encryption")
+  const aesKey = hkdf(
+    sharedSecret,
+    null, // salt (zero-filled 32 bytes)
+    Buffer.from('ecdsa_encryption'), // info
+    32 // length
+  );
 
   // Decrypt with AES-GCM
+  // Extract auth tag from end of ciphertext (last 16 bytes)
+  const authTag = ciphertextWithAuthTag.slice(ciphertextWithAuthTag.length - 16);
+  const ciphertext = ciphertextWithAuthTag.slice(0, ciphertextWithAuthTag.length - 16);
   const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, nonce);
   decipher.setAuthTag(authTag);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
@@ -247,13 +279,13 @@ function encryptEd25519(data: Buffer, publicKeyHex: string): Buffer {
     throw new Error(`Ed25519 public key must be 32 bytes, got ${publicKeyBytes.length}`);
   }
 
-  // Convert Ed25519 public key to X25519 using nacl
-  // nacl.box.keyPair.fromSecretKey can convert Ed25519 keys
-  // We need to create a temporary keypair to get the conversion
-  const tempKeyPair = nacl.sign.keyPair.fromSeed(publicKeyBytes);
-  // For public key conversion, we use the public key directly
-  // Note: This is a simplified conversion - proper conversion uses curve25519 conversion
-  const x25519PublicKey = nacl.box.keyPair.fromSecretKey(tempKeyPair.secretKey).publicKey;
+  // Convert Ed25519 public key to X25519 public key using ed2curve
+  const ed25519PublicKey = new Uint8Array(publicKeyBytes);
+  const x25519PublicKey = ed2curve.convertPublicKey(ed25519PublicKey);
+  
+  if (!x25519PublicKey) {
+    throw new Error('Failed to convert Ed25519 public key to X25519');
+  }
 
   // Generate ephemeral key pair
   const ephemeralKeyPair = nacl.box.keyPair();
@@ -283,12 +315,20 @@ function decryptEd25519(encryptedData: Buffer, privateKey: Uint8Array): Buffer {
   const nonce = encryptedData.slice(32, 56);
   const ciphertext = encryptedData.slice(56);
 
-  // Convert Ed25519 private key to X25519
+  // Convert Ed25519 private key to X25519 using ed2curve
   // The private key should be 32 bytes (seed) or 64 bytes (seed + public key)
-  // For nacl, we need to create a signing keypair first, then convert to box keypair
   const seed = privateKey.slice(0, 32);
   const signingKeyPair = nacl.sign.keyPair.fromSeed(seed);
-  const x25519KeyPair = nacl.box.keyPair.fromSecretKey(signingKeyPair.secretKey);
+  
+  // Convert Ed25519 secret key to X25519 secret key
+  const x25519SecretKey = ed2curve.convertSecretKey(signingKeyPair.secretKey);
+  
+  if (!x25519SecretKey) {
+    throw new Error('Failed to convert Ed25519 private key to X25519');
+  }
+
+  // Create X25519 keypair from the converted secret key
+  const x25519KeyPair = nacl.box.keyPair.fromSecretKey(x25519SecretKey);
 
   // Decrypt using Box
   const decrypted = nacl.box.open(
@@ -349,7 +389,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
   let modelPubKey: string;
   try {
     modelPubKey = await fetchModelPublicKey(model, signingAlgo);
-    console.log(`✓ Fetched model public key: ${modelPubKey.substring(0, 32)}...`);
+    console.log(`✓ Fetched model public key: ${modelPubKey}`);
   } catch (error) {
     console.log(`✗ Failed to fetch model public key: ${error}`);
     return;
@@ -379,7 +419,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
   let encryptedContent: string;
   try {
     encryptedContent = encryptMessageContent(originalContent, modelPubKey, signingAlgo);
-    console.log(`✓ Encrypted message content`);
+    console.log(`✓ Encrypted message content: ${encryptedContent}`);
   } catch (error) {
     console.log(`✗ Failed to encrypt message: ${error}`);
     return;
@@ -503,7 +543,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
         console.log(`\n\n✓ Complete decrypted response: ${decryptedContent}`);
         console.log(`✓ Total response length: ${responseText.length} bytes`);
         try {
-          // await verifyChat(chatId, bodyJson, responseText, `Encrypted Streaming (${signingAlgo.toUpperCase()})`, model);
+          await verifyChat(chatId, bodyJson, responseText, `Encrypted Streaming (${signingAlgo.toUpperCase()})`, model);
           resolve();
         } catch (error) {
           reject(error);
@@ -568,7 +608,7 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
   let encryptedContent: string;
   try {
     encryptedContent = encryptMessageContent(originalContent, modelPubKey, signingAlgo);
-    console.log(`✓ Encrypted message content`);
+    console.log(`✓ Encrypted message content: ${encryptedContent}`);
   } catch (error) {
     console.log(`✗ Failed to encrypt message: ${error}`);
     return;
@@ -692,7 +732,7 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
     console.log(`  Response: ${JSON.stringify(payload, null, 2)}`);
   }
 
-  // await verifyChat(chatId, bodyJson, JSON.stringify(response), `Encrypted Non-Streaming (${signingAlgo.toUpperCase()})`, model);
+  await verifyChat(chatId, bodyJson, JSON.stringify(response), `Encrypted Non-Streaming (${signingAlgo.toUpperCase()})`, model);
 }
 
 /**

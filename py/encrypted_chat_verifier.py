@@ -278,7 +278,7 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
     # Fetch model public key
     try:
         model_pub_key = fetch_model_public_key(model, signing_algo)
-        print(f"✓ Fetched model public key: {model_pub_key[:32]}...")
+        print(f"✓ Fetched model public key: {model_pub_key}")
     except Exception as e:
         print(f"✗ Failed to fetch model public key: {e}")
         return
@@ -304,7 +304,7 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
         encrypted_content = encrypt_message_content(
             original_content, model_pub_key, signing_algo
         )
-        print(f"✓ Encrypted message content")
+        print(f"✓ Encrypted message content: {encrypted_content}")
     except Exception as e:
         print(f"✗ Failed to encrypt message: {e}")
         return
@@ -440,7 +440,7 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
         encrypted_content = encrypt_message_content(
             original_content, model_pub_key, signing_algo
         )
-        print(f"✓ Encrypted message content")
+        print(f"✓ Encrypted message content: {encrypted_content}")
     except Exception as e:
         print(f"✗ Failed to encrypt message: {e}")
         return
