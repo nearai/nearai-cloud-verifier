@@ -38,8 +38,6 @@ def fetch_model_public_key(model, signing_algo="ecdsa"):
         for attestation in report["model_attestations"]:
             if "signing_public_key" in attestation:
                 return attestation["signing_public_key"]
-    elif "signing_public_key" in report:
-        return report["signing_public_key"]
 
     raise ValueError(
         f"Could not find signing_public_key for model {model} with algorithm {signing_algo}"

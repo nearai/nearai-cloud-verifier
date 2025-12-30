@@ -113,8 +113,6 @@ async function fetchModelPublicKey(model: string, signingAlgo: string = 'ecdsa')
         return attestation.signing_public_key;
       }
     }
-  } else if (report.signing_public_key) {
-    return report.signing_public_key;
   }
 
   throw new Error(`Could not find signing_public_key for model ${model} with algorithm ${signingAlgo}`);
