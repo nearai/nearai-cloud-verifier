@@ -376,20 +376,16 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
                     delta = data["choices"][0].get("delta", {})
                     if "content" in delta:
                         content_hex = delta["content"]
-                        try:
-                            decrypted_chunk = decrypt_message_content(
-                                content_hex, client_priv_key, signing_algo
-                            )
-                            decrypted_content += decrypted_chunk
-                            print(
-                                f"  Decrypted chunk: {decrypted_chunk}\n",
-                                end="",
-                                flush=True,
-                            )
-                        except Exception as e:
-                            print(f"✗ Failed to decrypt content: {e}")
-                            # If decryption fails, might be plain text or invalid hex
-                            print(f"  Encrypted content: {content_hex}")
+                        if isinstance(content_hex, str) and len(content_hex) > 0:
+                            try:
+                                decrypted_chunk = decrypt_message_content(
+                                    content_hex, client_priv_key, signing_algo
+                                )
+                                decrypted_content += decrypted_chunk
+                                print(f"  Decrypted chunk: {decrypted_chunk}\n", end="", flush=True)
+                            except Exception as e:
+                                print(f"✗ Failed to decrypt content: {e}")
+                                print(f"  Encrypted content: {content_hex}")
             except Exception as e:
                 print(f"✗ Failed to decrypt content: {e}")
                 print(f"  Encrypted content: {line}")
