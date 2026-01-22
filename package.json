@@ -7,15 +7,19 @@
   "scripts": {
     "build": "tsc",
     "chat": "tsx ts/chat_verifier.ts",
+    "encrypted-chat": "tsx ts/encrypted_chat_verifier.ts",
     "model": "tsx ts/model_verifier.ts",
     "domain": "tsx ts/domain_verifier.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
     "@phala/dcap-qvl-node": "^0.3.3",
-    "ethers": "^5.7.2"
+    "ed2curve": "^0.3.0",
+    "ethers": "^5.7.2",
+    "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
+    "@types/ed2curve": "^0.2.4",
     "@types/node": "^22.0.0",
     "tsx": "^4.20.6",
     "typescript": "^5.8.3"

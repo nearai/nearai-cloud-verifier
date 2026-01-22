@@ -11,10 +11,19 @@ importers:
       '@phala/dcap-qvl-node':
         specifier: ^0.3.3
         version: 0.3.3
+      ed2curve:
+        specifier: ^0.3.0
+        version: 0.3.0
       ethers:
         specifier: ^5.7.2
         version: 5.8.0
+      tweetnacl:
+        specifier: ^1.0.3
+        version: 1.0.3
     devDependencies:
+      '@types/ed2curve':
+        specifier: ^0.2.4
+        version: 0.2.4
       '@types/node':
         specifier: ^22.0.0
         version: 22.18.11
@@ -276,6 +285,9 @@ packages:
   '@phala/dcap-qvl-node@0.3.3':
     resolution: {integrity: sha512-Iakz7N6VfWXWfgDkgJ5PFr414UV8BD3mk9ssEd0sFFiGNgiAwzD/wE2zwsGRya7qYYC+R8rvg4uEHXQfu1ArAQ==}
 
+  '@types/ed2curve@0.2.4':
+    resolution: {integrity: sha512-1m9IX8qypOa0K1NfdMsMxB3gjhKyXbr5Yl9FzzwWQjLSDFGLkvRvSfla1NYqzIt72ocIALMXsF+twRlzr1ov/g==}
+
   '@types/node@22.18.11':
     resolution: {integrity: sha512-Gd33J2XIrXurb+eT2ktze3rJAfAp9ZNjlBdh4SVgyrKEOADwCbdUDaK7QgJno8Ue4kcajscsKqu6n8OBG3hhCQ==}
 
@@ -293,6 +305,9 @@ packages:
 
   brorand@1.1.0:
     resolution: {integrity: sha512-cKV8tMCEpQs4hK/ik71d6LrPOnpkpGBR0wzxqr68g2m/LB2GxVYQroAjMJZRVM1Y4BCjCKc3vAamxSzOY2RP+w==}
+
+  ed2curve@0.3.0:
+    resolution: {integrity: sha512-8w2fmmq3hv9rCrcI7g9hms2pMunQr1JINfcjwR9tAyZqhtyaMN991lF/ZfHfr5tzZQ8c7y7aBgZbjfbd0fjFwQ==}
 
   elliptic@6.6.1:
     resolution: {integrity: sha512-RaddvvMatK2LJHqFJ+YA4WysVN5Ita9E35botqIYspQ4TkRAlCicdzKOjlyv/1Za5RyTNn7di//eEV0uTAfe3g==}
@@ -341,6 +356,9 @@ packages:
     resolution: {integrity: sha512-ytQKuwgmrrkDTFP4LjR0ToE2nqgy886GpvRSpU0JAnrdBYppuY5rLkRUYPU1yCryb24SsKBTL/hlDQAEFVwtZg==}
     engines: {node: '>=18.0.0'}
     hasBin: true
+
+  tweetnacl@1.0.3:
+    resolution: {integrity: sha512-6rt+RN7aOi1nGMyC4Xa5DdYiukl2UWCbcJft7YhxReBGQD7OAM8Pbxw6YMo4r2diNEA8FEmu32YOn9rhaiE5yw==}
 
   typescript@5.9.3:
     resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
@@ -699,6 +717,10 @@ snapshots:
 
   '@phala/dcap-qvl-node@0.3.3': {}
 
+  '@types/ed2curve@0.2.4':
+    dependencies:
+      tweetnacl: 1.0.3
+
   '@types/node@22.18.11':
     dependencies:
       undici-types: 6.21.0
@@ -712,6 +734,10 @@ snapshots:
   bn.js@5.2.2: {}
 
   brorand@1.1.0: {}
+
+  ed2curve@0.3.0:
+    dependencies:
+      tweetnacl: 1.0.3
 
   elliptic@6.6.1:
     dependencies:
@@ -824,6 +850,8 @@ snapshots:
       get-tsconfig: 4.12.0
     optionalDependencies:
       fsevents: 2.3.3
+
+  tweetnacl@1.0.3: {}
 
   typescript@5.9.3: {}
 
