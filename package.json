@@ -8,6 +8,8 @@
     "build": "tsc",
     "chat": "tsx ts/chat_verifier.ts",
     "encrypted-chat": "tsx ts/encrypted_chat_verifier.ts",
+    "image": "tsx ts/image_verifier.ts",
+    "encrypted-image": "tsx ts/encrypted_image_verifier.ts",
     "model": "tsx ts/model_verifier.ts",
     "domain": "tsx ts/domain_verifier.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
