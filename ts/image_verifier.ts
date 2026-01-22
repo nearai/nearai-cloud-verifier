@@ -258,7 +258,7 @@ async function imageGenerationExample(model: string): Promise<void> {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const modelIndex = args.indexOf('--model');
-  const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'Qwen/Qwen-Image';
+  const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'black-forest-labs/FLUX.2-klein-4B';
 
   if (!API_KEY) {
     console.log('Error: API_KEY environment variable is required');

@@ -495,8 +495,14 @@ async function encryptedImageGenerationExample(model: string, signingAlgo: strin
             } catch (error) {
               console.log(`✗ Failed to decrypt b64_json for image ${i + 1}: ${error}`);
             }
+          } else {
+            console.log(`⚠ b64_json for image ${i + 1} is not valid hex (might be plain base64): length=${encryptedB64.length}, isHex=${/^[0-9a-fA-F]+$/.test(encryptedB64)}`);
           }
+        } else {
+          console.log(`⚠ b64_json for image ${i + 1} is not valid. b64_json: ${encryptedB64}`);
         }
+      } else {
+        console.log(`⚠ b64_json for image ${i + 1} is not present`);
       }
       
       // Decrypt revised_prompt if present and encrypted
@@ -511,8 +517,14 @@ async function encryptedImageGenerationExample(model: string, signingAlgo: strin
             } catch (error) {
               console.log(`✗ Failed to decrypt revised_prompt for image ${i + 1}: ${error}`);
             }
+          } else {
+            console.log(`⚠ revised_prompt for image ${i + 1} is not valid. revised_prompt: ${encryptedPrompt}`);
           }
+        } else {
+          console.log(`⚠ revised_prompt for image ${i + 1} is not valid. revised_prompt: ${encryptedPrompt}`);
         }
+      } else {
+        console.log(`⚠ revised_prompt for image ${i + 1} is not present`);
       }
     }
   }
@@ -526,7 +538,7 @@ async function encryptedImageGenerationExample(model: string, signingAlgo: strin
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const modelIndex = args.indexOf('--model');
-  const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'Qwen/Qwen-Image';
+  const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'black-forest-labs/FLUX.2-klein-4B';
   const signingAlgoIndex = args.indexOf('--signing-algo');
   const signingAlgo = signingAlgoIndex !== -1 && signingAlgoIndex + 1 < args.length && args[signingAlgoIndex + 1] ? args[signingAlgoIndex + 1] : 'ecdsa';
   const testBoth = args.includes('--test-both');
