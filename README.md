@@ -98,10 +98,10 @@ pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --test-both
 export API_KEY=sk-your-api-key-here
 
 # Python
-python3 py/image_verifier.py --model Qwen/Qwen-Image
+python3 py/image_verifier.py --model black-forest-labs/FLUX.2-klein-4B
 
 # TypeScript
-pnpm run image -- --model Qwen/Qwen-Image
+pnpm run image -- --model black-forest-labs/FLUX.2-klein-4B
 ```
 
 ### Encrypted Image Generation Verification
@@ -110,16 +110,16 @@ pnpm run image -- --model Qwen/Qwen-Image
 export API_KEY=sk-your-api-key-here
 
 # Python - Test ECDSA encryption
-python3 py/encrypted_image_verifier.py --model Qwen/Qwen-Image
+python3 py/encrypted_image_verifier.py --model black-forest-labs/FLUX.2-klein-4B
 
 # Python - Test both ECDSA and Ed25519
-python3 py/encrypted_image_verifier.py --model Qwen/Qwen-Image --test-both
+python3 py/encrypted_image_verifier.py --model black-forest-labs/FLUX.2-klein-4B --test-both
 
 # TypeScript - Test ECDSA encryption
-pnpm run encrypted-image -- --model Qwen/Qwen-Image
+pnpm run encrypted-image -- --model black-forest-labs/FLUX.2-klein-4B
 
 # TypeScript - Test both algorithms
-pnpm run encrypted-image -- --model Qwen/Qwen-Image --test-both
+pnpm run encrypted-image -- --model black-forest-labs/FLUX.2-klein-4B --test-both
 ```
 
 ### Domain Verification
@@ -587,10 +587,10 @@ pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1
 export API_KEY=sk-your-api-key-here
 
 # Python
-python3 py/image_verifier.py --model Qwen/Qwen-Image
+python3 py/image_verifier.py --model black-forest-labs/FLUX.2-klein-4B
 
 # TypeScript
-pnpm run image -- --model Qwen/Qwen-Image
+pnpm run image -- --model black-forest-labs/FLUX.2-klein-4B
 ```
 
 ### Domain Verification

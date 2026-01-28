@@ -188,7 +188,7 @@ def encrypt_ed25519(data: bytes, public_key_hex: str) -> bytes:
 
     # Generate ephemeral X25519 key pair using PyNaCl
     ephemeral_private = X25519PrivateKeyNaCl.generate()
-    ephemeral_public = ephemeral_private.public_key()
+    ephemeral_public = ephemeral_private.public_key
 
     # Create Box for encryption
     box = Box(ephemeral_private, x25519_public)
