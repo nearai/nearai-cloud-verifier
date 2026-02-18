@@ -10,6 +10,7 @@
     "encrypted-chat": "tsx ts/encrypted_chat_verifier.ts",
     "model": "tsx ts/model_verifier.ts",
     "domain": "tsx ts/domain_verifier.ts",
+    "tls": "tsx ts/tls_verifier.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
