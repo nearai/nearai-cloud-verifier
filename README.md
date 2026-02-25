@@ -92,6 +92,36 @@ pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1
 pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --test-both
 ```
 
+### Image Generation Verification
+
+```bash
+export API_KEY=sk-your-api-key-here
+
+# Python
+python3 py/image_verifier.py --model black-forest-labs/FLUX.2-klein-4B
+
+# TypeScript
+pnpm run image -- --model black-forest-labs/FLUX.2-klein-4B
+```
+
+### Encrypted Image Generation Verification
+
+```bash
+export API_KEY=sk-your-api-key-here
+
+# Python - Test ECDSA encryption
+python3 py/encrypted_image_verifier.py --model black-forest-labs/FLUX.2-klein-4B
+
+# Python - Test both ECDSA and Ed25519
+python3 py/encrypted_image_verifier.py --model black-forest-labs/FLUX.2-klein-4B --test-both
+
+# TypeScript - Test ECDSA encryption
+pnpm run encrypted-image -- --model black-forest-labs/FLUX.2-klein-4B
+
+# TypeScript - Test both algorithms
+pnpm run encrypted-image -- --model black-forest-labs/FLUX.2-klein-4B --test-both
+```
+
 ### Domain Verification
 
 ```bash
@@ -228,6 +258,19 @@ Fetches chat completions (streaming and non-streaming), verifies ECDSA signature
 
 **Note**: The verifier supplies a fresh nonce when fetching attestation (step 5), which ensures attestation freshness but means the nonce/report_data won't match the original signing context. This is expected behavior - the verifier proves the signing key is bound to valid hardware, not that a specific attestation was used for signing.
 
+## 🖼️ Image Generation Verifier
+
+Fetches image generation responses, verifies ECDSA signatures, and validates attestations:
+
+1. Sends image generation request to `/v1/images/generations`
+2. Fetches signature from `/v1/signature/{image_id}` endpoint (using the `id` field from the response)
+3. Verifies request hash and response hash match the signed hashes
+4. Recovers ECDSA signing address from signature
+5. Fetches fresh attestation with user-supplied nonce for the recovered signing address
+6. Validates attestation using the same checks as attestation verifier
+
+**Note**: The image generation verifier follows the same pattern as the chat verifier. The response includes an `id` field that is used to fetch the signature, just like `chat_id` for chat completions.
+
 ### Setup
 
 Set your API key as an environment variable:
@@ -267,6 +310,10 @@ pnpm run model -- [--model MODEL_NAME]
 
 Tests end-to-end encryption for chat completions. Encrypts request messages and decrypts response content using ECDSA or Ed25519 signing algorithms.
 
+## 🔐 Encrypted Image Generation Verifier
+
+Tests end-to-end encryption for image generation. Encrypts the prompt in the request and decrypts the response fields (`b64_json` and `revised_prompt`) using ECDSA or Ed25519 signing algorithms. When encryption is enabled, both the request prompt and response image data fields are encrypted.
+
 ### Setup
 
 Set your API key as an environment variable:
@@ -299,7 +346,7 @@ pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --test-both
 
 **Default model**: `deepseek-ai/DeepSeek-V3.1`
 
-### What It Tests
+### What It Tests (Chat)
 
 - ✅ **End-to-End Encryption** - Request messages encrypted with model's public key
 - ✅ **Response Decryption** - Response content decrypted with client's private key
@@ -307,6 +354,14 @@ pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --test-both
 - ✅ **Ed25519 Encryption** - X25519 key exchange with ChaCha20-Poly1305
 - ✅ **Streaming Support** - Decrypts streaming responses in real-time
 - ✅ **Non-Streaming Support** - Decrypts complete non-streaming responses
+
+### What It Tests (Image Generation)
+
+- ✅ **End-to-End Encryption** - Request prompt encrypted with model's public key
+- ✅ **Response Decryption** - Response `b64_json` and `revised_prompt` fields decrypted with client's private key
+- ✅ **ECDSA Encryption** - ECIES (Elliptic Curve Integrated Encryption Scheme) with AES-GCM
+- ✅ **Ed25519 Encryption** - X25519 key exchange with ChaCha20-Poly1305
+- ✅ **Signature Verification** - Verifies request and response hashes match signed values
 
 ### Encryption Headers
 
@@ -524,6 +579,18 @@ python3 py/chat_verifier.py --model deepseek-ai/DeepSeek-V3.1
 
 # TypeScript
 pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1
+```
+
+### Image Generation Verification with Custom Model
+
+```bash
+export API_KEY=sk-your-api-key-here
+
+# Python
+python3 py/image_verifier.py --model black-forest-labs/FLUX.2-klein-4B
+
+# TypeScript
+pnpm run image -- --model black-forest-labs/FLUX.2-klein-4B
 ```
 
 ### Domain Verification
