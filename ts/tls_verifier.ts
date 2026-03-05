@@ -26,6 +26,7 @@
  */
 
 import * as crypto from 'crypto';
+import * as https from 'https';
 import * as tls from 'tls';
 import { Buffer } from 'buffer';
 
@@ -40,104 +41,83 @@ import {
 } from './model_verifier';
 
 interface TlsAttestationReport extends AttestationBaseInfo {
+  model_name?: string;
   tls_cert_fingerprint?: string;
   signing_public_key?: string;
   request_nonce?: string;
 }
 
 /**
- * Connect to a server via TLS and compute the SHA-256 hash of the leaf
- * certificate's Subject Public Key Info (SPKI) DER encoding.
+ * Fetch attestation report AND extract the live TLS certificate SPKI hash
+ * from the same connection.
  *
- * This matches the inference proxy's `compute_spki_hash()` function which
- * hashes the SPKI (not the full certificate), making the hash stable across
- * certificate renewals that reuse the same key.
+ * Using a single TLS connection guarantees both values come from the same
+ * backend, avoiding mismatches caused by DNS round-robin or load-balancer
+ * routing between multiple backends.
  */
-function fetchLiveSpkiHash(hostname: string, port: number = 443): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const socket = tls.connect(port, hostname, {
-      servername: hostname,
-      rejectUnauthorized: false, // Trust comes from TEE binding, not CA
-    });
-
-    let resolved = false;
-
-    socket.on('secureConnect', () => {
-      if (resolved) return;
-      resolved = true;
-
-      try {
-        const cert = socket.getPeerX509Certificate();
-        if (!cert) {
-          socket.end();
-          reject(new Error('Failed to get certificate from server'));
-          return;
-        }
-        socket.end();
-
-        // Export SPKI DER and compute SHA-256 — matches inference proxy's compute_spki_hash()
-        const spkiDer = cert.publicKey.export({ type: 'spki', format: 'der' });
-        const hash = crypto.createHash('sha256').update(spkiDer).digest('hex');
-        resolve(hash);
-      } catch (error) {
-        socket.end();
-        reject(error);
-      }
-    });
-
-    socket.on('error', (error) => {
-      if (resolved) return;
-      resolved = true;
-      reject(new Error(`TLS connection failed: ${error.message}`));
-    });
-
-    socket.setTimeout(10000, () => {
-      if (resolved) return;
-      resolved = true;
-      socket.destroy();
-      reject(new Error('TLS connection timeout'));
-    });
-  });
-}
-
-/**
- * Fetch attestation report from an inference proxy with TLS fingerprint included.
- * The endpoint is public on proxies with the latest build. For older deployments
- * that still require auth, pass a bearer token via --token.
- */
-async function fetchAttestationReport(
-  baseUrl: string,
+function fetchAttestationAndSpki(
+  hostname: string,
+  port: number,
   nonce: string,
   signingAlgo: string = 'ecdsa',
   token?: string,
-): Promise<TlsAttestationReport> {
-  const url = `${baseUrl}/v1/attestation/report?include_tls_fingerprint=true&nonce=${nonce}&signing_algo=${signingAlgo}`;
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 60000);
-
-  const headers: Record<string, string> = {};
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  try {
-    const response = await fetch(url, { signal: controller.signal, headers });
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text}`);
+): Promise<{ attestation: TlsAttestationReport; liveSpkiHash: string }> {
+  return new Promise((resolve, reject) => {
+    const path = `/v1/attestation/report?include_tls_fingerprint=true&nonce=${nonce}&signing_algo=${signingAlgo}`;
+    const headers: Record<string, string> = { 'Host': hostname };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
     }
 
-    return await response.json() as TlsAttestationReport;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('Attestation request timed out');
-    }
-    throw error;
-  }
+    const req = https.request({
+      hostname,
+      port,
+      path,
+      method: 'GET',
+      headers,
+      rejectUnauthorized: false, // Trust comes from TEE binding, not CA
+      servername: hostname,
+      timeout: 60000,
+    }, (res) => {
+      // Extract live SPKI hash from this TLS session
+      const tlsSocket = res.socket as tls.TLSSocket;
+      const cert = tlsSocket.getPeerX509Certificate();
+      if (!cert) {
+        reject(new Error('Failed to get certificate from server'));
+        return;
+      }
+      const spkiDer = cert.publicKey.export({ type: 'spki', format: 'der' });
+      const liveSpkiHash = crypto.createHash('sha256').update(spkiDer).digest('hex');
+
+      // Read response body
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString();
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode}: ${body}`));
+          return;
+        }
+        try {
+          const attestation = JSON.parse(body) as TlsAttestationReport;
+          resolve({ attestation, liveSpkiHash });
+        } catch (e) {
+          reject(new Error(`Failed to parse attestation response: ${body}`));
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      reject(new Error(`TLS connection failed: ${error.message}`));
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Attestation request timed out'));
+    });
+
+    req.end();
+  });
 }
 
 /**
@@ -206,21 +186,30 @@ async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', 
   }
   const hostname = parsed.hostname;
   const port = parsed.port ? parseInt(parsed.port, 10) : 443;
-  const baseUrl = url.replace(/\/+$/, '');
 
   // 1. Generate nonce
   const requestNonce = crypto.randomBytes(32).toString('hex');
   console.log('Request nonce:', requestNonce);
 
-  // 2. Fetch attestation report with TLS fingerprint
-  console.log(`\nFetching attestation from ${baseUrl} ...`);
-  const attestation = await fetchAttestationReport(baseUrl, requestNonce, signingAlgo, token);
+  // 2. Fetch attestation report AND live SPKI hash from the same TLS connection.
+  //    This avoids round-robin mismatches when multiple backends share a domain.
+  console.log(`\nFetching attestation from ${hostname}:${port} (single TLS connection) ...`);
+  const { attestation, liveSpkiHash } = await fetchAttestationAndSpki(
+    hostname, port, requestNonce, signingAlgo, token,
+  );
 
   if (!attestation.tls_cert_fingerprint) {
     throw new Error(
       'Attestation report does not include tls_cert_fingerprint. ' +
       'The proxy may not have TLS_CERT_PATH configured.'
     );
+  }
+
+  // Extract model name from attestation (self-reported by the proxy inside the TEE)
+  if (attestation.model_name) {
+    console.log('Model name:', attestation.model_name);
+  } else {
+    console.log('Model name: (not present in attestation)');
   }
 
   console.log('Signing address:', attestation.signing_address);
@@ -235,10 +224,8 @@ async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', 
   console.log('\n🔐 TDX report data (TLS mode)');
   checkReportDataWithTls(attestation, requestNonce, intelResult);
 
-  // 5. Fetch live certificate SPKI hash and compare
+  // 5. Compare live certificate SPKI hash (from step 2) with attested fingerprint
   console.log('\n🔐 Live TLS certificate');
-  console.log(`Connecting to ${hostname}:${port} ...`);
-  const liveSpkiHash = await fetchLiveSpkiHash(hostname, port);
   console.log('Live certificate SPKI hash:', liveSpkiHash);
 
   const tlsMatch = liveSpkiHash === attestation.tls_cert_fingerprint;

@@ -27,6 +27,8 @@ Usage:
 
 import argparse
 import asyncio
+import http.client
+import json
 import os
 import secrets
 import socket
@@ -34,7 +36,6 @@ import ssl
 from hashlib import sha256
 from urllib.parse import urlparse
 
-import requests
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
@@ -48,56 +49,68 @@ from model_verifier import (
 )
 
 
-async def fetch_live_spki_hash(hostname: str, port: int = 443) -> str:
-    """Connect via TLS and compute SHA-256 of the leaf certificate's SPKI DER.
+def _compute_spki_hash(cert_der: bytes) -> str:
+    """Compute SHA-256 of a certificate's SPKI DER encoding.
 
-    This matches the inference proxy's ``compute_spki_hash()`` which hashes
-    the SubjectPublicKeyInfo (not the full certificate), making the hash
-    stable across certificate renewals that reuse the same key.
+    Matches the inference proxy's ``compute_spki_hash()`` — hashes the
+    SubjectPublicKeyInfo (not the full certificate), making the hash stable
+    across certificate renewals that reuse the same key.
     """
-
-    def _fetch() -> str:
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE  # Trust comes from TEE binding, not CA
-
-        sock = socket.create_connection((hostname, port), timeout=10)
-        try:
-            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                cert_der = ssock.getpeercert(binary_form=True)
-                if not cert_der:
-                    raise Exception("Failed to get certificate from server")
-
-                cert = x509.load_der_x509_certificate(cert_der, default_backend())
-                spki_der = cert.public_key().public_bytes(
-                    encoding=serialization.Encoding.DER,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
-                )
-                return sha256(spki_der).hexdigest()
-        finally:
-            sock.close()
-
-    return await asyncio.to_thread(_fetch)
+    cert = x509.load_der_x509_certificate(cert_der, default_backend())
+    spki_der = cert.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return sha256(spki_der).hexdigest()
 
 
-def fetch_attestation_report(
-    base_url: str, nonce: str, signing_algo: str = "ecdsa", token: str | None = None
-) -> dict:
-    """Fetch attestation report from an inference proxy with TLS fingerprint.
+def fetch_attestation_and_spki(
+    hostname: str,
+    port: int,
+    nonce: str,
+    signing_algo: str = "ecdsa",
+    token: str | None = None,
+) -> tuple[dict, str]:
+    """Fetch attestation report AND extract the live TLS certificate SPKI hash
+    from the same connection.
 
-    The endpoint is public on proxies with the latest build. For older
-    deployments that still require auth, pass a bearer token via --token.
+    Using a single TLS connection guarantees both values come from the same
+    backend, avoiding mismatches caused by DNS round-robin or load-balancer
+    routing between multiple backends.
     """
-    url = (
-        f"{base_url}/v1/attestation/report"
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE  # Trust comes from TEE binding, not CA
+
+    conn = http.client.HTTPSConnection(hostname, port, context=context, timeout=60)
+    conn.connect()
+
+    # Extract live SPKI hash from this TLS session
+    cert_der = conn.sock.getpeercert(binary_form=True)
+    if not cert_der:
+        conn.close()
+        raise Exception("Failed to get certificate from server")
+    live_spki_hash = _compute_spki_hash(cert_der)
+
+    # Make the attestation request over the same connection
+    path = (
+        f"/v1/attestation/report"
         f"?include_tls_fingerprint=true&nonce={nonce}&signing_algo={signing_algo}"
     )
-    headers = {}
+    headers = {"Host": hostname}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    resp = requests.get(url, headers=headers, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
+
+    conn.request("GET", path, headers=headers)
+    resp = conn.getresponse()
+    body = resp.read()
+    conn.close()
+
+    if resp.status != 200:
+        raise Exception(f"HTTP {resp.status}: {body.decode()}")
+
+    attestation = json.loads(body)
+    return attestation, live_spki_hash
 
 
 def check_report_data_with_tls(
@@ -157,15 +170,17 @@ async def verify_tls_attestation(
 
     hostname = parsed.hostname
     port = parsed.port or 443
-    base_url = url.rstrip("/")
 
     # 1. Generate nonce
     request_nonce = secrets.token_hex(32)
     print("Request nonce:", request_nonce)
 
-    # 2. Fetch attestation report with TLS fingerprint
-    print(f"\nFetching attestation from {base_url} ...")
-    attestation = fetch_attestation_report(base_url, request_nonce, signing_algo, token)
+    # 2. Fetch attestation report AND live SPKI hash from the same TLS connection.
+    #    This avoids round-robin mismatches when multiple backends share a domain.
+    print(f"\nFetching attestation from {hostname}:{port} (single TLS connection) ...")
+    attestation, live_spki_hash = await asyncio.to_thread(
+        fetch_attestation_and_spki, hostname, port, request_nonce, signing_algo, token
+    )
 
     tls_cert_fingerprint = attestation.get("tls_cert_fingerprint")
     if not tls_cert_fingerprint:
@@ -173,6 +188,13 @@ async def verify_tls_attestation(
             "Attestation report does not include tls_cert_fingerprint. "
             "The proxy may not have TLS_CERT_PATH configured."
         )
+
+    # Extract model name from attestation (self-reported by the proxy inside the TEE)
+    model_name = attestation.get("model_name")
+    if model_name:
+        print("Model name:", model_name)
+    else:
+        print("Model name: (not present in attestation)")
 
     print("Signing address:", attestation["signing_address"])
     print("Signing algorithm:", attestation.get("signing_algo"))
@@ -186,10 +208,8 @@ async def verify_tls_attestation(
     print("\n🔐 TDX report data (TLS mode)")
     check_report_data_with_tls(attestation, request_nonce, intel_result)
 
-    # 5. Fetch live certificate SPKI hash and compare
+    # 5. Compare live certificate SPKI hash (from step 2) with attested fingerprint
     print("\n🔐 Live TLS certificate")
-    print(f"Connecting to {hostname}:{port} ...")
-    live_spki_hash = await fetch_live_spki_hash(hostname, port)
     print("Live certificate SPKI hash:", live_spki_hash)
 
     tls_match = live_spki_hash == tls_cert_fingerprint
