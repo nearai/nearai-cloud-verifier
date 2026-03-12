@@ -669,10 +669,16 @@ async def main() -> None:
     parser.add_argument(
         "--verify-gateway-tls",
         action="store_true",
-        help="Optional; gateway TLS verification is already the default",
+        help="Deprecated: no effect; gateway TLS verification is always performed",
     )
     parser.add_argument("--model", default="deepseek-ai/DeepSeek-V3.1")
     args = parser.parse_args()
+
+    if getattr(args, "verify_gateway_tls", False):
+        print(
+            "Warning: --verify-gateway-tls is deprecated and has no effect; "
+            "gateway TLS verification is always performed.",
+        )
 
     domain = args.domain or os.environ.get("DOMAIN") or (urlparse(API_BASE).hostname or "")
     signing_address = args.signing_address or os.environ.get("GATEWAY_SIGNING_ADDRESS") or None

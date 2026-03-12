@@ -106,9 +106,12 @@ export interface AttestationApiReport {
 }
 
 /**
- * Fetch attestation report from the API
- * @param includeTls - if true, appends include_tls=true (response may include tls_certificate)
- * @param signingAddress - optional; when set, narrows gateway quote to this signer
+ * Fetch attestation report from the API.
+ * @param model - Model name (query param)
+ * @param nonce - Request nonce hex (query param)
+ * @param signingAlgo - Signing algorithm, default 'ecdsa'
+ * @param includeTls - If true, appends include_tls=true (response may include tls_certificate)
+ * @param signingAddress - Optional; when set, narrows gateway quote to this signer
  */
 async function fetchReport(
   model: string,
@@ -170,6 +173,11 @@ function signingAddressPadded32(signingAddress: string, signingAlgo: string): Bu
   const algo = signingAlgo.toLowerCase();
   const addrHex = algo === 'ecdsa' ? signingAddress.replace(/^0x/i, '') : signingAddress;
   const signingAddressBytes = Buffer.from(addrHex, 'hex');
+  if (signingAddressBytes.length > 32) {
+    throw new Error(
+      `Signing address is too long: expected at most 32 bytes, got ${signingAddressBytes.length}`,
+    );
+  }
   return Buffer.concat([signingAddressBytes, Buffer.alloc(32 - signingAddressBytes.length, 0)]);
 }
 

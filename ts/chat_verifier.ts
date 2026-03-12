@@ -162,8 +162,13 @@ async function verifyChat(
 
   const hashedText = signaturePayload.text;
   const parts = hashedText.split(':');
-  const requestHashServer = parts.length === 3 ? parts[1] : parts[0];
-  const responseHashServer = parts.length === 3 ? parts[2] : parts[1];
+  if (parts.length !== 2 && parts.length !== 3) {
+    throw new Error(
+      `Invalid signature payload text format: expected 2 or 3 colon-separated parts, got ${parts.length}: "${hashedText}"`,
+    );
+  }
+  const requestHashServer = parts.length === 3 ? parts[1]! : parts[0]!;
+  const responseHashServer = parts.length === 3 ? parts[2]! : parts[1]!;
   console.log('Request hash matches:', requestHash === requestHashServer);
   console.log('Response hash matches:', responseHash === responseHashServer);
 

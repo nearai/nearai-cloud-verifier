@@ -78,12 +78,15 @@ async def verify_chat(chat_id, request_body, response_text, label, model, verify
 
     hashed_text = signature_payload["text"]
     parts = hashed_text.split(":")
+    if len(parts) not in (2, 3):
+        raise ValueError(
+            f"Invalid signature payload text format: expected 2 or 3 colon-separated parts, "
+            f"got {len(parts)}: {hashed_text!r}"
+        )
     if len(parts) == 3:
         request_hash_server, response_hash_server = parts[1], parts[2]
-    elif len(parts) >= 2:
-        request_hash_server, response_hash_server = parts[0], parts[1]
     else:
-        raise ValueError(f"Signature text has unexpected format: {hashed_text!r}")
+        request_hash_server, response_hash_server = parts[0], parts[1]
     print("Request hash matches:", request_hash == request_hash_server)
     print("Response hash matches:", response_hash == response_hash_server)
 

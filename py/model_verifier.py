@@ -55,7 +55,12 @@ def _signing_address_padded32(signing_address, signing_algo):
     """Signing address as 32 bytes (right-padded), per algo."""
     algo = signing_algo.lower()
     addr_hex = signing_address.removeprefix("0x") if algo == "ecdsa" else signing_address
-    return bytes.fromhex(addr_hex).ljust(32, b"\x00")
+    raw = bytes.fromhex(addr_hex)
+    if len(raw) > 32:
+        raise ValueError(
+            f"Signing address is too long: expected at most 32 bytes, got {len(raw)}"
+        )
+    return raw.ljust(32, b"\x00")
 
 
 def _tls_bound_nonce_component(raw_nonce_bytes, tls_certificate_pem):

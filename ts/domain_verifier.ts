@@ -127,7 +127,13 @@ function parseArgs(): {
 } {
   const argv = process.argv.slice(2);
   const domainFromEnv = process.env.DOMAIN;
-  const domainFromUrl = new URL(API_BASE).hostname || "";
+  let domainFromUrl = "";
+  try {
+    domainFromUrl = new URL(API_BASE).hostname || "";
+  } catch {
+    // BASE_URL may be a bare hostname without scheme; use as domain candidate
+    domainFromUrl = API_BASE.replace(/^https?:\/\//i, "").split("/")[0] || "";
+  }
   let domain = domainFromEnv || domainFromUrl;
 
   const domainIdx = argv.indexOf("--domain");
