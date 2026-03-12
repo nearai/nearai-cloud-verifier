@@ -289,10 +289,16 @@ async function checkTdxQuote(attestation: AttestationBaseInfo): Promise<IntelRes
     const reportData: string = td10.report_data || '';
     const mrConfig: string = td10.mr_config_id || '';
 
-    // Determine verified status akin to Python's result.status == "UpToDate"
+    // TDX status: UpToDate is ideal; OutOfDate still has valid quote crypto—do not fail verification
+    const TDX_STATUS_OK = new Set(['UpToDate', 'OutOfDate']);
     const status: string | undefined = typeof rawResult?.status === 'string' ? rawResult.status : undefined;
-    const verifiedFromStatus = status ? status === 'UpToDate' : undefined;
+    const verifiedFromStatus = status ? TDX_STATUS_OK.has(status) : undefined;
     const verified = verifiedFromStatus ?? Boolean(rawResult?.quote?.verified);
+    if (status === 'OutOfDate') {
+      // Quote still verifies; Intel marks OutOfDate when platform TCB is below
+      // current advisory baseline—not a cryptographic failure.
+      console.log('Intel TDX quote status: OutOfDate');
+    }
 
     const mapped: IntelResult = {
       quote: {

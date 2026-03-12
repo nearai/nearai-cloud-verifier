@@ -181,6 +181,15 @@ async def check_tdx_quote(attestation):
         report_data = td10.get('report_data', "")
         mr_config = td10.get('mr_config_id', "")
 
+    # UpToDate is ideal; OutOfDate still has valid quote — do not fail verification
+    _tdx_status_ok = frozenset({"UpToDate", "OutOfDate"})
+    _status = getattr(result, "status", None)
+    _verified = _status in _tdx_status_ok if _status else False
+    if _status == "OutOfDate":
+        # Quote still verifies; Intel marks OutOfDate when the platform TCB level
+        # is below their current advisory baseline—not a cryptographic failure.
+        print("Intel TDX quote status: OutOfDate")
+
     # Create a result structure similar to the remote verification
     intel_result = {
         "quote": {
@@ -189,7 +198,7 @@ async def check_tdx_quote(attestation):
                 "mrconfig": mr_config
             }
         },
-        "verified": result.status == "UpToDate" if hasattr(result, 'status') else False
+        "verified": _verified,
     }
 
     print("Intel TDX quote verified:", intel_result["verified"])
