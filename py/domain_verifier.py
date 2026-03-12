@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Python implementation of domain attestation verifier."""
 
+import argparse
 import asyncio
 import json
 import os
 import re
+import secrets
 import socket
 import ssl
 from datetime import datetime, timezone
@@ -22,8 +24,10 @@ from cryptography.x509.oid import SignatureAlgorithmOID
 
 from model_verifier import (
     check_tdx_quote,
+    fetch_report,
     show_compose,
     show_sigstore_provenance,
+    verify_attestation,
 )
 
 API_BASE = os.environ.get("BASE_URL", "https://cloud-api.near.ai")
@@ -353,6 +357,38 @@ async def compare_certificate_fingerprints(
         raise Exception(f"Certificate fingerprint comparison failed: {error_message}")
 
 
+async def verify_gateway_tls_certificate_matches_live(
+    domain: str,
+    signing_address: str,
+    model: str = "deepseek-ai/DeepSeek-V3.1",
+):
+    """Fetch gateway report with include_tls; check tls_certificate leaf matches domain :443.
+
+    Kept in domain_verifier only—no live TLS checks in model_verifier/chat_verifier.
+    """
+    nonce = secrets.token_hex(32)
+    try:
+        report = fetch_report(
+            model, nonce, signing_algo="ecdsa", include_tls=True, signing_address=signing_address
+        )
+    except Exception as e:
+        print(f"Failed to fetch attestation report with include_tls: {e}")
+        return None
+    tls_pem = report.get("tls_certificate")
+    if not tls_pem or not isinstance(tls_pem, str):
+        print(
+            "\n🔐 Gateway TLS vs live domain: skipped (no tls_certificate in report; "
+            "set INGRESS_TLS_CERT_PATH on cloud-api)."
+        )
+        return None
+    print("\n🔐 Gateway TLS certificate vs live domain")
+    print(
+        "Comparing leaf cert fingerprint: tls_certificate from include_tls report vs",
+        f"{domain}:443",
+    )
+    return await compare_certificate_fingerprints(domain, tls_pem)
+
+
 def verify_certificate_key(certificate: str) -> bool:
     """Verify certificate chain integrity and trust."""
     try:
@@ -572,47 +608,79 @@ async def verify_domain_attestation(attestation: DomainAttestation) -> None:
     await check_certificate(attestation)
 
 
-async def fetch_domain_attestation() -> DomainAttestation:
-    """Fetch domain attestations from /evidences/ directory."""
-    domain = urlparse(API_BASE).hostname
-    evidences_url = f"{API_BASE}/evidences/"
+async def verify_domain_tls_via_attestation_report(
+    domain: str,
+    signing_address=None,
+    model: str = "deepseek-ai/DeepSeek-V3.1",
+) -> None:
+    """
+    Fetch attestation report with include_tls, verify gateway attestation binds
+    tls_certificate, then compare PEM leaf to live :443.
+    signing_address optional; omit for API default gateway quote.
+    """
+    print("========================================")
+    print("🔐 Domain TLS vs attestation report")
+    print("========================================")
+    print("Domain:", domain)
+    if signing_address:
+        print("Signing address:", signing_address)
 
-    sha256sum_url = f"{evidences_url}sha256sum.txt"
-    acme_account_url = f"{evidences_url}acme-account.json"
-    cert_url = f"{evidences_url}cert-{domain}.pem"
-    intel_quote_url = f"{evidences_url}quote.json"
-    info_url = f"{evidences_url}info.json"
-
-    responses = await asyncio.gather(
-        asyncio.to_thread(requests.get, sha256sum_url),
-        asyncio.to_thread(requests.get, acme_account_url),
-        asyncio.to_thread(requests.get, cert_url),
-        asyncio.to_thread(requests.get, intel_quote_url),
-        asyncio.to_thread(requests.get, info_url),
+    nonce = secrets.token_hex(32)
+    report = fetch_report(
+        model,
+        nonce,
+        signing_algo="ecdsa",
+        include_tls=True,
+        signing_address=signing_address or None,
     )
+    tls_pem = report.get("tls_certificate")
+    if not tls_pem or not isinstance(tls_pem, str):
+        raise SystemExit(
+            "No tls_certificate in attestation report. "
+            "Set INGRESS_TLS_CERT_PATH on cloud-api and request include_tls."
+        )
 
-    sha256sum_response, acme_account_response, cert_response, intel_quote_response, info_response = responses
+    gateway = report.get("gateway_attestation")
+    if gateway:
+        print("\n🔐 Gateway attestation (include_tls binding)")
+        await verify_attestation(gateway, nonce, verify_model=False, tls_certificate_pem=tls_pem)
+    else:
+        print(
+            "\n⚠️  No gateway_attestation in report; skipping TDX/report_data check. "
+            "Still comparing TLS PEM to live."
+        )
 
-    intel_quote = intel_quote_response.json()["quote"]
-
-    return DomainAttestation(
-        domain=domain or "",
-        sha256sum=sha256sum_response.text,
-        acme_account=acme_account_response.text,
-        cert=cert_response.text,
-        intel_quote=intel_quote,
-        info=info_response.json(),
-    )
+    print("\n🔐 Live TLS certificate vs attested tls_certificate")
+    ok = await compare_certificate_fingerprints(domain, tls_pem)
+    if not ok:
+        raise SystemExit(1)
 
 
 async def main() -> None:
-    """Main verification function."""
-    print("========================================")
-    print("🔐 Domain Attestation")
-    print("========================================")
+    """Domain verifier: gateway TLS vs attestation is always run (default)."""
+    parser = argparse.ArgumentParser(
+        description="Verify gateway tls_certificate is bound in attestation and matches live :443"
+    )
+    parser.add_argument("--domain", help="Host to TLS-connect (default: BASE_URL hostname)")
+    parser.add_argument(
+        "--signing-address",
+        help="Optional; narrows gateway quote to this signer (else API default)",
+    )
+    parser.add_argument(
+        "--verify-gateway-tls",
+        action="store_true",
+        help="Optional; gateway TLS verification is already the default",
+    )
+    parser.add_argument("--model", default="deepseek-ai/DeepSeek-V3.1")
+    args = parser.parse_args()
 
-    attestation = await fetch_domain_attestation()
-    await verify_domain_attestation(attestation)
+    domain = args.domain or os.environ.get("DOMAIN") or (urlparse(API_BASE).hostname or "")
+    signing_address = args.signing_address or os.environ.get("GATEWAY_SIGNING_ADDRESS") or None
+
+    if not domain:
+        raise SystemExit("DOMAIN, --domain, or BASE_URL with hostname is required.")
+
+    await verify_domain_tls_via_attestation_report(domain, signing_address, args.model)
 
 
 if __name__ == "__main__":

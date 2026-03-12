@@ -1,497 +1,215 @@
-import { AttestationBaseInfo, checkTdxQuote, IntelResult, showCompose, showSigstoreProvenance } from "./model_verifier";
-import { createHash, X509Certificate } from 'crypto'
-import { Buffer } from 'buffer';
-import * as tls from 'tls';
+/**
+ * Domain verifier — gateway TLS verification is the default behavior.
+ *
+ * Fetches attestation report with include_tls, verifies gateway report_data
+ * binds tls_certificate, then compares that PEM's leaf cert to domain:443.
+ */
+
+import {
+  AttestationReport,
+  fetchReport,
+  verifyAttestation,
+} from "./model_verifier";
+import { createHash, randomBytes, X509Certificate } from "crypto";
+import * as tls from "tls";
 
 const API_BASE: string = process.env.BASE_URL || "https://cloud-api.near.ai";
 
-interface DomainAttestation extends AttestationBaseInfo {
-  domain: string;
-  sha256sum: string;
-  acmeAccount: string;
-  cert: string;
-}
-
-interface ReportDataResult {
-  sha256sum_matches: boolean;
-  empty_bytes_matches: boolean;
-}
-
 function parseCertificateChain(certChainPem: string): X509Certificate[] {
   const pemCertificateRegex =
-    /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g
-  const parsedCertificates: X509Certificate[] = []
-
+    /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
+  const parsedCertificates: X509Certificate[] = [];
   for (const certificateMatch of certChainPem.matchAll(pemCertificateRegex)) {
     try {
-      parsedCertificates.push(new X509Certificate(certificateMatch[0]))
+      parsedCertificates.push(new X509Certificate(certificateMatch[0]));
     } catch (parseError) {
-      console.error('Failed to parse certificate from PEM:', parseError)
+      console.error("Failed to parse certificate from PEM:", parseError);
     }
   }
-
-  return parsedCertificates
+  return parsedCertificates;
 }
 
-function verifyCertificateChain(certificates: X509Certificate[]): boolean {
-  if (certificates.length === 0) {
-    throw new Error(
-      'Certificate chain verification failed: Empty certificate chain',
-    )
-  }
-
-  for (let index = 0; index < certificates.length; index++) {
-    if (index === certificates.length - 1) continue // Skip root certificate
-
-    const certificate = certificates[index]
-    const issuerCertificate = certificates[index + 1]
-
-    if (!certificate) {
-      throw new Error(
-        `Certificate chain verification failed: Missing certificate at index ${index}`,
-      )
-    }
-
-    if (!issuerCertificate) {
-      throw new Error(
-        `Certificate chain verification failed: Missing issuer certificate for certificate ${index}`,
-      )
-    }
-
-    try {
-      const isVerified = certificate.verify(issuerCertificate.publicKey)
-      const issuerMatches = certificate.issuer === issuerCertificate.subject
-
-      if (!isVerified) {
-        throw new Error(
-          `Certificate chain verification failed: Certificate ${index} signature verification failed`,
-        )
-      }
-
-      if (!issuerMatches) {
-        throw new Error(
-          `Certificate chain verification failed: Certificate ${index} issuer '${certificate.issuer}' does not match next certificate subject '${issuerCertificate.subject}'`,
-        )
-      }
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error
-          ? error.message
-          : `Unknown certificate chain verification error for certificate ${index}`
-      console.error('Certificate chain verification error:', errorMessage)
-      throw new Error(`Certificate chain verification failed: ${errorMessage}`)
-    }
-  }
-
-  return true
-}
-
-function isRootCertificateTrusted(rootCertificate: X509Certificate): boolean {
-  const trustedRootCaIssuers = [
-    'C=US\nO=Internet Security Research Group\nCN=ISRG Root X1',
-    'C=US\nO=Digital Signature Trust Co.\nCN=DST Root CA X3',
-  ]
-
-  try {
-    return rootCertificate.issuer === rootCertificate.subject
-      ? rootCertificate.verify(rootCertificate.publicKey)
-      : trustedRootCaIssuers.includes(rootCertificate.issuer)
-  } catch (error) {
-    const errorMessage =
-      error instanceof Error
-        ? error.message
-        : 'Unknown root certificate trust verification error'
-    console.error('Root certificate trust verification error:', errorMessage)
-    throw new Error(
-      `Root certificate trust verification failed: ${errorMessage}`,
-    )
-  }
-}
-
-/**
- * Gets the SHA256 fingerprint of a certificate in OpenSSL format
- * (colon-separated hex, uppercase)
- */
+/** SHA256(DER) fingerprint, OpenSSL-style colon-separated uppercase hex */
 function getCertificateFingerprint(cert: X509Certificate): string {
-  // Get the raw DER encoding of the certificate
-  const der = cert.raw;
-  // Compute SHA256 hash
-  const hash = createHash('sha256').update(der).digest('hex');
-  // Format as colon-separated uppercase hex (OpenSSL format)
-  return hash.toUpperCase().match(/.{2}/g)?.join(':') || '';
+  const hash = createHash("sha256").update(cert.raw).digest("hex");
+  return hash.toUpperCase().match(/.{2}/g)?.join(":") || "";
 }
 
-/**
- * Fetches the certificate from a live server via TLS connection
- */
-function fetchLiveCertificate(domain: string, port: number = 443): Promise<X509Certificate> {
+/** TLS connect to domain:port and return leaf as X509Certificate */
+function fetchLiveCertificate(
+  domain: string,
+  port: number = 443,
+): Promise<X509Certificate> {
   return new Promise((resolve, reject) => {
     const socket = tls.connect(port, domain, {
       servername: domain,
-      rejectUnauthorized: false, // We're just fetching the cert, not verifying it
+      rejectUnauthorized: false,
     });
-
     let resolved = false;
-
-    socket.on('secureConnect', () => {
+    socket.on("secureConnect", () => {
       if (resolved) return;
       resolved = true;
-
       try {
         const cert = socket.getPeerX509Certificate();
-
         if (!cert) {
           socket.end();
-          reject(new Error('Failed to get certificate from server'));
+          reject(new Error("Failed to get certificate from server"));
           return;
         }
-
         socket.end();
-
-        const base64 = cert.raw.toString('base64');
+        const base64 = cert.raw.toString("base64");
         const base64Lines = base64.match(/.{1,64}/g);
         if (!base64Lines) {
-          reject(new Error('Failed to encode certificate in PEM format'));
+          reject(new Error("Failed to encode certificate in PEM format"));
           return;
         }
-
-        const pem = '-----BEGIN CERTIFICATE-----\n' +
-          base64Lines.join('\n') +
-          '\n-----END CERTIFICATE-----';
+        const pem =
+          "-----BEGIN CERTIFICATE-----\n" +
+          base64Lines.join("\n") +
+          "\n-----END CERTIFICATE-----";
         resolve(new X509Certificate(pem));
       } catch (error) {
         socket.end();
-        reject(new Error(`Failed to parse certificate from server: ${error instanceof Error ? error.message : 'Unknown error'}`));
+        reject(
+          new Error(
+            `Failed to parse certificate from server: ${error instanceof Error ? error.message : "Unknown error"}`,
+          ),
+        );
       }
     });
-
-    socket.on('error', (error) => {
+    socket.on("error", (error) => {
       if (resolved) return;
       resolved = true;
       reject(new Error(`TLS connection failed: ${error.message}`));
     });
-
     socket.setTimeout(10000, () => {
       if (resolved) return;
       resolved = true;
       socket.destroy();
-      reject(new Error('TLS connection timeout'));
+      reject(new Error("TLS connection timeout"));
     });
   });
 }
 
 /**
- * Compares the certificate fingerprint from live server with evidence certificate
+ * Compare leaf cert in attested PEM to live server cert (SHA256 DER fingerprint).
  */
-async function compareCertificateFingerprints(domain: string, evidenceCertPem: string): Promise<boolean> {
-  try {
-    // Get fingerprint from evidence certificate
-    const evidenceCertChain = parseCertificateChain(evidenceCertPem);
-    const evidenceLeafCert = evidenceCertChain[0];
-    if (!evidenceLeafCert) {
-      throw new Error('Failed to parse evidence certificate');
-    }
-    const evidenceFingerprint = getCertificateFingerprint(evidenceLeafCert);
-
-    // Get fingerprint from live server
-    console.log(`Fetching certificate from live server: ${domain}:443`);
-    const liveCert = await fetchLiveCertificate(domain, 443);
-    const liveFingerprint = getCertificateFingerprint(liveCert);
-
-    // Compare fingerprints    
-    const matches = evidenceFingerprint === liveFingerprint;
-    console.log(`Fingerprints match: ${matches}`);
-
-    if (!matches) {
-      console.log('⚠️  Certificate fingerprint mismatch!');
-      console.log('   The certificate served by the live server does not match the evidence certificate.');
-      console.log(`   Evidence certificate fingerprint (SHA256): ${evidenceFingerprint}`);
-      console.log(`   Live server certificate fingerprint (SHA256): ${liveFingerprint}`);
-    }
-
-    return matches;
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('Certificate fingerprint comparison failed:', errorMessage);
-    throw new Error(`Certificate fingerprint comparison failed: ${errorMessage}`);
-  }
-}
-
-/**
- * Verifies certificate chain integrity and trust.
- */
-export function verifyCertificateKey(certificate: string): boolean {
-  try {
-    const certificateChain = parseCertificateChain(certificate)
-    const leafCertificate = certificateChain[0]
-
-    if (!leafCertificate) {
-      throw new Error(
-        'Certificate verification failed: Unable to parse leaf certificate from certificate chain',
-      )
-    }
-
-    // Verify certificate chain integrity
-    if (!verifyCertificateChain(certificateChain)) {
-      throw new Error(
-        'Certificate verification failed: Certificate chain validation failed',
-      )
-    }
-
-    // Verify root certificate trust
-    const rootCertificate = certificateChain[certificateChain.length - 1]
-    if (
-      certificateChain.length > 1 &&
-      rootCertificate &&
-      !isRootCertificateTrusted(rootCertificate)
-    ) {
-      throw new Error(
-        `Certificate verification failed: Root certificate is not trusted (issuer: ${rootCertificate.issuer})`,
-      )
-    }
-
-    // Check certificate validity period
-    const currentTime = new Date()
-    if (new Date(leafCertificate.validFrom) > currentTime) {
-      throw new Error(
-        `Certificate verification failed: Certificate is not yet valid (valid from: ${leafCertificate.validFrom})`,
-      )
-    }
-
-    if (new Date(leafCertificate.validTo) < currentTime) {
-      throw new Error(
-        `Certificate verification failed: Certificate has expired (valid to: ${leafCertificate.validTo})`,
-      )
-    }
-
-    // Validate public keys
-    const leafCertificatePublicKey = leafCertificate.publicKey.export({
-      type: 'spki',
-      format: 'der',
-    })
-    if (!leafCertificatePublicKey) {
-      throw new Error(
-        'Certificate verification failed: Unable to extract public key from certificate',
-      )
-    }
-    console.log('Certificate public key:', leafCertificatePublicKey.toString('hex'));
-
-    return true
-  } catch (error) {
-    const errorMessage =
-      error instanceof Error
-        ? error.message
-        : 'Unknown certificate verification error'
-    console.error('Certificate verification error:', errorMessage)
-    throw new Error(`Certificate verification failed: ${errorMessage}`)
-  }
-}
-
-async function checkCertificate(attestation: DomainAttestation) {
-  console.log('\n🔐 SSL certificate');
-  try {
-    const certVerified = verifyCertificateKey(attestation.cert);
-    console.log('Certificate verified:', certVerified);
-    if (!certVerified) {
-      console.log('Certificate verification failed');
-    }
-  } catch (error) {
-    console.log('Certificate verified:', false);
-    console.error('Certificate verification error:', error);
-  }
-
-  // Compare certificate fingerprint with live server
-  try {
-    await compareCertificateFingerprints(
-      attestation.domain,
-      attestation.cert
-    );
-  } catch (error) {
-    console.error('Failed to compare certificate fingerprints:', error);
-  }
-}
-
-
-/**
- * Verifies DNS CAA records for domain control.
- */
-export async function verifyDnsCAA(
-  domainName: string,
-  acmeAccountUri: string,
+async function compareCertificateFingerprints(
+  domain: string,
+  attestedPem: string,
 ): Promise<boolean> {
-  const dnsUrl = `https://dns.google/resolve?name=${domainName}&type=CAA`
-  try {
-    const dnsResponse = await fetch(dnsUrl)
-
-    if (!dnsResponse.ok) {
-      throw new Error(
-        `DNS CAA query failed for domain '${domainName}': ${dnsResponse.status} ${dnsResponse.statusText} (URL: ${dnsUrl})`,
-      )
-    }
-
-    const { Answer: dnsRecords } = (await dnsResponse.json()) as {
-      Answer?: Array<{ type: number; data?: string }>
-    }
-
-    const caaRecords = dnsRecords?.filter((record) => record.type === 257) ?? []
-
-    if (caaRecords.length === 0) {
-      throw new Error(
-        `No CAA records found for domain '${domainName}' - domain does not have Certificate Authority Authorization configured`,
-      )
-    }
-
-    const hasMatchingRecord = caaRecords.every((record) =>
-      record.data?.includes(acmeAccountUri),
-    )
-    if (!hasMatchingRecord) {
-      throw new Error(
-        `CAA records for domain '${domainName}' do not authorize ACME account '${acmeAccountUri}' - found records: ${JSON.stringify(caaRecords.map((r) => r.data))}`,
-      )
-    }
-
-    return true
-  } catch (error) {
-    const errorMessage =
-      error instanceof Error
-        ? error.message
-        : `Unknown DNS CAA verification error for domain '${domainName}'`
-    console.error('DNS CAA verification error:', errorMessage)
-    throw new Error(`DNS CAA verification failed: ${errorMessage}`)
+  const chain = parseCertificateChain(attestedPem);
+  const evidenceLeaf = chain[0];
+  if (!evidenceLeaf) {
+    throw new Error("Failed to parse attested PEM (no certificate found)");
   }
+  const evidenceFp = getCertificateFingerprint(evidenceLeaf);
+  console.log(`Fetching certificate from live server: ${domain}:443`);
+  const liveCert = await fetchLiveCertificate(domain, 443);
+  const liveFp = getCertificateFingerprint(liveCert);
+  const matches = evidenceFp === liveFp;
+  console.log(`Fingerprints match: ${matches}`);
+  if (!matches) {
+    console.log("⚠️  Certificate fingerprint mismatch!");
+    console.log(
+      "   The certificate served by the live server does not match the attested tls_certificate.",
+    );
+    console.log(`   Attested PEM leaf fingerprint (SHA256): ${evidenceFp}`);
+    console.log(`   Live server certificate fingerprint (SHA256): ${liveFp}`);
+  }
+  return matches;
 }
 
-async function checkDnsCAA(attestation: DomainAttestation) {
-  console.log('\n🔐 DNS CAA record');
-  try {
-    const acmeAccountUri = JSON.parse(attestation.acmeAccount).uri;
-    const verified = await verifyDnsCAA(attestation.domain, acmeAccountUri);
-    console.log('DNS CAA verified:', verified);
-  } catch (error) {
-    console.log('Failed to verify DNS CAA:', error);
-  }
+function parseArgs(): {
+  domain: string;
+  signingAddress: string | undefined;
+  model: string;
+} {
+  const argv = process.argv.slice(2);
+  const domainFromEnv = process.env.DOMAIN;
+  const domainFromUrl = new URL(API_BASE).hostname || "";
+  let domain = domainFromEnv || domainFromUrl;
+
+  const domainIdx = argv.indexOf("--domain");
+  if (domainIdx !== -1 && argv[domainIdx + 1]) domain = argv[domainIdx + 1];
+
+  let signingAddress: string | undefined =
+    process.env.GATEWAY_SIGNING_ADDRESS || undefined;
+  const addrIdx = argv.indexOf("--signing-address");
+  if (addrIdx !== -1 && argv[addrIdx + 1]) signingAddress = argv[addrIdx + 1];
+
+  let model = "deepseek-ai/DeepSeek-V3.1";
+  const modelIdx = argv.indexOf("--model");
+  if (modelIdx !== -1 && argv[modelIdx + 1]) model = argv[modelIdx + 1];
+
+  return { domain, signingAddress, model };
 }
 
 /**
- * Verify that the TDX report data binds the ACME account and certificate hashes (sha256sum).
- * This ensures the attestation is cryptographically tied to the provided ACME account and certificate.
+ * Fetch include_tls report, verify gateway attestation binds tls_certificate,
+ * then ensure live :443 presents the same leaf cert.
  */
-function checkReportData(attestation: DomainAttestation, intelResult: IntelResult): ReportDataResult {
-  // Get expected report data from attestation
-  const acmeAccountHash = createHash('sha256').update(attestation.acmeAccount).digest('hex');
-  const certHash = createHash('sha256').update(attestation.cert).digest('hex');
-  const expectedSha256sumFile = `${acmeAccountHash}  acme-account.json\n`
-    + `${certHash}  cert-${attestation.domain}.pem\n`;
-  const expectedSha256sum = createHash('sha256').update(expectedSha256sumFile).digest('hex');
+async function verifyDomainTlsViaAttestationReport(): Promise<void> {
+  const { domain, signingAddress, model } = parseArgs();
 
-  const reportDataHex = intelResult.quote.body.reportdata;
-  const reportData = Buffer.from(reportDataHex.replace('0x', ''), 'hex');
-
-  const embeddedSha256sum = reportData.subarray(0, 32).toString('hex');
-  const emptyBytes = reportData.subarray(32).toString('hex');
-
-  const sha256sumFileMatches = expectedSha256sumFile === attestation.sha256sum;
-  const sha256sumMatches = embeddedSha256sum === expectedSha256sum;
-  const emptyBytesMatches = emptyBytes === '0'.repeat(64);
-
-  console.log('sha256sum.txt file matches:', sha256sumFileMatches);
-  if (!sha256sumFileMatches) {
-    console.log('sha256sum.txt file:', 'expected:', expectedSha256sumFile, 'actual:', attestation.sha256sum);
-  }
-  console.log('Report data embeds sha256sum:', sha256sumMatches);
-  if (!sha256sumMatches) {
-    console.log('Report data sha256sum:', 'expected:', expectedSha256sum, 'actual:', embeddedSha256sum);
-  }
-  console.log('Report data embeds empty bytes:', emptyBytesMatches);
-  if (!emptyBytesMatches) {
-    console.log('Report data embeds empty bytes:', 'expected:', '0'.repeat(64), 'actual:', emptyBytes);
+  if (!domain) {
+    console.error("DOMAIN, --domain, or BASE_URL with hostname is required.");
+    process.exit(1);
   }
 
-  return {
-    sha256sum_matches: sha256sumMatches,
-    empty_bytes_matches: emptyBytesMatches
-  };
+  console.log("========================================");
+  console.log("🔐 Domain TLS vs attestation report");
+  console.log("========================================");
+  console.log("Domain:", domain);
+  if (signingAddress) console.log("Signing address:", signingAddress);
+
+  const nonce = randomBytes(32).toString("hex");
+  const report = await fetchReport(
+    model,
+    nonce,
+    "ecdsa",
+    true,
+    signingAddress,
+  );
+
+  const tlsPem = report.tls_certificate;
+  if (!tlsPem || typeof tlsPem !== "string") {
+    console.error(
+      "No tls_certificate in attestation report. Set INGRESS_TLS_CERT_PATH on cloud-api and request include_tls.",
+    );
+    process.exit(1);
+  }
+
+  const gateway = report.gateway_attestation as AttestationReport | undefined;
+  if (gateway) {
+    console.log("\n🔐 Gateway attestation (include_tls binding)");
+    await verifyAttestation(gateway, nonce, false, tlsPem);
+  } else {
+    console.log(
+      "\n⚠️  No gateway_attestation in report; skipping TDX/report_data check. Still comparing TLS PEM to live.",
+    );
+  }
+
+  console.log("\n🔐 Live TLS certificate vs attested tls_certificate");
+  const ok = await compareCertificateFingerprints(domain, tlsPem);
+  if (!ok) process.exit(1);
 }
 
-/**
- * Verify domain attestation
- */
-async function verifyDomainAttestation(attestation: DomainAttestation): Promise<void> {
-  if (!attestation.domain) {
-    throw new Error(`Invalid domain: ${attestation.domain}`);
-  }
-
-  // 1. Verify Intel TDX quote
-  console.log('\n🔐 Intel TDX quote');
-  const intelResult = await checkTdxQuote(attestation);
-
-  // 2. Check report data
-  console.log('\n🔐 TDX report data');
-  checkReportData(attestation, intelResult);
-
-  // 3. Verify docker compose file
-  showCompose(attestation, intelResult);
-  await showSigstoreProvenance(attestation);
-
-  // 4. Verify SSL certificate
-  await checkCertificate(attestation);
-}
-
-/**
- * Fetch domain attestations from /evidences/ directory
- */
-async function fetchDomainAttestation(): Promise<DomainAttestation> {
-  const domain = new URL(API_BASE).hostname;
-  const evidencesUrl = `${API_BASE}/evidences/`;
-
-  const sha256sumUrl = `${evidencesUrl}sha256sum.txt`;
-  const acmeAccountUrl = `${evidencesUrl}acme-account.json`;
-  const certUrl = `${evidencesUrl}cert-${domain}.pem`;
-  const intelQuoteUrl = `${evidencesUrl}quote.json`;
-  const infoUrl = `${evidencesUrl}info.json`;
-
-  const [
-    sha256sumResponse,
-    acmeAccountResponse,
-    certResponse,
-    intelQuoteResponse,
-    infoResponse,
-  ] = await Promise.all([
-    fetch(sha256sumUrl),
-    fetch(acmeAccountUrl),
-    fetch(certUrl),
-    fetch(intelQuoteUrl),
-    fetch(infoUrl),
-  ]);
-
-  const intelQuoteData = await intelQuoteResponse.json() as { quote: string };
-  const infoData = await infoResponse.json() as {
-    tcb_info: string | { app_compose: string };
-  };
-
-  return {
-    domain: domain ?? "",
-    sha256sum: await sha256sumResponse.text(),
-    acmeAccount: await acmeAccountResponse.text(),
-    cert: await certResponse.text(),
-    intel_quote: intelQuoteData.quote,
-    info: infoData,
-  };
-}
-
-/**
- * Main verification function
- */
 async function main(): Promise<void> {
-  console.log('========================================');
-  console.log('🔐 Domain Attestation');
-  console.log('========================================');
-
-  const attestation = await fetchDomainAttestation();
-  await verifyDomainAttestation(attestation);
+  await verifyDomainTlsViaAttestationReport();
 }
 
-// Run the main function if this file is executed directly
 if (require.main === module) {
-  main().catch(console.error);
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
 }
+
+export {
+  compareCertificateFingerprints,
+  fetchLiveCertificate,
+  getCertificateFingerprint,
+  parseCertificateChain,
+  verifyDomainTlsViaAttestationReport,
+};

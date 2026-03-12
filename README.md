@@ -16,7 +16,7 @@ Python and TypeScript tools for validating NEAR AI Cloud attestation reports and
 - ✅ **Intel TDX Quote Validation** - Verify CPU TEE measurements
 - 🔑 **ECDSA Signature Verification** - Validate signed AI responses
 - 📦 **Sigstore Provenance** - Container supply chain verification
-- 🌐 **Domain Verification** - Verify custom domain SSL certificates
+- 🌐 **Domain Verification** - Gateway TLS attestation vs live certificate (default)
 - 🔗 **Multi-Server Support** - Load balancer attestation aggregation
 
 ## 📋 Requirements
@@ -98,17 +98,24 @@ pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1
 pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --test-both
 ```
 
-### Domain Verification
+### Domain Verification (gateway TLS)
+
+**Default behavior** for `domain_verifier`: confirms the gateway’s attested TLS material matches what the host serves on **:443**.
+
+1. `GET /v1/attestation/report?include_tls=true` → `tls_certificate` + `gateway_attestation`
+2. Gateway `report_data` must bind that PEM (`model_verifier.verify_attestation`)
+3. **Leaf** SHA256(DER) fingerprint must match the live server certificate
 
 ```bash
-export BASE_URL=https://cloud-api.near.ai  # or your custom domain
+export BASE_URL=https://cloud-api.near.ai   # optional; hostname defaults --domain
 
-# Python
 python3 py/domain_verifier.py
-
-# TypeScript
 pnpm run domain
+
+# Optional: --domain host --signing-address 0x... --model ...
 ```
+
+If the report has no `tls_certificate`, configure `INGRESS_TLS_CERT_PATH` on cloud-api.
 
 ## 🔐 Model Verifier
 
@@ -324,92 +331,42 @@ The verifier automatically includes the following headers for encrypted requests
 
 ## 🌐 Domain Verifier
 
-Verifies domain attestations for custom domain deployments. Fetches evidence from the `/evidences/` directory and validates:
+Gateway TLS verification runs **by default** every time you run the domain verifier.
 
-1. **Intel TDX Quote** - Verifies TDX quote with [`dcap-qvl`](https://github.com/Phala-Network/dcap-qvl) library
-2. **TDX Report Data** - Validates that report data binds the ACME account and certificate hashes (sha256sum)
-3. **Docker Compose Manifest** - Displays compose manifest and verifies it matches the mr_config measurement
-4. **Sigstore Provenance** - Checks container image provenance links
-5. **SSL Certificate** - Verifies certificate chain integrity, validity period, and matches live server certificate fingerprint
+| Step | What it does |
+|------|----------------|
+| 1 | `GET /v1/attestation/report?include_tls=true` (optional `signing_address`) |
+| 2 | `verify_attestation(gateway, …, tls_certificate_pem)` — `report_data` must bind the PEM |
+| 3 | Leaf cert in `tls_certificate` must match live `:443` (SHA256 fingerprint) |
 
-### Setup
-
-Set the base URL environment variable (defaults to `https://cloud-api.near.ai`):
+### Usage
 
 ```bash
-export BASE_URL=https://your-domain.near.ai
-```
+export BASE_URL=https://cloud-api.near.ai   # optional
 
-Or create a `.env` file:
-
-```bash
-BASE_URL=https://your-domain.near.ai
-```
-
-Then run:
-
-```bash
-# Python
 python3 py/domain_verifier.py
-
-# TypeScript
 pnpm run domain
 ```
 
-### What It Verifies
+### Requirements
 
-- ✅ **TDX Quote Integrity** - Valid CPU TEE measurements via Intel TDX
-- ✅ **Report Data Binding** - ACME account and certificate hashes cryptographically bound to hardware
-- ✅ **Certificate Chain** - Valid SSL certificate chain with trusted root CA
-- ✅ **Certificate Validity** - Certificate is not expired and within validity period
-- ✅ **Live Certificate Match** - Evidence certificate fingerprint matches live server certificate
-- ✅ **Compose Manifest** - Docker compose hash matches mr_config measurement
-- ✅ **Container Provenance** - Sigstore links accessible for container images
+- ✅ Gateway `report_data` binds `tls_certificate`
+- ✅ Same leaf cert served on the domain over TLS
 
 ### Example Output
 
 ```
 ========================================
-🔐 Domain Attestation
+🔐 Domain TLS vs attestation report
 ========================================
+Domain: cloud-api.near.ai
 
-🔐 TDX report data
-sha256sum.txt file matches: True
-Report data embeds sha256sum: True
-Report data embeds empty bytes: True
-
-Docker compose manifest attested by the enclave:
-services:
-  dstack-ingress:
-    image: nearaidev/dstack-ingress-vpc@sha256:cf9f52ec3e3a45750b88f71ba6d057dab0b4fee0d0e7dc78c42bcc5ce34094ee
-    ...
-
-Compose sha256: abc123...
-mr_config (from verified quote): 0x01abc123...
-mr_config matches compose hash: True
-
-🔐 Sigstore provenance
-Checking Sigstore accessibility for container images...
-  ✓ https://search.sigstore.dev/?hash=sha256:cf9f52ec... (HTTP 200)
-
-🔐 SSL certificate
-Certificate public key: 3059301306072a8648ce3d0...
-Certificate verified: True
+🔐 Gateway attestation (include_tls binding)
+...
+🔐 Live TLS certificate vs attested tls_certificate
 Fetching certificate from live server: cloud-api.near.ai:443
 Fingerprints match: True
 ```
-
-### Evidence Files
-
-The domain verifier fetches the following evidence files from `/evidences/`:
-
-- `sha256sum.txt` - SHA256 checksums of ACME account and certificate
-- `acme-account.json` - ACME account information
-- `cert-{domain}.pem` - SSL certificate chain in PEM format
-- `quote.json` - Intel TDX quote
-- `info.json` - TCB information including Docker compose manifest
-
-These files are served by the TEE-protected ingress service and cryptographically bound to the hardware via TDX report data.
 
 ## 📦 Sigstore Provenance
 
@@ -537,10 +494,7 @@ pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1
 ```bash
 export BASE_URL=https://your-domain.near.ai
 
-# Python
 python3 py/domain_verifier.py
-
-# TypeScript
 pnpm run domain
 ```
 
@@ -601,9 +555,8 @@ await showSigstoreProvenance(attestation);
 
 These verifiers work with [NEAR AI Cloud Gateway](https://github.com/nearai/cloud-api) attestation endpoints:
 
-- `GET /v1/attestation/report` - Get TEE attestation
+- `GET /v1/attestation/report` - TEE attestation; use `include_tls=true` for domain verifier (`signing_address` optional)
 - `GET /v1/signature/{chat_id}` - Get response signature
-- `GET /evidences/{file}` - Get domain attestation evidence files (sha256sum.txt, acme-account.json, cert-{domain}.pem, quote.json, info.json)
 
 ## 🤝 Contributing
 
