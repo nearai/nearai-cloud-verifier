@@ -17,6 +17,7 @@ from model_verifier import (
     check_gpu,
     check_tdx_quote,
     show_sigstore_provenance,
+    verify_gateway_tls_binding,
 )
 
 API_KEY = os.environ.get("API_KEY", "")
@@ -42,34 +43,31 @@ def recover_signer(text, signature):
 
 
 def fetch_attestation_for(signing_address, model):
-    """Fetch attestation for a specific signing address."""
+    """Fetch attestation for a specific signing address (model path; no include_tls)."""
     nonce = secrets.token_hex(32)
     url = f"{BASE_URL}/v1/attestation/report?model={model}&nonce={nonce}&signing_algo=ecdsa&signing_address={signing_address}"
     report = requests.get(url, timeout=30).json()
 
-    # Handle both single attestation and multi-node response formats
     if "model_attestations" in report:
-        # Multi-node format: find the attestation matching the signing address
         attestation = next(
             item for item in report["model_attestations"]
             if item["signing_address"].lower() == signing_address.lower()
         )
     else:
-        # Single attestation format: use the report directly
         attestation = report
 
     return attestation, nonce
 
 
 async def check_attestation(signing_address, attestation, nonce):
-    """Verify attestation for a signing address (calls check_report_data, check_gpu, check_tdx_quote)."""
+    """Verify model attestation. TLS PEM binding lives in model_verifier.verify_gateway_tls_binding."""
     intel_result = await check_tdx_quote(attestation)
     check_report_data(attestation, nonce, intel_result)
     check_gpu(attestation, nonce)
     show_sigstore_provenance(attestation)
 
 
-async def verify_chat(chat_id, request_body, response_text, label, model):
+async def verify_chat(chat_id, request_body, response_text, label, model, verify_tls=False):
     """Verify a chat completion signature and attestation."""
     request_hash = sha256_text(request_body)
     response_hash = sha256_text(response_text)
@@ -79,7 +77,16 @@ async def verify_chat(chat_id, request_body, response_text, label, model):
     print(json.dumps(signature_payload, indent=2))
 
     hashed_text = signature_payload["text"]
-    request_hash_server, response_hash_server = hashed_text.split(":")
+    parts = hashed_text.split(":")
+    if len(parts) not in (2, 3):
+        raise ValueError(
+            f"Invalid signature payload text format: expected 2 or 3 colon-separated parts, "
+            f"got {len(parts)}: {hashed_text!r}"
+        )
+    if len(parts) == 3:
+        request_hash_server, response_hash_server = parts[1], parts[2]
+    else:
+        request_hash_server, response_hash_server = parts[0], parts[1]
     print("Request hash matches:", request_hash == request_hash_server)
     print("Response hash matches:", response_hash == response_hash_server)
 
@@ -87,6 +94,9 @@ async def verify_chat(chat_id, request_body, response_text, label, model):
     signing_address = signature_payload["signing_address"]
     recovered = recover_signer(hashed_text, signature)
     print("Signature valid:", recovered.lower() == signing_address.lower())
+
+    if verify_tls:
+        await verify_gateway_tls_binding(signing_address, model)
 
     attestation, nonce = fetch_attestation_for(signing_address, model)
     if not isinstance(attestation, dict) or attestation.get("error"):
@@ -97,7 +107,7 @@ async def verify_chat(chat_id, request_body, response_text, label, model):
     await check_attestation(signing_address, attestation, nonce)
 
 
-async def streaming_example(model):
+async def streaming_example(model, verify_tls=False):
     body = {
         "model": model,
         "messages": [{"role": "user", "content": "Hello, how are you?"}],
@@ -119,12 +129,12 @@ async def streaming_example(model):
         line = chunk.decode()
         response_text += line + "\n"
         if line.startswith("data: {") and chat_id is None:
-            chat_id = json.loads(line[6:])['id']
+            chat_id = json.loads(line[6:])["id"]
 
-    await verify_chat(chat_id, body_json, response_text, "Streaming example", model)
+    await verify_chat(chat_id, body_json, response_text, "Streaming example", model, verify_tls)
 
 
-async def non_streaming_example(model):
+async def non_streaming_example(model, verify_tls=False):
     body = {
         "model": model,
         "messages": [{"role": "user", "content": "Hello, how are you?"}],
@@ -141,21 +151,26 @@ async def non_streaming_example(model):
 
     payload = response.json()
     chat_id = payload["id"]
-    await verify_chat(chat_id, body_json, response.text, "Non-streaming example", model)
+    await verify_chat(chat_id, body_json, response.text, "Non-streaming example", model, verify_tls)
 
 
 async def main():
-    """Run example verification of streaming and non-streaming chat completions."""
     parser = argparse.ArgumentParser(description="Verify NEAR AI Cloud Signed Chat Responses")
     parser.add_argument("--model", default="deepseek-ai/DeepSeek-V3.1")
+    parser.add_argument(
+        "--verify-tls",
+        action="store_true",
+        help="Run gateway TLS PEM binding via model_verifier.verify_gateway_tls_binding",
+    )
     args = parser.parse_args()
 
     if not API_KEY:
         print("Error: API_KEY environment variable is required")
-        print("Set it with: export API_KEY=your-api-key")
         return
-    await streaming_example(args.model)
-    await non_streaming_example(args.model)
+    if args.verify_tls:
+        print("TLS PEM binding: model_verifier.verify_gateway_tls_binding (--verify-tls)")
+    await streaming_example(args.model, args.verify_tls)
+    await non_streaming_example(args.model, args.verify_tls)
 
 
 if __name__ == "__main__":

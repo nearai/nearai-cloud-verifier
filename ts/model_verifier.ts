@@ -21,6 +21,7 @@ interface AttestationBaseInfo {
   signing_address: string;
   signing_algo: string;
   nvidia_payload: string;
+  tls_cert_fingerprint?: string;
   info: {
     tcb_info: string | {
       app_compose: string;
@@ -97,14 +98,36 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
   }
 }
 
+/** Full API response including gateway_attestation, model_attestations, tls_certificate */
+export interface AttestationApiReport {
+  gateway_attestation?: AttestationReport;
+  model_attestations?: AttestationReport[];
+  tls_certificate?: string;
+  [key: string]: unknown;
+}
+
 /**
- * Fetch attestation report from the API
- * @param model - The model name to fetch the report for
- * @param nonce - The nonce for the request
- * @param signingAlgo - The signing algorithm to use (defaults to 'ecdsa')
+ * Fetch attestation report from the API.
+ * @param model - Model name (query param)
+ * @param nonce - Request nonce hex (query param)
+ * @param signingAlgo - Signing algorithm, default 'ecdsa'
+ * @param includeTls - If true, appends include_tls=true (response may include tls_certificate)
+ * @param signingAddress - Optional; when set, narrows gateway quote to this signer
  */
-async function fetchReport(model: string, nonce: string, signingAlgo: string = 'ecdsa'): Promise<AttestationReport> {
-  const url = `${API_BASE}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=${signingAlgo}`;
+async function fetchReport(
+  model: string,
+  nonce: string,
+  signingAlgo: string = 'ecdsa',
+  includeTls: boolean = false,
+  signingAddress?: string,
+): Promise<AttestationApiReport> {
+  let url = `${API_BASE}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=${signingAlgo}`;
+  if (includeTls) {
+    url += '&include_tls_fingerprint=true';
+  }
+  if (signingAddress) {
+    url += `&signing_address=${encodeURIComponent(signingAddress)}`;
+  }
   return await makeRequest(url);
 }
 
@@ -140,44 +163,86 @@ function base64urlDecodeJwtPayload(jwtToken: string): string {
   return Buffer.from(padded, 'base64url').toString('utf-8');
 }
 
+/** report_data from intel quote body (hex string → Buffer) */
+function reportDataBufferFromIntel(intelResult: IntelResult): Buffer {
+  const hex = intelResult.quote.body.reportdata.replace(/^0x/i, '');
+  return Buffer.from(hex, 'hex');
+}
+
+/** Signing address as 32-byte buffer (right-padded with zeros), per algo */
+function signingAddressPadded32(signingAddress: string, signingAlgo: string): Buffer {
+  const algo = signingAlgo.toLowerCase();
+  const addrHex = algo === 'ecdsa' ? signingAddress.replace(/^0x/i, '') : signingAddress;
+  const signingAddressBytes = Buffer.from(addrHex, 'hex');
+  if (signingAddressBytes.length > 32) {
+    throw new Error(
+      `Signing address is too long: expected at most 32 bytes, got ${signingAddressBytes.length}`,
+    );
+  }
+  return Buffer.concat([signingAddressBytes, Buffer.alloc(32 - signingAddressBytes.length, 0)]);
+}
+
 /**
- * Verify that TDX report data binds the signing address and request nonce
+ * Verify that TDX report data binds the signing address and request nonce.
+ *
+ * When attestation contains tls_cert_fingerprint (include_tls_fingerprint mode),
+ * report_data[0..32] = SHA256(signing_address_bytes || fingerprint_bytes) and
+ * report_data[32..64] = raw nonce.
+ * Otherwise, report_data[0..32] = padded signing address and
+ * report_data[32..64] = raw nonce.
  */
-function checkReportData(attestation: AttestationReport, requestNonce: string, intelResult: IntelResult): ReportDataResult {
-  const reportDataHex = intelResult.quote.body.reportdata;
-  const reportData = Buffer.from(reportDataHex.replace('0x', ''), 'hex');
-  const signingAddress = attestation.signing_address;
+function checkReportData(
+  attestation: AttestationReport,
+  requestNonce: string,
+  intelResult: IntelResult,
+): ReportDataResult {
+  const reportData = reportDataBufferFromIntel(intelResult);
   const signingAlgo = (attestation.signing_algo || 'ecdsa').toLowerCase();
 
-  // Parse signing address bytes based on algorithm
-  let signingAddressBytes: Buffer;
-  if (signingAlgo === 'ecdsa') {
-    const addrHex = signingAddress.replace('0x', '');
-    signingAddressBytes = Buffer.from(addrHex, 'hex');
+  const embeddedFirst32 = reportData.subarray(0, 32);
+  const embeddedSecond32 = reportData.subarray(32, Math.min(64, reportData.length));
+
+  const tlsCertFingerprint = attestation.tls_cert_fingerprint;
+  let bindsAddress: boolean;
+
+  if (tlsCertFingerprint) {
+    // TLS binding mode: report_data[0..32] = SHA256(signing_address || fingerprint)
+    const addrHex = signingAlgo === 'ecdsa'
+      ? attestation.signing_address.replace(/^0x/i, '')
+      : attestation.signing_address;
+    const signingAddrBytes = Buffer.from(addrHex, 'hex');
+    const fpBytes = Buffer.from(tlsCertFingerprint, 'hex');
+    const expectedFirst32 = crypto.createHash('sha256').update(signingAddrBytes).update(fpBytes).digest();
+    bindsAddress = embeddedFirst32.equals(expectedFirst32);
+
+    console.log('Signing algorithm:', signingAlgo);
+    console.log('Report data binds signing address + TLS fingerprint:', bindsAddress);
+    if (!bindsAddress) {
+      console.log('  expected:', expectedFirst32.toString('hex'));
+      console.log('  actual:  ', embeddedFirst32.toString('hex'));
+    }
   } else {
-    signingAddressBytes = Buffer.from(signingAddress, 'hex');
+    // Standard mode: report_data[0..32] = padded signing address
+    const expectedAddress = signingAddressPadded32(attestation.signing_address, signingAlgo);
+    bindsAddress = embeddedFirst32.equals(expectedAddress);
+
+    console.log('Signing algorithm:', signingAlgo);
+    console.log('Report data binds signing address:', bindsAddress);
+    if (!bindsAddress) {
+      console.log('  expected:', expectedAddress.toString('hex'), 'actual:', embeddedFirst32.toString('hex'));
+    }
   }
 
-  const embeddedAddress = reportData.subarray(0, 32);
-  const embeddedNonce = reportData.subarray(32);
-
-  const bindsAddress = embeddedAddress.equals(Buffer.concat([signingAddressBytes, Buffer.alloc(32 - signingAddressBytes.length, 0)]));
-  const embedsNonce = embeddedNonce.toString('hex') === requestNonce;
-
-  console.log('Signing algorithm:', signingAlgo);
-  console.log('Report data binds signing address:', bindsAddress);
-  if (!bindsAddress) {
-    console.log('Report data binds signing address:', 'expected:', signingAddressBytes.toString('hex'), 'actual:', embeddedAddress.toString('hex'));
-  }
+  // Nonce is always raw in second 32 bytes
+  const rawNonceBytes = Buffer.from(requestNonce, 'hex');
+  const embedsNonce = rawNonceBytes.length === 32 && embeddedSecond32.length === 32 && embeddedSecond32.equals(rawNonceBytes);
   console.log('Report data embeds request nonce:', embedsNonce);
   if (!embedsNonce) {
-    console.log('Report data embeds request nonce:', 'expected:', requestNonce, 'actual:', embeddedNonce.toString('hex'));
+    console.log('  expected:', requestNonce);
+    console.log('  actual:  ', embeddedSecond32.toString('hex'));
   }
 
-  return {
-    binds_address: bindsAddress,
-    embeds_nonce: embedsNonce
-  };
+  return { binds_address: bindsAddress, embeds_nonce: embedsNonce };
 }
 
 /**
@@ -221,10 +286,16 @@ async function checkTdxQuote(attestation: AttestationBaseInfo): Promise<IntelRes
     const reportData: string = td10.report_data || '';
     const mrConfig: string = td10.mr_config_id || '';
 
-    // Determine verified status akin to Python's result.status == "UpToDate"
+    // TDX status: UpToDate is ideal; OutOfDate still has valid quote crypto—do not fail verification
+    const TDX_STATUS_OK = new Set(['UpToDate', 'OutOfDate']);
     const status: string | undefined = typeof rawResult?.status === 'string' ? rawResult.status : undefined;
-    const verifiedFromStatus = status ? status === 'UpToDate' : undefined;
+    const verifiedFromStatus = status ? TDX_STATUS_OK.has(status) : undefined;
     const verified = verifiedFromStatus ?? Boolean(rawResult?.quote?.verified);
+    if (status === 'OutOfDate') {
+      // Quote still verifies; Intel marks OutOfDate when platform TCB is below
+      // current advisory baseline—not a cryptographic failure.
+      console.log('Intel TDX quote status: OutOfDate');
+    }
 
     const mapped: IntelResult = {
       quote: {
@@ -302,16 +373,17 @@ async function checkSigstoreLinks(links: string[]): Promise<Array<[string, boole
   return results;
 }
 
-/**
- * Extract and display Sigstore provenance links from attestation
- */
+/** Parsed tcb_info object with optional app_compose string (shared by Sigstore + compose display). */
+function parsedTcbInfo(attestation: AttestationBaseInfo): Record<string, unknown> | null {
+  const raw = attestation.info?.tcb_info;
+  if (raw == null) return null;
+  return typeof raw === 'string' ? (JSON.parse(raw) as Record<string, unknown>) : (raw as Record<string, unknown>);
+}
+
 async function showSigstoreProvenance(attestation: AttestationBaseInfo): Promise<void> {
-  let tcbInfo = attestation.info.tcb_info;
-  if (typeof tcbInfo === 'string') {
-    tcbInfo = JSON.parse(tcbInfo);
-  }
-  
-  const compose = (tcbInfo as any).app_compose;
+  const tcbInfo = parsedTcbInfo(attestation);
+  if (!tcbInfo) return;
+  const compose = tcbInfo.app_compose as string | undefined;
   if (!compose) {
     return;
   }
@@ -338,12 +410,9 @@ async function showSigstoreProvenance(attestation: AttestationBaseInfo): Promise
  * Display the Docker compose manifest and verify against mr_config from verified quote
  */
 function showCompose(attestation: AttestationBaseInfo, intelResult: IntelResult): void {
-  let tcbInfo = attestation.info.tcb_info;
-  if (typeof tcbInfo === 'string') {
-    tcbInfo = JSON.parse(tcbInfo);
-  }
-  
-  const appCompose = (tcbInfo as any).app_compose;
+  const tcbInfo = parsedTcbInfo(attestation);
+  if (!tcbInfo) return;
+  const appCompose = tcbInfo.app_compose as string | undefined;
   if (!appCompose) {
     return;
   }
@@ -363,13 +432,19 @@ function showCompose(attestation: AttestationBaseInfo, intelResult: IntelResult)
 }
 
 /**
- * Verify a single attestation
+ * Verify a single attestation.
+ *
+ * When attestation contains tls_cert_fingerprint (from include_tls_fingerprint),
+ * report_data[0..32] = SHA256(signing_address || fingerprint) is verified automatically.
  */
-async function verifyAttestation(attestation: AttestationReport, requestNonce: string, verifyModel: boolean): Promise<void> {
+async function verifyAttestation(
+  attestation: AttestationReport,
+  requestNonce: string,
+  verifyModel: boolean,
+): Promise<void> {
   console.log('🔐 Attestation');
 
   console.log('Request nonce:', requestNonce);
-  // Check if signing_address exists (for both gateway and model attestations)
   if (attestation.signing_address) {
     console.log('\nSigning address:', attestation.signing_address);
   }
@@ -390,15 +465,44 @@ async function verifyAttestation(attestation: AttestationReport, requestNonce: s
 }
 
 /**
- * Main verification function
+ * Gateway-only verification with TLS fingerprint binding.
+ * Call from chat_verifier when --verify-tls; all logic lives here.
  */
+async function verifyGatewayTlsBinding(
+  signingAddress: string,
+  model: string,
+  signingAlgo: string = 'ecdsa',
+): Promise<void> {
+  const requestNonce = crypto.randomBytes(32).toString('hex');
+  const report = await fetchReport(model, requestNonce, signingAlgo, true, signingAddress);
+  const gateway = report.gateway_attestation;
+
+  if (!gateway) {
+    console.log('No gateway_attestation in report (cannot verify TLS binding).');
+    return;
+  }
+  if (!gateway.tls_cert_fingerprint) {
+    console.log(
+      'TLS verification requested but gateway has no tls_cert_fingerprint ' +
+        '(set TLS_CERT_PATH on cloud-api or omit --verify-tls).',
+    );
+    return;
+  }
+
+  console.log('========================================');
+  console.log('🔐 Gateway attestation (include_tls_fingerprint)');
+  console.log('========================================');
+  await verifyAttestation(gateway, requestNonce, false);
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const modelIndex = args.indexOf('--model');
   const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'deepseek-ai/DeepSeek-V3.1';
+  const includeTls = args.includes('--verify-tls');
 
   const requestNonce = crypto.randomBytes(32).toString('hex');
-  const report = await fetchReport(model, requestNonce, 'ecdsa');
+  const report = await fetchReport(model, requestNonce, 'ecdsa', includeTls);
 
   if (!report.gateway_attestation) {
     console.log('No gateway attestation found');
@@ -408,7 +512,11 @@ async function main(): Promise<void> {
   console.log('========================================');
   console.log('🔐 Gateway attestation');
   console.log('========================================');
-  await verifyAttestation(report.gateway_attestation, requestNonce, false);
+  await verifyAttestation(
+    report.gateway_attestation,
+    requestNonce,
+    false,
+  );
 
   // Verify model attestations
   if (!report.model_attestations) {
@@ -433,6 +541,7 @@ if (require.main === module) {
 
 export {
   fetchReport,
+  verifyGatewayTlsBinding,
   checkTdxQuote,
   checkReportData,
   checkGpu,

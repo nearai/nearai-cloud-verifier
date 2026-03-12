@@ -14,6 +14,7 @@ import {
   checkGpu,
   checkTdxQuote,
   showSigstoreProvenance,
+  verifyGatewayTlsBinding,
   AttestationReport
 } from './model_verifier';
 
@@ -111,30 +112,27 @@ function recoverSigner(text: string, signature: string): string {
 }
 
 /**
- * Fetch attestation for a specific signing address
+ * Fetch attestation for a specific signing address (model attestation path; no include_tls).
  */
 async function fetchAttestationFor(signingAddress: string, model: string): Promise<[AttestationReport, string]> {
   const nonce = crypto.randomBytes(32).toString('hex');
-  const url = `${BASE_URL}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=ecdsa&signing_address=${signingAddress}`;
+  const url = `${BASE_URL}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=ecdsa&signing_address=${encodeURIComponent(signingAddress)}`;
   const report = await makeRequest(url);
 
-  // Handle both single attestation and multi-node response formats
   let attestation: AttestationReport;
   if (report.model_attestations) {
-    // Multi-node format: find the attestation matching the signing address
     attestation = report.model_attestations.find(
       (item: AttestationReport) => item.signing_address.toLowerCase() === signingAddress.toLowerCase()
     )!;
   } else {
-    // Single attestation format: use the report directly
-    attestation = report;
+    attestation = report as unknown as AttestationReport;
   }
 
   return [attestation, nonce];
 }
 
 /**
- * Verify attestation for a signing address
+ * Verify model attestation (TDX + report data + GPU + sigstore). TLS PEM binding is handled in model_verifier.verifyGatewayTlsBinding.
  */
 async function checkAttestation(signingAddress: string, attestation: AttestationReport, nonce: string): Promise<void> {
   const intelResult = await checkTdxQuote(attestation);
@@ -144,9 +142,17 @@ async function checkAttestation(signingAddress: string, attestation: Attestation
 }
 
 /**
- * Verify a chat completion signature and attestation
+ * Verify a chat completion signature and attestation.
+ * @param verifyTls if true, runs gateway TLS PEM binding verification via model_verifier (separate fetch with include_tls).
  */
-async function verifyChat(chatId: string, requestBody: string, responseText: string, label: string, model: string): Promise<void> {
+async function verifyChat(
+  chatId: string,
+  requestBody: string,
+  responseText: string,
+  label: string,
+  model: string,
+  verifyTls: boolean = false,
+): Promise<void> {
   const requestHash = sha256Text(requestBody);
   const responseHash = sha256Text(responseText);
 
@@ -155,7 +161,14 @@ async function verifyChat(chatId: string, requestBody: string, responseText: str
   console.log(JSON.stringify(signaturePayload, null, 2));
 
   const hashedText = signaturePayload.text;
-  const [requestHashServer, responseHashServer] = hashedText.split(':');
+  const parts = hashedText.split(':');
+  if (parts.length !== 2 && parts.length !== 3) {
+    throw new Error(
+      `Invalid signature payload text format: expected 2 or 3 colon-separated parts, got ${parts.length}: "${hashedText}"`,
+    );
+  }
+  const requestHashServer = parts.length === 3 ? parts[1]! : parts[0]!;
+  const responseHashServer = parts.length === 3 ? parts[2]! : parts[1]!;
   console.log('Request hash matches:', requestHash === requestHashServer);
   console.log('Response hash matches:', responseHash === responseHashServer);
 
@@ -163,6 +176,10 @@ async function verifyChat(chatId: string, requestBody: string, responseText: str
   const signingAddress = signaturePayload.signing_address;
   const recovered = recoverSigner(hashedText, signature);
   console.log('Signature valid:', recovered.toLowerCase() === signingAddress.toLowerCase());
+
+  if (verifyTls) {
+    await verifyGatewayTlsBinding(signingAddress, model, 'ecdsa');
+  }
 
   const [attestation, nonce] = await fetchAttestationFor(signingAddress, model);
   if (!attestation || "error" in attestation) {
@@ -177,7 +194,7 @@ async function verifyChat(chatId: string, requestBody: string, responseText: str
 /**
  * Streaming example
  */
-async function streamingExample(model: string): Promise<void> {
+async function streamingExample(model: string, verifyTls: boolean = false): Promise<void> {
   const body: ChatCompletionRequest = {
     model,
     messages: [{ role: 'user', content: 'Hello, how are you?' }],
@@ -205,7 +222,6 @@ async function streamingExample(model: string): Promise<void> {
     };
 
     const req = client.request(requestOptions, (res) => {
-      // Check HTTP status code
       if (res.statusCode !== 200) {
         let errorData = '';
         res.on('data', (chunk) => {
@@ -226,33 +242,27 @@ async function streamingExample(model: string): Promise<void> {
         buffer += chunk.toString();
         responseText += chunk.toString();
         
-        // Process complete lines from buffer
         let newlineIndex;
         while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
           const line = buffer.substring(0, newlineIndex).trim();
           buffer = buffer.substring(newlineIndex + 1);
           
-          // Skip empty lines and comments
           if (line.length === 0 || line.startsWith(':')) {
             continue;
           }
           
-          // Parse SSE data lines
           if (line.startsWith('data: ') && chatId === null) {
-            const dataStr = line.substring(6); // Skip "data: "
-            
-            // Handle [DONE] marker
+            const dataStr = line.substring(6);
             if (dataStr === '[DONE]') {
               continue;
             }
-            
             try {
               const data = JSON.parse(dataStr);
               if (data.id) {
                 chatId = data.id;
               }
-            } catch (error) {
-              // Ignore parsing errors for non-JSON lines
+            } catch {
+              // ignore
             }
           }
         }
@@ -264,7 +274,7 @@ async function streamingExample(model: string): Promise<void> {
           return;
         }
         try {
-          await verifyChat(chatId, bodyJson, responseText, 'Streaming example', model);
+          await verifyChat(chatId, bodyJson, responseText, 'Streaming example', model, verifyTls);
           resolve();
         } catch (error) {
           reject(error);
@@ -286,7 +296,7 @@ async function streamingExample(model: string): Promise<void> {
 /**
  * Non-streaming example
  */
-async function nonStreamingExample(model: string): Promise<void> {
+async function nonStreamingExample(model: string, verifyTls: boolean = false): Promise<void> {
   const body: ChatCompletionRequest = {
     model,
     messages: [{ role: 'user', content: 'Hello, how are you?' }],
@@ -306,7 +316,7 @@ async function nonStreamingExample(model: string): Promise<void> {
 
   const payload: ChatCompletionResponse = response;
   const chatId = payload.id;
-  await verifyChat(chatId, bodyJson, JSON.stringify(response), 'Non-streaming example', model);
+  await verifyChat(chatId, bodyJson, JSON.stringify(response), 'Non-streaming example', model, verifyTls);
 }
 
 /**
@@ -316,6 +326,7 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const modelIndex = args.indexOf('--model');
   const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'deepseek-ai/DeepSeek-V3.1';
+  const verifyTls = args.includes('--verify-tls');
 
   if (!API_KEY) {
     console.log('Error: API_KEY environment variable is required');
@@ -323,11 +334,13 @@ async function main(): Promise<void> {
     return;
   }
 
-  await streamingExample(model);
-  await nonStreamingExample(model);
+  if (verifyTls) {
+    console.log('TLS PEM binding: handled in model_verifier.verifyGatewayTlsBinding (--verify-tls)');
+  }
+  await streamingExample(model, verifyTls);
+  await nonStreamingExample(model, verifyTls);
 }
 
-// Run the main function if this file is executed directly
 if (require.main === module) {
   main().catch(console.error);
 }
