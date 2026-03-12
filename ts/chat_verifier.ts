@@ -155,7 +155,11 @@ async function verifyChat(chatId: string, requestBody: string, responseText: str
   console.log(JSON.stringify(signaturePayload, null, 2));
 
   const hashedText = signaturePayload.text;
-  const [requestHashServer, responseHashServer] = hashedText.split(':');
+  // Support both formats: Python proxy uses "requestHash:responseHash" (2 parts);
+  // Rust proxy uses "modelName:requestHash:responseHash" (3 parts).
+  const parts = hashedText.split(':');
+  const requestHashServer = parts.length === 3 ? parts[1] : parts[0];
+  const responseHashServer = parts.length === 3 ? parts[2] : parts[1];
   console.log('Request hash matches:', requestHash === requestHashServer);
   console.log('Response hash matches:', responseHash === responseHashServer);
 

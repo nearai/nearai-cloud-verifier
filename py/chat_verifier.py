@@ -79,7 +79,15 @@ async def verify_chat(chat_id, request_body, response_text, label, model):
     print(json.dumps(signature_payload, indent=2))
 
     hashed_text = signature_payload["text"]
-    request_hash_server, response_hash_server = hashed_text.split(":")
+    # Support both formats: Python proxy uses "requestHash:responseHash" (2 parts);
+    # Rust proxy uses "modelName:requestHash:responseHash" (3 parts).
+    parts = hashed_text.split(":")
+    if len(parts) == 3:
+        request_hash_server, response_hash_server = parts[1], parts[2]
+    elif len(parts) >= 2:
+        request_hash_server, response_hash_server = parts[0], parts[1]
+    else:
+        raise ValueError(f"Signature text has unexpected format (expected 2 or 3 colon-separated parts): {hashed_text!r}")
     print("Request hash matches:", request_hash == request_hash_server)
     print("Response hash matches:", response_hash == response_hash_server)
 
