@@ -29,7 +29,7 @@ def fetch_report(model, nonce, signing_algo="ecdsa", include_tls=False, signing_
     """
     url = f"{BASE_URL}/v1/attestation/report?model={model}&nonce={nonce}&signing_algo={signing_algo}"
     if include_tls:
-        url += "&include_tls=true"
+        url += "&include_tls_fingerprint=true"
     if signing_address:
         url += f"&signing_address={signing_address}"
     return requests.get(url, timeout=30).json()
@@ -63,73 +63,65 @@ def _signing_address_padded32(signing_address, signing_algo):
     return raw.ljust(32, b"\x00")
 
 
-def _tls_bound_nonce_component(raw_nonce_bytes, tls_certificate_pem):
-    """report_data[32:64] for include_tls: SHA256(nonce_32 || SHA256(pem_utf8))."""
-    if len(raw_nonce_bytes) != 32:
-        return None
-    pem_hash = sha256(tls_certificate_pem.encode("utf-8")).digest()
-    return sha256(raw_nonce_bytes + pem_hash).digest()
+def check_report_data(attestation, request_nonce, intel_result):
+    """Verify TDX report_data binds signing address and nonce.
 
-
-def _log_report_data_nonce(matches_raw, matches_tls, request_nonce, embedded_hex, expected_tls_hex):
-    if matches_raw:
-        print("Report data embeds request nonce (raw):", True)
-        return
-    if matches_tls:
-        print("Report data nonce component: TLS-bound SHA256(nonce||SHA256(pem)):", True)
-        return
-    print("Report data embeds request nonce:", False)
-    print("  expected raw nonce:", request_nonce)
-    if expected_tls_hex:
-        print("  expected TLS-bound: ", expected_tls_hex)
-    print("  actual:            ", embedded_hex)
-
-
-def check_report_data(attestation, request_nonce, intel_result, tls_certificate_pem=None):
-    """Verify TDX report_data binds signing address and nonce (raw or TLS-bound PEM).
+    When attestation contains tls_cert_fingerprint (include_tls_fingerprint mode),
+    report_data[0..32] = SHA256(signing_address_bytes || fingerprint_bytes) and
+    report_data[32..64] = raw nonce.
+    Otherwise, report_data[0..32] = padded signing address and
+    report_data[32..64] = raw nonce.
 
     Returns dict with binds_address and embeds_nonce.
     """
     report_data = _report_data_bytes(intel_result)
     signing_algo = attestation.get("signing_algo", "ecdsa").lower()
-    expected_address = _signing_address_padded32(attestation["signing_address"], signing_algo)
 
-    embedded_address = report_data[:32]
-    embedded_nonce = report_data[32:64] if len(report_data) >= 64 else report_data[32:]
-    binds_address = embedded_address == expected_address
+    embedded_first32 = report_data[:32]
+    embedded_second32 = report_data[32:64] if len(report_data) >= 64 else report_data[32:]
 
+    tls_cert_fingerprint = attestation.get("tls_cert_fingerprint")
+
+    if tls_cert_fingerprint:
+        # TLS binding mode: report_data[0..32] = SHA256(signing_address || fingerprint)
+        addr_hex = attestation["signing_address"]
+        if signing_algo == "ecdsa":
+            signing_addr_bytes = bytes.fromhex(addr_hex.removeprefix("0x"))
+        else:
+            signing_addr_bytes = bytes.fromhex(addr_hex)
+        fp_bytes = bytes.fromhex(tls_cert_fingerprint)
+        expected_first32 = sha256(signing_addr_bytes + fp_bytes).digest()
+        binds_address = embedded_first32 == expected_first32
+
+        print("Signing algorithm:", signing_algo)
+        print("Report data binds signing address + TLS fingerprint:", binds_address)
+        if not binds_address:
+            print("  expected:", expected_first32.hex())
+            print("  actual:  ", embedded_first32.hex())
+    else:
+        # Standard mode: report_data[0..32] = padded signing address
+        expected_address = _signing_address_padded32(attestation["signing_address"], signing_algo)
+        binds_address = embedded_first32 == expected_address
+
+        print("Signing algorithm:", signing_algo)
+        print("Report data binds signing address:", binds_address)
+        if not binds_address:
+            print("  expected:", expected_address.hex(), "actual:", embedded_first32.hex())
+
+    # Nonce is always raw in second 32 bytes
     try:
         raw_nonce_bytes = bytes.fromhex(request_nonce)
     except ValueError:
         raw_nonce_bytes = b""
-    matches_raw = (
+    embeds_nonce = (
         len(raw_nonce_bytes) == 32
-        and len(embedded_nonce) == 32
-        and embedded_nonce == raw_nonce_bytes
+        and len(embedded_second32) == 32
+        and embedded_second32 == raw_nonce_bytes
     )
-    expected_tls = (
-        _tls_bound_nonce_component(raw_nonce_bytes, tls_certificate_pem)
-        if tls_certificate_pem
-        else None
-    )
-    matches_tls = (
-        expected_tls is not None
-        and len(embedded_nonce) == 32
-        and embedded_nonce == expected_tls
-    )
-    embeds_nonce = matches_raw or matches_tls
-
-    print("Signing algorithm:", signing_algo)
-    print("Report data binds signing address:", binds_address)
-    if not binds_address:
-        print("Report data binds signing address:", "expected:", expected_address.hex(), "actual:", embedded_address.hex())
-    _log_report_data_nonce(
-        matches_raw,
-        matches_tls,
-        request_nonce,
-        embedded_nonce.hex(),
-        expected_tls.hex() if expected_tls else None,
-    )
+    print("Report data embeds request nonce:", embeds_nonce)
+    if not embeds_nonce:
+        print("  expected:", request_nonce)
+        print("  actual:  ", embedded_second32.hex())
 
     return {"binds_address": binds_address, "embeds_nonce": embeds_nonce}
 
@@ -295,11 +287,11 @@ def show_compose(attestation, intel_result):
     print("mr_config matches compose hash:", mr_config.lower().startswith(expected_mr_config.lower()))
 
 
-async def verify_attestation(attestation, request_nonce, verify_model=False, tls_certificate_pem=None):
+async def verify_attestation(attestation, request_nonce, verify_model=False):
     """Verify the attestation.
 
-    If tls_certificate_pem is set (gateway + include_tls), verifies report_data[32:64]
-    = SHA256(nonce||SHA256(pem)).
+    When attestation contains tls_cert_fingerprint (from include_tls_fingerprint),
+    report_data[0..32] = SHA256(signing_address || fingerprint) is verified automatically.
     """
     print("\n🔐 Attestation")
 
@@ -312,7 +304,7 @@ async def verify_attestation(attestation, request_nonce, verify_model=False, tls
     intel_result = await check_tdx_quote(attestation)
 
     print("\n🔐 TDX report data")
-    check_report_data(attestation, request_nonce, intel_result, tls_certificate_pem)
+    check_report_data(attestation, request_nonce, intel_result)
 
     if verify_model:
         print("\n🔐 GPU attestation")
@@ -323,32 +315,31 @@ async def verify_attestation(attestation, request_nonce, verify_model=False, tls
 
 
 async def verify_gateway_tls_binding(signing_address, model, signing_algo="ecdsa"):
-    """Gateway-only verification with optional TLS PEM binding (include_tls)."""
+    """Gateway-only verification with TLS fingerprint binding."""
     request_nonce = secrets.token_hex(32)
     report = fetch_report(model, request_nonce, signing_algo=signing_algo, include_tls=True, signing_address=signing_address)
     gateway = report.get("gateway_attestation")
-    tls_pem = report.get("tls_certificate")
 
     if not gateway:
         print("No gateway_attestation in report (cannot verify TLS binding).")
         return
-    if not tls_pem:
+    if not gateway.get("tls_cert_fingerprint"):
         print(
-            "TLS verification requested but response has no tls_certificate "
-            "(set INGRESS_TLS_CERT_PATH on cloud-api or omit --verify-tls)."
+            "TLS verification requested but gateway has no tls_cert_fingerprint "
+            "(set TLS_CERT_PATH on cloud-api or omit --verify-tls)."
         )
         return
 
     print("========================================")
-    print("🔐 Gateway attestation (include_tls)")
+    print("🔐 Gateway attestation (include_tls_fingerprint)")
     print("========================================")
-    await verify_attestation(gateway, request_nonce, verify_model=False, tls_certificate_pem=tls_pem)
+    await verify_attestation(gateway, request_nonce, verify_model=False)
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Verify NEAR AI Cloud TEE Attestation")
     parser.add_argument("--model", default="deepseek-ai/DeepSeek-V3.1")
-    parser.add_argument("--verify-tls", action="store_true", help="Fetch with include_tls and verify PEM binding on gateway")
+    parser.add_argument("--verify-tls", action="store_true", help="Fetch with include_tls_fingerprint and verify TLS fingerprint binding on gateway")
     args = parser.parse_args()
 
     request_nonce = secrets.token_hex(32)
@@ -359,8 +350,7 @@ async def main() -> None:
     print("========================================")
     gateway_attestation = report.get("gateway_attestation")
     if gateway_attestation:
-        tls_pem = report.get("tls_certificate") if args.verify_tls else None
-        await verify_attestation(gateway_attestation, request_nonce, verify_model=False, tls_certificate_pem=tls_pem)
+        await verify_attestation(gateway_attestation, request_nonce, verify_model=False)
 
     model_attestations = report.get("model_attestations", [])
     index = 0

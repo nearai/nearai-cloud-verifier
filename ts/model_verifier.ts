@@ -21,6 +21,7 @@ interface AttestationBaseInfo {
   signing_address: string;
   signing_algo: string;
   nvidia_payload: string;
+  tls_cert_fingerprint?: string;
   info: {
     tcb_info: string | {
       app_compose: string;
@@ -122,7 +123,7 @@ async function fetchReport(
 ): Promise<AttestationApiReport> {
   let url = `${API_BASE}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=${signingAlgo}`;
   if (includeTls) {
-    url += '&include_tls=true';
+    url += '&include_tls_fingerprint=true';
   }
   if (signingAddress) {
     url += `&signing_address=${encodeURIComponent(signingAddress)}`;
@@ -182,76 +183,64 @@ function signingAddressPadded32(signingAddress: string, signingAlgo: string): Bu
 }
 
 /**
- * Cloud-api include_tls: report_data[32..64] = SHA256(nonce_32 || SHA256(pem_utf8)).
- * Returns 32-byte digest, or null if nonce is not 32 bytes.
- */
-function tlsBoundNonceComponent(nonceBytes: Buffer, tlsCertificatePem: string): Buffer | null {
-  if (nonceBytes.length !== 32) return null;
-  const pemHash = crypto.createHash('sha256').update(Buffer.from(tlsCertificatePem, 'utf8')).digest();
-  return crypto.createHash('sha256').update(nonceBytes).update(pemHash).digest();
-}
-
-function logReportDataNonceResult(
-  matchesRaw: boolean,
-  matchesTls: boolean,
-  requestNonce: string,
-  embeddedHex: string,
-  expectedTlsHex: string | null,
-): void {
-  if (matchesRaw) {
-    console.log('Report data embeds request nonce (raw):', true);
-    return;
-  }
-  if (matchesTls) {
-    console.log('Report data nonce component: TLS-bound SHA256(nonce||SHA256(pem)):', true);
-    return;
-  }
-  console.log('Report data embeds request nonce:', false);
-  console.log('  expected raw nonce:', requestNonce);
-  if (expectedTlsHex) console.log('  expected TLS-bound: ', expectedTlsHex);
-  console.log('  actual:            ', embeddedHex);
-}
-
-/**
- * Verify that TDX report data binds the signing address and request nonce (or TLS PEM binding).
- * When tlsCertificatePem is set, report_data[32..64] may be SHA256(nonce||SHA256(pem)) instead of raw nonce.
+ * Verify that TDX report data binds the signing address and request nonce.
+ *
+ * When attestation contains tls_cert_fingerprint (include_tls_fingerprint mode),
+ * report_data[0..32] = SHA256(signing_address_bytes || fingerprint_bytes) and
+ * report_data[32..64] = raw nonce.
+ * Otherwise, report_data[0..32] = padded signing address and
+ * report_data[32..64] = raw nonce.
  */
 function checkReportData(
   attestation: AttestationReport,
   requestNonce: string,
   intelResult: IntelResult,
-  tlsCertificatePem?: string | null,
 ): ReportDataResult {
   const reportData = reportDataBufferFromIntel(intelResult);
   const signingAlgo = (attestation.signing_algo || 'ecdsa').toLowerCase();
-  const expectedAddress = signingAddressPadded32(attestation.signing_address, signingAlgo);
 
-  const embeddedAddress = reportData.subarray(0, 32);
-  const embeddedNonce = reportData.subarray(32, Math.min(64, reportData.length));
-  const bindsAddress = embeddedAddress.equals(expectedAddress);
+  const embeddedFirst32 = reportData.subarray(0, 32);
+  const embeddedSecond32 = reportData.subarray(32, Math.min(64, reportData.length));
 
-  const rawNonceBytes = Buffer.from(requestNonce, 'hex');
-  const matchesRaw = rawNonceBytes.length === 32 && embeddedNonce.length === 32 && embeddedNonce.equals(rawNonceBytes);
-  const expectedTls =
-    tlsCertificatePem && rawNonceBytes.length === 32
-      ? tlsBoundNonceComponent(rawNonceBytes, tlsCertificatePem)
-      : null;
-  const matchesTls =
-    Boolean(expectedTls) && embeddedNonce.length === 32 && embeddedNonce.equals(expectedTls!);
-  const embedsNonce = matchesRaw || matchesTls;
+  const tlsCertFingerprint = attestation.tls_cert_fingerprint;
+  let bindsAddress: boolean;
 
-  console.log('Signing algorithm:', signingAlgo);
-  console.log('Report data binds signing address:', bindsAddress);
-  if (!bindsAddress) {
-    console.log('Report data binds signing address:', 'expected:', expectedAddress.toString('hex'), 'actual:', embeddedAddress.toString('hex'));
+  if (tlsCertFingerprint) {
+    // TLS binding mode: report_data[0..32] = SHA256(signing_address || fingerprint)
+    const addrHex = signingAlgo === 'ecdsa'
+      ? attestation.signing_address.replace(/^0x/i, '')
+      : attestation.signing_address;
+    const signingAddrBytes = Buffer.from(addrHex, 'hex');
+    const fpBytes = Buffer.from(tlsCertFingerprint, 'hex');
+    const expectedFirst32 = crypto.createHash('sha256').update(signingAddrBytes).update(fpBytes).digest();
+    bindsAddress = embeddedFirst32.equals(expectedFirst32);
+
+    console.log('Signing algorithm:', signingAlgo);
+    console.log('Report data binds signing address + TLS fingerprint:', bindsAddress);
+    if (!bindsAddress) {
+      console.log('  expected:', expectedFirst32.toString('hex'));
+      console.log('  actual:  ', embeddedFirst32.toString('hex'));
+    }
+  } else {
+    // Standard mode: report_data[0..32] = padded signing address
+    const expectedAddress = signingAddressPadded32(attestation.signing_address, signingAlgo);
+    bindsAddress = embeddedFirst32.equals(expectedAddress);
+
+    console.log('Signing algorithm:', signingAlgo);
+    console.log('Report data binds signing address:', bindsAddress);
+    if (!bindsAddress) {
+      console.log('  expected:', expectedAddress.toString('hex'), 'actual:', embeddedFirst32.toString('hex'));
+    }
   }
-  logReportDataNonceResult(
-    matchesRaw,
-    matchesTls,
-    requestNonce,
-    embeddedNonce.toString('hex'),
-    expectedTls ? expectedTls.toString('hex') : null,
-  );
+
+  // Nonce is always raw in second 32 bytes
+  const rawNonceBytes = Buffer.from(requestNonce, 'hex');
+  const embedsNonce = rawNonceBytes.length === 32 && embeddedSecond32.length === 32 && embeddedSecond32.equals(rawNonceBytes);
+  console.log('Report data embeds request nonce:', embedsNonce);
+  if (!embedsNonce) {
+    console.log('  expected:', requestNonce);
+    console.log('  actual:  ', embeddedSecond32.toString('hex'));
+  }
 
   return { binds_address: bindsAddress, embeds_nonce: embedsNonce };
 }
@@ -444,18 +433,18 @@ function showCompose(attestation: AttestationBaseInfo, intelResult: IntelResult)
 
 /**
  * Verify a single attestation.
- * @param tlsCertificatePem - when set (gateway + include_tls), verifies report_data[32..64] = SHA256(nonce||SHA256(pem))
+ *
+ * When attestation contains tls_cert_fingerprint (from include_tls_fingerprint),
+ * report_data[0..32] = SHA256(signing_address || fingerprint) is verified automatically.
  */
 async function verifyAttestation(
   attestation: AttestationReport,
   requestNonce: string,
   verifyModel: boolean,
-  tlsCertificatePem?: string | null,
 ): Promise<void> {
   console.log('🔐 Attestation');
 
   console.log('Request nonce:', requestNonce);
-  // Check if signing_address exists (for both gateway and model attestations)
   if (attestation.signing_address) {
     console.log('\nSigning address:', attestation.signing_address);
   }
@@ -464,7 +453,7 @@ async function verifyAttestation(
   const intelResult = await checkTdxQuote(attestation);
 
   console.log('\n🔐 TDX report data');
-  checkReportData(attestation, requestNonce, intelResult, tlsCertificatePem);
+  checkReportData(attestation, requestNonce, intelResult);
 
   if (verifyModel) {
     console.log('\n🔐 GPU attestation');
@@ -476,7 +465,7 @@ async function verifyAttestation(
 }
 
 /**
- * Gateway-only verification with optional TLS PEM binding (include_tls flow).
+ * Gateway-only verification with TLS fingerprint binding.
  * Call from chat_verifier when --verify-tls; all logic lives here.
  */
 async function verifyGatewayTlsBinding(
@@ -487,24 +476,23 @@ async function verifyGatewayTlsBinding(
   const requestNonce = crypto.randomBytes(32).toString('hex');
   const report = await fetchReport(model, requestNonce, signingAlgo, true, signingAddress);
   const gateway = report.gateway_attestation;
-  const tlsPem = report.tls_certificate;
 
   if (!gateway) {
     console.log('No gateway_attestation in report (cannot verify TLS binding).');
     return;
   }
-  if (!tlsPem) {
+  if (!gateway.tls_cert_fingerprint) {
     console.log(
-      'TLS verification requested but response has no tls_certificate ' +
-        '(set INGRESS_TLS_CERT_PATH on cloud-api or omit --verify-tls).',
+      'TLS verification requested but gateway has no tls_cert_fingerprint ' +
+        '(set TLS_CERT_PATH on cloud-api or omit --verify-tls).',
     );
     return;
   }
 
   console.log('========================================');
-  console.log('🔐 Gateway attestation (include_tls)');
+  console.log('🔐 Gateway attestation (include_tls_fingerprint)');
   console.log('========================================');
-  await verifyAttestation(gateway, requestNonce, false, tlsPem);
+  await verifyAttestation(gateway, requestNonce, false);
 }
 
 async function main(): Promise<void> {
@@ -528,7 +516,6 @@ async function main(): Promise<void> {
     report.gateway_attestation,
     requestNonce,
     false,
-    includeTls ? report.tls_certificate : undefined,
   );
 
   // Verify model attestations

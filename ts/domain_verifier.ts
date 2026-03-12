@@ -188,8 +188,8 @@ async function verifyDomainTlsViaAttestationReport(): Promise<void> {
 
   const gateway = report.gateway_attestation as AttestationReport | undefined;
   if (gateway) {
-    console.log("\n🔐 Gateway attestation (include_tls binding)");
-    await verifyAttestation(gateway, nonce, false, tlsPem);
+    console.log("\n🔐 Gateway attestation (include_tls_fingerprint binding)");
+    await verifyAttestation(gateway, nonce, false);
   } else {
     console.log(
       "\n⚠️  No gateway_attestation in report; skipping TDX/report_data check. Still comparing TLS PEM to live.",

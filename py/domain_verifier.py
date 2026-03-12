@@ -642,8 +642,8 @@ async def verify_domain_tls_via_attestation_report(
 
     gateway = report.get("gateway_attestation")
     if gateway:
-        print("\n🔐 Gateway attestation (include_tls binding)")
-        await verify_attestation(gateway, nonce, verify_model=False, tls_certificate_pem=tls_pem)
+        print("\n🔐 Gateway attestation (include_tls_fingerprint binding)")
+        await verify_attestation(gateway, nonce, verify_model=False)
     else:
         print(
             "\n⚠️  No gateway_attestation in report; skipping TDX/report_data check. "
