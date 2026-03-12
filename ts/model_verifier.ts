@@ -97,14 +97,33 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
   }
 }
 
+/** Full API response including gateway_attestation, model_attestations, tls_certificate */
+export interface AttestationApiReport {
+  gateway_attestation?: AttestationReport;
+  model_attestations?: AttestationReport[];
+  tls_certificate?: string;
+  [key: string]: unknown;
+}
+
 /**
  * Fetch attestation report from the API
- * @param model - The model name to fetch the report for
- * @param nonce - The nonce for the request
- * @param signingAlgo - The signing algorithm to use (defaults to 'ecdsa')
+ * @param includeTls - if true, appends include_tls=true (response may include tls_certificate)
+ * @param signingAddress - optional; when set, narrows gateway quote to this signer
  */
-async function fetchReport(model: string, nonce: string, signingAlgo: string = 'ecdsa'): Promise<AttestationReport> {
-  const url = `${API_BASE}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=${signingAlgo}`;
+async function fetchReport(
+  model: string,
+  nonce: string,
+  signingAlgo: string = 'ecdsa',
+  includeTls: boolean = false,
+  signingAddress?: string,
+): Promise<AttestationApiReport> {
+  let url = `${API_BASE}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=${signingAlgo}`;
+  if (includeTls) {
+    url += '&include_tls=true';
+  }
+  if (signingAddress) {
+    url += `&signing_address=${encodeURIComponent(signingAddress)}`;
+  }
   return await makeRequest(url);
 }
 
@@ -140,44 +159,93 @@ function base64urlDecodeJwtPayload(jwtToken: string): string {
   return Buffer.from(padded, 'base64url').toString('utf-8');
 }
 
-/**
- * Verify that TDX report data binds the signing address and request nonce
- */
-function checkReportData(attestation: AttestationReport, requestNonce: string, intelResult: IntelResult): ReportDataResult {
-  const reportDataHex = intelResult.quote.body.reportdata;
-  const reportData = Buffer.from(reportDataHex.replace('0x', ''), 'hex');
-  const signingAddress = attestation.signing_address;
-  const signingAlgo = (attestation.signing_algo || 'ecdsa').toLowerCase();
+/** report_data from intel quote body (hex string → Buffer) */
+function reportDataBufferFromIntel(intelResult: IntelResult): Buffer {
+  const hex = intelResult.quote.body.reportdata.replace(/^0x/i, '');
+  return Buffer.from(hex, 'hex');
+}
 
-  // Parse signing address bytes based on algorithm
-  let signingAddressBytes: Buffer;
-  if (signingAlgo === 'ecdsa') {
-    const addrHex = signingAddress.replace('0x', '');
-    signingAddressBytes = Buffer.from(addrHex, 'hex');
-  } else {
-    signingAddressBytes = Buffer.from(signingAddress, 'hex');
+/** Signing address as 32-byte buffer (right-padded with zeros), per algo */
+function signingAddressPadded32(signingAddress: string, signingAlgo: string): Buffer {
+  const algo = signingAlgo.toLowerCase();
+  const addrHex = algo === 'ecdsa' ? signingAddress.replace(/^0x/i, '') : signingAddress;
+  const signingAddressBytes = Buffer.from(addrHex, 'hex');
+  return Buffer.concat([signingAddressBytes, Buffer.alloc(32 - signingAddressBytes.length, 0)]);
+}
+
+/**
+ * Cloud-api include_tls: report_data[32..64] = SHA256(nonce_32 || SHA256(pem_utf8)).
+ * Returns 32-byte digest, or null if nonce is not 32 bytes.
+ */
+function tlsBoundNonceComponent(nonceBytes: Buffer, tlsCertificatePem: string): Buffer | null {
+  if (nonceBytes.length !== 32) return null;
+  const pemHash = crypto.createHash('sha256').update(Buffer.from(tlsCertificatePem, 'utf8')).digest();
+  return crypto.createHash('sha256').update(nonceBytes).update(pemHash).digest();
+}
+
+function logReportDataNonceResult(
+  matchesRaw: boolean,
+  matchesTls: boolean,
+  requestNonce: string,
+  embeddedHex: string,
+  expectedTlsHex: string | null,
+): void {
+  if (matchesRaw) {
+    console.log('Report data embeds request nonce (raw):', true);
+    return;
   }
+  if (matchesTls) {
+    console.log('Report data nonce component: TLS-bound SHA256(nonce||SHA256(pem)):', true);
+    return;
+  }
+  console.log('Report data embeds request nonce:', false);
+  console.log('  expected raw nonce:', requestNonce);
+  if (expectedTlsHex) console.log('  expected TLS-bound: ', expectedTlsHex);
+  console.log('  actual:            ', embeddedHex);
+}
+
+/**
+ * Verify that TDX report data binds the signing address and request nonce (or TLS PEM binding).
+ * When tlsCertificatePem is set, report_data[32..64] may be SHA256(nonce||SHA256(pem)) instead of raw nonce.
+ */
+function checkReportData(
+  attestation: AttestationReport,
+  requestNonce: string,
+  intelResult: IntelResult,
+  tlsCertificatePem?: string | null,
+): ReportDataResult {
+  const reportData = reportDataBufferFromIntel(intelResult);
+  const signingAlgo = (attestation.signing_algo || 'ecdsa').toLowerCase();
+  const expectedAddress = signingAddressPadded32(attestation.signing_address, signingAlgo);
 
   const embeddedAddress = reportData.subarray(0, 32);
-  const embeddedNonce = reportData.subarray(32);
+  const embeddedNonce = reportData.subarray(32, Math.min(64, reportData.length));
+  const bindsAddress = embeddedAddress.equals(expectedAddress);
 
-  const bindsAddress = embeddedAddress.equals(Buffer.concat([signingAddressBytes, Buffer.alloc(32 - signingAddressBytes.length, 0)]));
-  const embedsNonce = embeddedNonce.toString('hex') === requestNonce;
+  const rawNonceBytes = Buffer.from(requestNonce, 'hex');
+  const matchesRaw = rawNonceBytes.length === 32 && embeddedNonce.length === 32 && embeddedNonce.equals(rawNonceBytes);
+  const expectedTls =
+    tlsCertificatePem && rawNonceBytes.length === 32
+      ? tlsBoundNonceComponent(rawNonceBytes, tlsCertificatePem)
+      : null;
+  const matchesTls =
+    Boolean(expectedTls) && embeddedNonce.length === 32 && embeddedNonce.equals(expectedTls!);
+  const embedsNonce = matchesRaw || matchesTls;
 
   console.log('Signing algorithm:', signingAlgo);
   console.log('Report data binds signing address:', bindsAddress);
   if (!bindsAddress) {
-    console.log('Report data binds signing address:', 'expected:', signingAddressBytes.toString('hex'), 'actual:', embeddedAddress.toString('hex'));
+    console.log('Report data binds signing address:', 'expected:', expectedAddress.toString('hex'), 'actual:', embeddedAddress.toString('hex'));
   }
-  console.log('Report data embeds request nonce:', embedsNonce);
-  if (!embedsNonce) {
-    console.log('Report data embeds request nonce:', 'expected:', requestNonce, 'actual:', embeddedNonce.toString('hex'));
-  }
+  logReportDataNonceResult(
+    matchesRaw,
+    matchesTls,
+    requestNonce,
+    embeddedNonce.toString('hex'),
+    expectedTls ? expectedTls.toString('hex') : null,
+  );
 
-  return {
-    binds_address: bindsAddress,
-    embeds_nonce: embedsNonce
-  };
+  return { binds_address: bindsAddress, embeds_nonce: embedsNonce };
 }
 
 /**
@@ -302,16 +370,17 @@ async function checkSigstoreLinks(links: string[]): Promise<Array<[string, boole
   return results;
 }
 
-/**
- * Extract and display Sigstore provenance links from attestation
- */
+/** Parsed tcb_info object with optional app_compose string (shared by Sigstore + compose display). */
+function parsedTcbInfo(attestation: AttestationBaseInfo): Record<string, unknown> | null {
+  const raw = attestation.info?.tcb_info;
+  if (raw == null) return null;
+  return typeof raw === 'string' ? (JSON.parse(raw) as Record<string, unknown>) : (raw as Record<string, unknown>);
+}
+
 async function showSigstoreProvenance(attestation: AttestationBaseInfo): Promise<void> {
-  let tcbInfo = attestation.info.tcb_info;
-  if (typeof tcbInfo === 'string') {
-    tcbInfo = JSON.parse(tcbInfo);
-  }
-  
-  const compose = (tcbInfo as any).app_compose;
+  const tcbInfo = parsedTcbInfo(attestation);
+  if (!tcbInfo) return;
+  const compose = tcbInfo.app_compose as string | undefined;
   if (!compose) {
     return;
   }
@@ -338,12 +407,9 @@ async function showSigstoreProvenance(attestation: AttestationBaseInfo): Promise
  * Display the Docker compose manifest and verify against mr_config from verified quote
  */
 function showCompose(attestation: AttestationBaseInfo, intelResult: IntelResult): void {
-  let tcbInfo = attestation.info.tcb_info;
-  if (typeof tcbInfo === 'string') {
-    tcbInfo = JSON.parse(tcbInfo);
-  }
-  
-  const appCompose = (tcbInfo as any).app_compose;
+  const tcbInfo = parsedTcbInfo(attestation);
+  if (!tcbInfo) return;
+  const appCompose = tcbInfo.app_compose as string | undefined;
   if (!appCompose) {
     return;
   }
@@ -363,9 +429,15 @@ function showCompose(attestation: AttestationBaseInfo, intelResult: IntelResult)
 }
 
 /**
- * Verify a single attestation
+ * Verify a single attestation.
+ * @param tlsCertificatePem - when set (gateway + include_tls), verifies report_data[32..64] = SHA256(nonce||SHA256(pem))
  */
-async function verifyAttestation(attestation: AttestationReport, requestNonce: string, verifyModel: boolean): Promise<void> {
+async function verifyAttestation(
+  attestation: AttestationReport,
+  requestNonce: string,
+  verifyModel: boolean,
+  tlsCertificatePem?: string | null,
+): Promise<void> {
   console.log('🔐 Attestation');
 
   console.log('Request nonce:', requestNonce);
@@ -378,7 +450,7 @@ async function verifyAttestation(attestation: AttestationReport, requestNonce: s
   const intelResult = await checkTdxQuote(attestation);
 
   console.log('\n🔐 TDX report data');
-  checkReportData(attestation, requestNonce, intelResult);
+  checkReportData(attestation, requestNonce, intelResult, tlsCertificatePem);
 
   if (verifyModel) {
     console.log('\n🔐 GPU attestation');
@@ -390,15 +462,45 @@ async function verifyAttestation(attestation: AttestationReport, requestNonce: s
 }
 
 /**
- * Main verification function
+ * Gateway-only verification with optional TLS PEM binding (include_tls flow).
+ * Call from chat_verifier when --verify-tls; all logic lives here.
  */
+async function verifyGatewayTlsBinding(
+  signingAddress: string,
+  model: string,
+  signingAlgo: string = 'ecdsa',
+): Promise<void> {
+  const requestNonce = crypto.randomBytes(32).toString('hex');
+  const report = await fetchReport(model, requestNonce, signingAlgo, true, signingAddress);
+  const gateway = report.gateway_attestation;
+  const tlsPem = report.tls_certificate;
+
+  if (!gateway) {
+    console.log('No gateway_attestation in report (cannot verify TLS binding).');
+    return;
+  }
+  if (!tlsPem) {
+    console.log(
+      'TLS verification requested but response has no tls_certificate ' +
+        '(set INGRESS_TLS_CERT_PATH on cloud-api or omit --verify-tls).',
+    );
+    return;
+  }
+
+  console.log('========================================');
+  console.log('🔐 Gateway attestation (include_tls)');
+  console.log('========================================');
+  await verifyAttestation(gateway, requestNonce, false, tlsPem);
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const modelIndex = args.indexOf('--model');
   const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'deepseek-ai/DeepSeek-V3.1';
+  const includeTls = args.includes('--verify-tls');
 
   const requestNonce = crypto.randomBytes(32).toString('hex');
-  const report = await fetchReport(model, requestNonce, 'ecdsa');
+  const report = await fetchReport(model, requestNonce, 'ecdsa', includeTls);
 
   if (!report.gateway_attestation) {
     console.log('No gateway attestation found');
@@ -408,7 +510,12 @@ async function main(): Promise<void> {
   console.log('========================================');
   console.log('🔐 Gateway attestation');
   console.log('========================================');
-  await verifyAttestation(report.gateway_attestation, requestNonce, false);
+  await verifyAttestation(
+    report.gateway_attestation,
+    requestNonce,
+    false,
+    includeTls ? report.tls_certificate : undefined,
+  );
 
   // Verify model attestations
   if (!report.model_attestations) {
@@ -433,6 +540,7 @@ if (require.main === module) {
 
 export {
   fetchReport,
+  verifyGatewayTlsBinding,
   checkTdxQuote,
   checkReportData,
   checkGpu,

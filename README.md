@@ -57,9 +57,11 @@ export API_KEY=sk-your-api-key-here
 
 # Python
 python3 py/model_verifier.py --model deepseek-ai/DeepSeek-V3.1
+python3 py/model_verifier.py --model deepseek-ai/DeepSeek-V3.1 --verify-tls
 
 # TypeScript
 pnpm run model -- --model deepseek-ai/DeepSeek-V3.1
+pnpm run model -- --model deepseek-ai/DeepSeek-V3.1 --verify-tls
 ```
 
 ### Chat Verification
@@ -72,6 +74,10 @@ python3 py/chat_verifier.py --model deepseek-ai/DeepSeek-V3.1
 
 # TypeScript
 pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1
+
+# Optional: TLS PEM binding is implemented in model_verifier (gateway); chat_verifier only calls it when --verify-tls
+python3 py/chat_verifier.py --model deepseek-ai/DeepSeek-V3.1 --verify-tls
+pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1 --verify-tls
 ```
 
 ### Encrypted Chat Verification
@@ -555,6 +561,8 @@ attestation = fetch_report("deepseek-ai/DeepSeek-V3.1", nonce)
 # Verify all components
 intel_result = await check_tdx_quote(attestation)
 check_report_data(attestation, nonce, intel_result)
+# With include_tls / tls_certificate: pass PEM so nonce component SHA256(nonce||SHA256(pem)) is accepted
+# check_report_data(attestation, nonce, intel_result, tls_certificate_pem)
 check_gpu(attestation, nonce)
 ```
 
@@ -581,6 +589,8 @@ const attestation: AttestationReport = await fetchReport('deepseek-ai/DeepSeek-V
 // Verify all components
 const intelResult: IntelResult = await checkTdxQuote(attestation);
 checkReportData(attestation, nonce, intelResult);
+// With include_tls: pass tlsCertificatePem as 4th arg so SHA256(nonce||SHA256(pem)) is accepted
+// checkReportData(attestation, nonce, intelResult, tlsCertificatePem);
 await checkGpu(attestation, nonce);
 await showSigstoreProvenance(attestation);
 ```
