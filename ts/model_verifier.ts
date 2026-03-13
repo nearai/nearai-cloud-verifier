@@ -484,7 +484,7 @@ async function verifyGatewayTlsBinding(
   if (!gateway.tls_cert_fingerprint) {
     console.log(
       'TLS verification requested but gateway has no tls_cert_fingerprint ' +
-        '(set TLS_CERT_PATH on cloud-api or omit --verify-tls).',
+        '(configure the gateway to include a TLS certificate fingerprint in attestation, or omit --verify-tls).',
     );
     return;
   }

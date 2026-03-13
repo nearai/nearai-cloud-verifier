@@ -181,7 +181,7 @@ async function verifyDomainTlsViaAttestationReport(): Promise<void> {
   const tlsPem = report.tls_certificate;
   if (!tlsPem || typeof tlsPem !== "string") {
     console.error(
-      "No tls_certificate in attestation report. Set TLS_CERT_PATH on cloud-api and request include_tls_fingerprint.",
+      "No tls_certificate in attestation report. Configure the gateway to include tls_certificate in attestation and request include_tls_fingerprint.",
     );
     process.exit(1);
   }

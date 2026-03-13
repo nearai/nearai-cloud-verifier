@@ -192,7 +192,7 @@ async def verify_tls_attestation(
     if not tls_cert_fingerprint:
         raise Exception(
             "Attestation report does not include tls_cert_fingerprint. "
-            "The proxy may not have TLS_CERT_PATH configured."
+            "The proxy may not be configured to expose a TLS certificate fingerprint."
         )
 
     # Extract model name from attestation (self-reported by the proxy inside the TEE)

@@ -212,7 +212,7 @@ async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', 
   if (!attestation.tls_cert_fingerprint) {
     throw new Error(
       'Attestation report does not include tls_cert_fingerprint. ' +
-      'The proxy may not have TLS_CERT_PATH configured.'
+      'The proxy may not be configured to expose a TLS certificate fingerprint.'
     );
   }
 

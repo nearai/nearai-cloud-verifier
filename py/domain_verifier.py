@@ -378,7 +378,7 @@ async def verify_gateway_tls_certificate_matches_live(
     if not tls_pem or not isinstance(tls_pem, str):
         print(
             "\n🔐 Gateway TLS vs live domain: skipped (no tls_certificate in report; "
-            "set TLS_CERT_PATH on cloud-api)."
+            "configure the gateway to include tls_certificate in attestation)."
         )
         return None
     print("\n🔐 Gateway TLS certificate vs live domain")
@@ -637,7 +637,7 @@ async def verify_domain_tls_via_attestation_report(
     if not tls_pem or not isinstance(tls_pem, str):
         raise SystemExit(
             "No tls_certificate in attestation report. "
-            "Set TLS_CERT_PATH on cloud-api and request include_tls_fingerprint."
+            "Configure the gateway to include tls_certificate in attestation and request include_tls_fingerprint."
         )
 
     gateway = report.get("gateway_attestation")
