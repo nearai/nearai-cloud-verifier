@@ -20,7 +20,8 @@ interface AttestationBaseInfo {
   intel_quote: string;
   signing_address: string;
   signing_algo: string;
-  nvidia_payload: string;
+  // Optional: gateway attestations may omit GPU evidence entirely.
+  nvidia_payload?: string;
   tls_cert_fingerprint?: string;
   info: {
     tcb_info: string | {
@@ -30,6 +31,7 @@ interface AttestationBaseInfo {
 }
 
 interface AttestationReport extends AttestationBaseInfo {
+  model_name?: string;
   model_attestations?: AttestationReport[];
   gateway_attestation?: AttestationReport;
 }
@@ -111,7 +113,7 @@ export interface AttestationApiReport {
  * @param model - Model name (query param)
  * @param nonce - Request nonce hex (query param)
  * @param signingAlgo - Signing algorithm, default 'ecdsa'
- * @param includeTls - If true, appends include_tls=true (response may include tls_certificate)
+ * @param includeTls - If true, appends include_tls_fingerprint=true (response includes tls_cert_fingerprint in gateway_attestation and tls_certificate)
  * @param signingAddress - Optional; when set, narrows gateway quote to this signer
  */
 async function fetchReport(
@@ -249,6 +251,9 @@ function checkReportData(
  * Verify GPU attestation evidence via NVIDIA NRAS
  */
 async function checkGpu(attestation: AttestationReport, requestNonce: string): Promise<GpuResult> {
+  if (!attestation.nvidia_payload) {
+    throw new Error('GPU verification requested but attestation has no nvidia_payload.');
+  }
   const payload: NvidiaPayload = JSON.parse(attestation.nvidia_payload);
 
   // Verify GPU uses the same request_nonce
@@ -484,7 +489,7 @@ async function verifyGatewayTlsBinding(
   if (!gateway.tls_cert_fingerprint) {
     console.log(
       'TLS verification requested but gateway has no tls_cert_fingerprint ' +
-        '(set TLS_CERT_PATH on cloud-api or omit --verify-tls).',
+        '(configure the gateway to include a TLS certificate fingerprint in attestation, or omit --verify-tls).',
     );
     return;
   }

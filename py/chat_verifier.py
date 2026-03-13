@@ -43,7 +43,7 @@ def recover_signer(text, signature):
 
 
 def fetch_attestation_for(signing_address, model):
-    """Fetch attestation for a specific signing address (model path; no include_tls)."""
+    """Fetch attestation for a specific signing address (model path; no include_tls_fingerprint)."""
     nonce = secrets.token_hex(32)
     url = f"{BASE_URL}/v1/attestation/report?model={model}&nonce={nonce}&signing_algo=ecdsa&signing_address={signing_address}"
     report = requests.get(url, timeout=30).json()

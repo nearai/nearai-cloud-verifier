@@ -1,8 +1,8 @@
 /**
  * Domain verifier — gateway TLS verification is the default behavior.
  *
- * Fetches attestation report with include_tls, verifies gateway report_data
- * binds tls_certificate, then compares that PEM's leaf cert to domain:443.
+ * Fetches attestation report with include_tls_fingerprint=true, verifies gateway
+ * report_data binds tls_certificate, then compares that PEM's leaf cert to domain:443.
  */
 
 import {
@@ -152,8 +152,8 @@ function parseArgs(): {
 }
 
 /**
- * Fetch include_tls report, verify gateway attestation binds tls_certificate,
- * then ensure live :443 presents the same leaf cert.
+ * Fetch attestation with include_tls_fingerprint=true, verify gateway attestation
+ * binds tls_certificate, then ensure live :443 presents the same leaf cert.
  */
 async function verifyDomainTlsViaAttestationReport(): Promise<void> {
   const { domain, signingAddress, model } = parseArgs();
@@ -181,7 +181,7 @@ async function verifyDomainTlsViaAttestationReport(): Promise<void> {
   const tlsPem = report.tls_certificate;
   if (!tlsPem || typeof tlsPem !== "string") {
     console.error(
-      "No tls_certificate in attestation report. Set INGRESS_TLS_CERT_PATH on cloud-api and request include_tls.",
+      "No tls_certificate in attestation report. Configure the gateway to include tls_certificate in attestation and request include_tls_fingerprint.",
     );
     process.exit(1);
   }

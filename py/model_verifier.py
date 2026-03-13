@@ -24,7 +24,7 @@ def fetch_report(model, nonce, signing_algo="ecdsa", include_tls=False, signing_
     """Fetch attestation report from the API.
 
     Args:
-        include_tls: if True, appends include_tls=true (response may include tls_certificate)
+        include_tls: if True, appends include_tls_fingerprint=true (response includes tls_cert_fingerprint in gateway_attestation and tls_certificate)
         signing_address: optional; narrows gateway quote to this signer
     """
     url = f"{BASE_URL}/v1/attestation/report?model={model}&nonce={nonce}&signing_algo={signing_algo}"
@@ -326,7 +326,7 @@ async def verify_gateway_tls_binding(signing_address, model, signing_algo="ecdsa
     if not gateway.get("tls_cert_fingerprint"):
         print(
             "TLS verification requested but gateway has no tls_cert_fingerprint "
-            "(set TLS_CERT_PATH on cloud-api or omit --verify-tls)."
+            "(configure the gateway to include a TLS certificate fingerprint in attestation, or omit --verify-tls)."
         )
         return
 
