@@ -20,7 +20,8 @@ interface AttestationBaseInfo {
   intel_quote: string;
   signing_address: string;
   signing_algo: string;
-  nvidia_payload: string;
+  // Optional: gateway attestations may omit GPU evidence entirely.
+  nvidia_payload?: string;
   tls_cert_fingerprint?: string;
   info: {
     tcb_info: string | {
@@ -30,6 +31,7 @@ interface AttestationBaseInfo {
 }
 
 interface AttestationReport extends AttestationBaseInfo {
+  model_name?: string;
   model_attestations?: AttestationReport[];
   gateway_attestation?: AttestationReport;
 }
@@ -249,6 +251,9 @@ function checkReportData(
  * Verify GPU attestation evidence via NVIDIA NRAS
  */
 async function checkGpu(attestation: AttestationReport, requestNonce: string): Promise<GpuResult> {
+  if (!attestation.nvidia_payload) {
+    throw new Error('GPU verification requested but attestation has no nvidia_payload.');
+  }
   const payload: NvidiaPayload = JSON.parse(attestation.nvidia_payload);
 
   // Verify GPU uses the same request_nonce

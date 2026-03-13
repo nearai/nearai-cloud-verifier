@@ -35,23 +35,10 @@ import {
   checkGpu,
   showCompose,
   showSigstoreProvenance,
-  AttestationBaseInfo,
   IntelResult,
+  AttestationApiReport,
+  AttestationReport,
 } from './model_verifier';
-
-interface TlsAttestationReport extends AttestationBaseInfo {
-  model_name?: string;
-  tls_cert_fingerprint?: string;
-  signing_public_key?: string;
-  request_nonce?: string;
-}
-
-/** Cloud-api returns { gateway_attestation, model_attestations?, tls_certificate? }; fingerprint is inside gateway_attestation. */
-interface AttestationReportResponse {
-  gateway_attestation: TlsAttestationReport;
-  model_attestations?: unknown[];
-  tls_certificate?: string;
-}
 
 /**
  * Fetch attestation report AND extract the live TLS certificate SPKI hash
@@ -67,7 +54,7 @@ function fetchAttestationAndSpki(
   nonce: string,
   signingAlgo: string = 'ecdsa',
   token?: string,
-): Promise<{ attestation: TlsAttestationReport; liveSpkiHash: string }> {
+): Promise<{ attestation: AttestationReport; liveSpkiHash: string }> {
   return new Promise((resolve, reject) => {
     const path = `/v1/attestation/report?include_tls_fingerprint=true&nonce=${nonce}&signing_algo=${signingAlgo}`;
     const headers: Record<string, string> = { 'Host': hostname };
@@ -105,11 +92,15 @@ function fetchAttestationAndSpki(
           return;
         }
         try {
-          const response = JSON.parse(body) as AttestationReportResponse;
-          const attestation = response?.gateway_attestation;
-          if (!attestation) {
-            reject(new Error('Attestation response missing gateway_attestation'));
-            return;
+          const parsed = JSON.parse(body) as unknown;
+          // Prefer wrapped cloud-api shape { gateway_attestation, ... }, but stay
+          // compatible with older flat responses that return the attestation directly.
+          let attestation: AttestationReport | undefined;
+          const maybeWrapped = parsed as Partial<AttestationApiReport> | undefined;
+          if (maybeWrapped && typeof maybeWrapped === 'object' && maybeWrapped.gateway_attestation) {
+            attestation = maybeWrapped.gateway_attestation as AttestationReport;
+          } else {
+            attestation = parsed as AttestationReport;
           }
           resolve({ attestation, liveSpkiHash });
         } catch (e) {
@@ -140,7 +131,7 @@ function fetchAttestationAndSpki(
  *   [32..64] = nonce
  */
 function checkReportDataWithTls(
-  attestation: TlsAttestationReport,
+  attestation: AttestationReport,
   requestNonce: string,
   intelResult: IntelResult,
 ): { binds_address_and_tls: boolean; embeds_nonce: boolean } {
@@ -249,7 +240,7 @@ async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', 
   // 6. GPU attestation (optional; cloud-api gateway has no GPU)
   console.log('\n🔐 GPU attestation');
   if (attestation.nvidia_payload) {
-    await checkGpu(attestation as import('./model_verifier').AttestationReport, requestNonce);
+    await checkGpu(attestation, requestNonce);
   } else {
     console.log('No nvidia_payload in attestation (gateway without GPU); skipping GPU check.');
   }
