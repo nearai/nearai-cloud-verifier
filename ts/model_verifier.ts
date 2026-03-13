@@ -111,7 +111,7 @@ export interface AttestationApiReport {
  * @param model - Model name (query param)
  * @param nonce - Request nonce hex (query param)
  * @param signingAlgo - Signing algorithm, default 'ecdsa'
- * @param includeTls - If true, appends include_tls=true (response may include tls_certificate)
+ * @param includeTls - If true, appends include_tls_fingerprint=true (response includes tls_cert_fingerprint in gateway_attestation and tls_certificate)
  * @param signingAddress - Optional; when set, narrows gateway quote to this signer
  */
 async function fetchReport(

@@ -43,7 +43,6 @@ from cryptography.hazmat.primitives import serialization
 from model_verifier import (
     check_tdx_quote,
     check_gpu,
-    check_rtmrs,
     show_compose,
     show_sigstore_provenance,
 )
@@ -109,7 +108,14 @@ def fetch_attestation_and_spki(
     if resp.status != 200:
         raise Exception(f"HTTP {resp.status}: {body.decode()}")
 
-    attestation = json.loads(body)
+    # cloud-api returns a wrapper object:
+    #   { "gateway_attestation": { ... quote fields ..., "tls_cert_fingerprint": ... }, ... }
+    # Use gateway_attestation for verification. Keep backward-compat if a flat object is returned.
+    response = json.loads(body)
+    if isinstance(response, dict) and isinstance(response.get("gateway_attestation"), dict):
+        attestation = response["gateway_attestation"]
+    else:
+        attestation = response
     return attestation, live_spki_hash
 
 
@@ -220,14 +226,13 @@ async def verify_tls_attestation(
 
     # 6. GPU attestation
     print("\n🔐 GPU attestation")
-    check_gpu(attestation, request_nonce)
+    if attestation.get("nvidia_payload"):
+        check_gpu(attestation, request_nonce)
+    else:
+        print("No nvidia_payload in attestation (gateway without GPU); skipping GPU check.")
 
-    # 7. RTMR verification
-    print("\n🔐 RTMR verification")
-    check_rtmrs(attestation, intel_result)
-
-    # 8. Compose and Sigstore
-    show_compose(attestation)
+    # 7. Compose and Sigstore
+    show_compose(attestation, intel_result)
     show_sigstore_provenance(attestation)
 
 

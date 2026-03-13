@@ -112,7 +112,7 @@ function recoverSigner(text: string, signature: string): string {
 }
 
 /**
- * Fetch attestation for a specific signing address (model attestation path; no include_tls).
+ * Fetch attestation for a specific signing address (model attestation path; no include_tls_fingerprint).
  */
 async function fetchAttestationFor(signingAddress: string, model: string): Promise<[AttestationReport, string]> {
   const nonce = crypto.randomBytes(32).toString('hex');
@@ -143,7 +143,7 @@ async function checkAttestation(signingAddress: string, attestation: Attestation
 
 /**
  * Verify a chat completion signature and attestation.
- * @param verifyTls if true, runs gateway TLS PEM binding verification via model_verifier (separate fetch with include_tls).
+ * @param verifyTls if true, runs gateway TLS binding verification via model_verifier (separate fetch with include_tls_fingerprint=true).
  */
 async function verifyChat(
   chatId: string,

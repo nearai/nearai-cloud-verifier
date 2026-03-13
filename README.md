@@ -102,7 +102,7 @@ pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --test-both
 
 **Default behavior** for `domain_verifier`: confirms the gateway’s attested TLS material matches what the host serves on **:443**.
 
-1. `GET /v1/attestation/report?include_tls=true` → `tls_certificate` + `gateway_attestation`
+1. `GET /v1/attestation/report?include_tls_fingerprint=true` → `tls_certificate` + `gateway_attestation` (with `tls_cert_fingerprint`)
 2. Gateway `report_data` must bind that PEM (`model_verifier.verify_attestation`)
 3. **Leaf** SHA256(DER) fingerprint must match the live server certificate
 
@@ -115,7 +115,7 @@ pnpm run domain
 # Optional: --domain host --signing-address 0x... --model ...
 ```
 
-If the report has no `tls_certificate`, configure `INGRESS_TLS_CERT_PATH` on cloud-api.
+If the report has no `tls_certificate`, configure `TLS_CERT_PATH` on cloud-api.
 
 ## 🔐 Model Verifier
 
@@ -335,7 +335,7 @@ Gateway TLS verification runs **by default** every time you run the domain verif
 
 | Step | What it does |
 |------|----------------|
-| 1 | `GET /v1/attestation/report?include_tls=true` (optional `signing_address`) |
+| 1 | `GET /v1/attestation/report?include_tls_fingerprint=true` (optional `signing_address`) |
 | 2 | `verify_attestation(gateway, …, tls_certificate_pem)` — `report_data` must bind the PEM |
 | 3 | Leaf cert in `tls_certificate` must match live `:443` (SHA256 fingerprint) |
 
@@ -361,7 +361,7 @@ pnpm run domain
 ========================================
 Domain: cloud-api.near.ai
 
-🔐 Gateway attestation (include_tls binding)
+🔐 Gateway attestation (include_tls_fingerprint binding)
 ...
 🔐 Live TLS certificate vs attested tls_certificate
 Fetching certificate from live server: cloud-api.near.ai:443
@@ -515,7 +515,7 @@ attestation = fetch_report("deepseek-ai/DeepSeek-V3.1", nonce)
 # Verify all components
 intel_result = await check_tdx_quote(attestation)
 check_report_data(attestation, nonce, intel_result)
-# With include_tls / tls_certificate: pass PEM so nonce component SHA256(nonce||SHA256(pem)) is accepted
+# With include_tls_fingerprint / tls_certificate: pass PEM so nonce component SHA256(nonce||SHA256(pem)) is accepted
 # check_report_data(attestation, nonce, intel_result, tls_certificate_pem)
 check_gpu(attestation, nonce)
 ```
@@ -543,7 +543,7 @@ const attestation: AttestationReport = await fetchReport('deepseek-ai/DeepSeek-V
 // Verify all components
 const intelResult: IntelResult = await checkTdxQuote(attestation);
 checkReportData(attestation, nonce, intelResult);
-// With include_tls: pass tlsCertificatePem as 4th arg so SHA256(nonce||SHA256(pem)) is accepted
+// With include_tls_fingerprint: pass tlsCertificatePem as 4th arg so SHA256(nonce||SHA256(pem)) is accepted
 // checkReportData(attestation, nonce, intelResult, tlsCertificatePem);
 await checkGpu(attestation, nonce);
 await showSigstoreProvenance(attestation);
@@ -555,7 +555,7 @@ await showSigstoreProvenance(attestation);
 
 These verifiers work with [NEAR AI Cloud Gateway](https://github.com/nearai/cloud-api) attestation endpoints:
 
-- `GET /v1/attestation/report` - TEE attestation; use `include_tls=true` for domain verifier (`signing_address` optional)
+- `GET /v1/attestation/report` - TEE attestation; use `include_tls_fingerprint=true` for domain verifier (`signing_address` optional)
 - `GET /v1/signature/{chat_id}` - Get response signature
 
 ## 🤝 Contributing

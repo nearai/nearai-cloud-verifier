@@ -33,7 +33,6 @@ import { Buffer } from 'buffer';
 import {
   checkTdxQuote,
   checkGpu,
-  checkRtmrs,
   showCompose,
   showSigstoreProvenance,
   AttestationBaseInfo,
@@ -45,6 +44,13 @@ interface TlsAttestationReport extends AttestationBaseInfo {
   tls_cert_fingerprint?: string;
   signing_public_key?: string;
   request_nonce?: string;
+}
+
+/** Cloud-api returns { gateway_attestation, model_attestations?, tls_certificate? }; fingerprint is inside gateway_attestation. */
+interface AttestationReportResponse {
+  gateway_attestation: TlsAttestationReport;
+  model_attestations?: unknown[];
+  tls_certificate?: string;
 }
 
 /**
@@ -99,7 +105,12 @@ function fetchAttestationAndSpki(
           return;
         }
         try {
-          const attestation = JSON.parse(body) as TlsAttestationReport;
+          const response = JSON.parse(body) as AttestationReportResponse;
+          const attestation = response?.gateway_attestation;
+          if (!attestation) {
+            reject(new Error('Attestation response missing gateway_attestation'));
+            return;
+          }
           resolve({ attestation, liveSpkiHash });
         } catch (e) {
           reject(new Error(`Failed to parse attestation response: ${body}`));
@@ -235,16 +246,16 @@ async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', 
     console.log('  live:    ', liveSpkiHash);
   }
 
-  // 6. GPU attestation
+  // 6. GPU attestation (optional; cloud-api gateway has no GPU)
   console.log('\n🔐 GPU attestation');
-  await checkGpu(attestation, requestNonce);
+  if (attestation.nvidia_payload) {
+    await checkGpu(attestation as import('./model_verifier').AttestationReport, requestNonce);
+  } else {
+    console.log('No nvidia_payload in attestation (gateway without GPU); skipping GPU check.');
+  }
 
-  // 7. RTMR verification
-  console.log('\n🔐 RTMR verification');
-  checkRtmrs(attestation, intelResult);
-
-  // 8. Compose and Sigstore
-  showCompose(attestation);
+  // 7. Compose and Sigstore
+  showCompose(attestation, intelResult);
   await showSigstoreProvenance(attestation);
 }
 

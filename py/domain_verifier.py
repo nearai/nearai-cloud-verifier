@@ -362,7 +362,7 @@ async def verify_gateway_tls_certificate_matches_live(
     signing_address: str,
     model: str = "deepseek-ai/DeepSeek-V3.1",
 ):
-    """Fetch gateway report with include_tls; check tls_certificate leaf matches domain :443.
+    """Fetch gateway report with include_tls_fingerprint=true; check tls_certificate leaf matches domain :443.
 
     Kept in domain_verifier only—no live TLS checks in model_verifier/chat_verifier.
     """
@@ -372,18 +372,18 @@ async def verify_gateway_tls_certificate_matches_live(
             model, nonce, signing_algo="ecdsa", include_tls=True, signing_address=signing_address
         )
     except Exception as e:
-        print(f"Failed to fetch attestation report with include_tls: {e}")
+        print(f"Failed to fetch attestation report with include_tls_fingerprint: {e}")
         return None
     tls_pem = report.get("tls_certificate")
     if not tls_pem or not isinstance(tls_pem, str):
         print(
             "\n🔐 Gateway TLS vs live domain: skipped (no tls_certificate in report; "
-            "set INGRESS_TLS_CERT_PATH on cloud-api)."
+            "set TLS_CERT_PATH on cloud-api)."
         )
         return None
     print("\n🔐 Gateway TLS certificate vs live domain")
     print(
-        "Comparing leaf cert fingerprint: tls_certificate from include_tls report vs",
+        "Comparing leaf cert fingerprint: tls_certificate from include_tls_fingerprint report vs",
         f"{domain}:443",
     )
     return await compare_certificate_fingerprints(domain, tls_pem)
@@ -614,8 +614,8 @@ async def verify_domain_tls_via_attestation_report(
     model: str = "deepseek-ai/DeepSeek-V3.1",
 ) -> None:
     """
-    Fetch attestation report with include_tls, verify gateway attestation binds
-    tls_certificate, then compare PEM leaf to live :443.
+    Fetch attestation report with include_tls_fingerprint=true, verify gateway
+    attestation binds tls_certificate, then compare PEM leaf to live :443.
     signing_address optional; omit for API default gateway quote.
     """
     print("========================================")
@@ -637,7 +637,7 @@ async def verify_domain_tls_via_attestation_report(
     if not tls_pem or not isinstance(tls_pem, str):
         raise SystemExit(
             "No tls_certificate in attestation report. "
-            "Set INGRESS_TLS_CERT_PATH on cloud-api and request include_tls."
+            "Set TLS_CERT_PATH on cloud-api and request include_tls_fingerprint."
         )
 
     gateway = report.get("gateway_attestation")
