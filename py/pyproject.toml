@@ -2,3 +2,7 @@
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+markers = [
+    "integration: re-verifies the captured fixture against real Intel PCCS + NVIDIA NRAS (network)",
+    "live: fetches a fresh attestation from cloud-api.near.ai and runs full verification (network)",
+]
