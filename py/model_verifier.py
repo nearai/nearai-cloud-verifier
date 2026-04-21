@@ -6,10 +6,13 @@ import base64
 import dcap_qvl
 import json
 import re
+import sys
 import time
 import os
 import secrets
+from dataclasses import dataclass, field
 from hashlib import sha256
+from typing import List, Optional, Tuple
 
 import requests
 
@@ -18,6 +21,30 @@ API_KEY = os.environ.get("API_KEY", "")
 
 GPU_VERIFIER_API = "https://nras.attestation.nvidia.com/v3/attest/gpu"
 SIGSTORE_SEARCH_BASE = "https://search.sigstore.dev/?hash="
+
+
+@dataclass
+class VerificationResult:
+    """Machine-readable verdict for a single attestation (gateway or model).
+
+    Sub-checks default to False (i.e. not verified) so callers who consume
+    partial results never see a spurious True. ``gpu_ok`` is ``None`` when the
+    check was not requested (``verify_model=False``), to distinguish "skipped"
+    from "failed".
+    """
+    tdx_verified: bool = False
+    binds_address: bool = False
+    embeds_nonce: bool = False
+    compose_match: bool = True  # True if there's no compose to check (nothing to fail on)
+    gpu_ok: Optional[bool] = None
+
+    @property
+    def valid(self) -> bool:
+        if not (self.tdx_verified and self.binds_address and self.embeds_nonce and self.compose_match):
+            return False
+        if self.gpu_ok is False:
+            return False
+        return True
 
 
 def fetch_report(model, nonce, signing_algo="ecdsa", include_tls=False, signing_address=None):
@@ -268,12 +295,18 @@ def show_sigstore_provenance(attestation):
             print(f"  ✗ {link} (HTTP {status})")
 
 
-def show_compose(attestation, intel_result):
-    """Display the Docker compose manifest and verify against mr_config from verified quote."""
+def show_compose(attestation, intel_result) -> bool:
+    """Display the Docker compose manifest and verify against mr_config from verified quote.
+
+    Returns True when mr_config matches the compose hash (or when no compose is
+    present — nothing to verify). Returns False when the values are present and
+    disagree: this is a cryptographic indicator that the running workload is
+    not what the attestation claims.
+    """
     tcb_info = _parsed_tcb_info(attestation) or {}
     app_compose = tcb_info.get("app_compose")
     if not app_compose:
-        return
+        return True  # nothing to verify
     docker_compose = json.loads(app_compose)["docker_compose_file"]
     print("\nDocker compose manifest attested by the enclave:")
     print(docker_compose)
@@ -284,34 +317,52 @@ def show_compose(attestation, intel_result):
     mr_config = intel_result["quote"]["body"]["mrconfig"]
     print("mr_config (from verified quote):", mr_config)
     expected_mr_config = "01" + compose_hash
-    print("mr_config matches compose hash:", mr_config.lower().startswith(expected_mr_config.lower()))
+    matches = mr_config.lower().startswith(expected_mr_config.lower())
+    print("mr_config matches compose hash:", matches)
+    return matches
 
 
-async def verify_attestation(attestation, request_nonce, verify_model=False):
-    """Verify the attestation.
+async def verify_attestation(attestation, request_nonce, verify_model=False) -> VerificationResult:
+    """Verify the attestation and return a machine-readable :class:`VerificationResult`.
+
+    All sub-checks still print to stdout as before, so scripted users see the same
+    walkthrough. Callers that want to branch on the verdict can inspect the returned
+    fields or the ``valid`` property.
 
     When attestation contains tls_cert_fingerprint (from include_tls_fingerprint),
     report_data[0..32] = SHA256(signing_address || fingerprint) is verified automatically.
     """
+    result = VerificationResult()
+
     print("\n🔐 Attestation")
-
     print("Request nonce:", request_nonce)
-
     if "signing_address" in attestation:
         print("\nSigning address:", attestation["signing_address"])
 
     print("\n🔐 Intel TDX quote")
     intel_result = await check_tdx_quote(attestation)
+    if intel_result is None:
+        # check_tdx_quote swallowed a verification error; cannot proceed.
+        return result
+    result.tdx_verified = bool(intel_result.get("verified", False))
 
     print("\n🔐 TDX report data")
-    check_report_data(attestation, request_nonce, intel_result)
+    rd = check_report_data(attestation, request_nonce, intel_result)
+    result.binds_address = bool(rd.get("binds_address"))
+    result.embeds_nonce = bool(rd.get("embeds_nonce"))
 
     if verify_model:
         print("\n🔐 GPU attestation")
-        check_gpu(attestation, request_nonce)
+        gpu = check_gpu(attestation, request_nonce)
+        verdict = gpu.get("verdict")
+        # NRAS returns either a boolean True/False or a status string; treat any non-truthy
+        # verdict or a mismatched nonce as a failure.
+        result.gpu_ok = bool(verdict) and bool(gpu.get("nonce_matches", False))
 
-    show_compose(attestation, intel_result)
+    result.compose_match = show_compose(attestation, intel_result)
     show_sigstore_provenance(attestation)
+
+    return result
 
 
 async def verify_gateway_tls_binding(signing_address, model, signing_algo="ecdsa"):
@@ -336,6 +387,51 @@ async def verify_gateway_tls_binding(signing_address, model, signing_algo="ecdsa
     await verify_attestation(gateway, request_nonce, verify_model=False)
 
 
+async def verify_report(report, request_nonce, requested_model) -> List[Tuple[str, VerificationResult]]:
+    """Verify every attestation in a report bundle and enforce:
+
+    - the report contains at least one model attestation,
+    - each model attestation's ``model_name`` matches the requested model.
+
+    Returns a list of ``(label, VerificationResult)`` pairs. The caller decides
+    how to surface failures; :func:`main` uses the aggregate to set the exit code.
+    """
+    results: List[Tuple[str, VerificationResult]] = []
+
+    print("========================================")
+    print("🔐 Gateway attestation")
+    print("========================================")
+    gateway_attestation = report.get("gateway_attestation")
+    if gateway_attestation:
+        gw = await verify_attestation(gateway_attestation, request_nonce, verify_model=False)
+        results.append(("gateway", gw))
+
+    model_attestations = report.get("model_attestations", [])
+    if not model_attestations:
+        print("\n❌ No model_attestations in report — refusing to treat this as verified.")
+        results.append(("model_attestations_present", VerificationResult(tdx_verified=False)))
+        return results
+
+    for index, model_attestation in enumerate(model_attestations, start=1):
+        print("\n\n\n========================================")
+        print(f"🔐 Model attestations: (#{index})")
+        print("========================================")
+
+        returned_name = model_attestation.get("model_name")
+        if returned_name and returned_name != requested_model:
+            print(
+                f"❌ Gateway returned attestation for model {returned_name!r}, "
+                f"but {requested_model!r} was requested."
+            )
+            results.append((f"model[{index}]:requested_model", VerificationResult(tdx_verified=False)))
+            continue
+
+        r = await verify_attestation(model_attestation, request_nonce, verify_model=True)
+        results.append((f"model[{index}]:{returned_name or requested_model}", r))
+
+    return results
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Verify NEAR AI Cloud TEE Attestation")
     parser.add_argument("--model", default="deepseek-ai/DeepSeek-V3.1")
@@ -345,21 +441,21 @@ async def main() -> None:
     request_nonce = secrets.token_hex(32)
     report = fetch_report(args.model, request_nonce, signing_algo="ecdsa", include_tls=args.verify_tls)
 
-    print("========================================")
-    print("🔐 Gateway attestation")
-    print("========================================")
-    gateway_attestation = report.get("gateway_attestation")
-    if gateway_attestation:
-        await verify_attestation(gateway_attestation, request_nonce, verify_model=False)
+    results = await verify_report(report, request_nonce, args.model)
 
-    model_attestations = report.get("model_attestations", [])
-    index = 0
-    for model_attestation in model_attestations:
-        index += 1
-        print("\n\n\n========================================")
-        print(f"🔐 Model attestations: (#{index})")
-        print("========================================")
-        await verify_attestation(model_attestation, request_nonce, verify_model=True)
+    print("\n\n========================================")
+    print("🔐 Verification summary")
+    print("========================================")
+    failed = [name for name, r in results if not r.valid]
+    for name, r in results:
+        mark = "✅" if r.valid else "❌"
+        print(f"  {mark} {name}: {r}")
+
+    if failed:
+        print(f"\n❌ Verification FAILED for: {failed}")
+        sys.exit(1)
+    print("\n✅ All attestations verified.")
+
 
 if __name__ == "__main__":
     import asyncio
