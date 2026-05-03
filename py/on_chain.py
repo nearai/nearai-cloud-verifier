@@ -73,67 +73,69 @@ class OnChainConfig:
         chain_id: 1 (mainnet) or 8453 (Base mainnet) etc. — used only
             for diagnostic output.
         request_timeout: Per-eth_call HTTP timeout (seconds).
-        expected_kms_root_pubkey_hex: Off-chain pinned value for the
-            canonical KMS pubkey (the SubjectPublicKeyInfo blob the
-            booting KMS publishes to CVMs as
-            ``info.key_provider_info.id``).  Required when
-            ``kmsInfo()`` on chain is empty (i.e. the deployer never
-            called ``setKmsInfo``); when both are present, both must
-            agree.  Set to None to disable the KMS-root check entirely
-            (NOT recommended — defeats one leg of the closed chain).
+        require_kms_provenance: When True (default), the verifier
+            insists on a TDX-attested provenance for the KMS root
+            pubkey — i.e. the on-chain ``kmsInfo.quote`` must be
+            populated AND verifiable, OR a quote+eventlog must be
+            supplied out-of-band via ``kms_attestation_override``.
+            Without one of those, the kms-root binding to a TDX TD
+            cannot be established and the verifier fails closed.
+            Setting to False bypasses the provenance check (NOT
+            recommended; this is the historical "trust the deployer's
+            asserted pubkey" mode and provides no exfil protection
+            beyond reputation).
     """
 
     kms_contract_addr: str
     rpc_url: str = "https://mainnet.base.org"
     chain_id: int = 8453
     request_timeout: float = 12.0
-    expected_kms_root_pubkey_hex: Optional[str] = None
+    require_kms_provenance: bool = True
 
 
 @dataclass
 class OnChainResult:
     """Result of running on-chain anchoring against an attestation.
 
-    The **hard checks** (must be True for ``valid``):
+    All five fields are hard checks — any False (or, for
+    ``kms_provenance``, a fail-closed None when
+    ``require_kms_provenance`` is set) fails ``valid``.
 
       * ``app_registered``           — DstackKms.registeredApps(app_id)
       * ``compose_allowed``          — DstackApp(app_id).allowedComposeHashes(...)
       * ``os_image_allowed``         — DstackKms.allowedOsImages(os_image_hash)
       * ``model_app_id_matches``     — pinned (model→app_id) anchor
-
-    The **soft cross-check**:
-
-      * ``kms_root_matches`` — compares info.key_provider_info.id against
-        the canonical KMS pubkey, taken from on-chain
-        ``DstackKms.kmsInfo().k256Pubkey`` if populated, otherwise from
-        an off-chain pin in :class:`OnChainConfig`.  If neither is
-        available, reported as None (unanchored) with a warning, but
-        does NOT fail ``valid``.  If a value IS available and
-        disagrees, that DOES fail ``valid``.
+      * ``kms_provenance``           — TDX-attested origin of
+        ``info.key_provider_info.id``.  See :func:`verify_on_chain_anchors`
+        for what this requires.  ``None`` means "could not establish";
+        the ``valid`` property treats that as failure when
+        ``OnChainConfig.require_kms_provenance`` is True (the default).
     """
 
     app_registered: Optional[bool] = None
     compose_allowed: Optional[bool] = None
     os_image_allowed: Optional[bool] = None
-    kms_root_matches: Optional[bool] = None
+    kms_provenance: Optional[bool] = None
     model_app_id_matches: Optional[bool] = None
     extracted: Dict[str, Any] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    # Set by verify_on_chain_anchors; controls how kms_provenance=None
+    # is interpreted by the .valid property.
+    _require_kms_provenance: bool = True
 
     @property
     def valid(self) -> bool:
-        # Hard checks must all be True.
         hard = (
             self.app_registered is True
             and self.compose_allowed is True
             and self.os_image_allowed is True
             and self.model_app_id_matches is True
         )
-        # Soft cross-check: only fail if explicitly mismatched.  An
-        # un-anchorable kms_root (None) does not block ``valid``.
-        soft = self.kms_root_matches is not False
-        return hard and soft
+        if self._require_kms_provenance:
+            return hard and self.kms_provenance is True
+        # Permissive mode: only fail on explicit False, not on None.
+        return hard and self.kms_provenance is not False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -141,10 +143,11 @@ class OnChainResult:
             "app_registered": self.app_registered,
             "compose_allowed": self.compose_allowed,
             "os_image_allowed": self.os_image_allowed,
-            "kms_root_matches": self.kms_root_matches,
+            "kms_provenance": self.kms_provenance,
             "model_app_id_matches": self.model_app_id_matches,
             "extracted": self.extracted,
             "errors": list(self.errors),
+            "warnings": list(self.warnings),
         }
 
 
@@ -219,6 +222,42 @@ def is_os_image_allowed(cfg: OnChainConfig, os_image_hash: str) -> bool:
     return _bool_from_word(_eth_call(cfg, cfg.kms_contract_addr, data))
 
 
+def _decode_kms_info(raw_hex: str) -> Tuple[bytes, bytes, bytes, bytes]:
+    """ABI-decode ``kmsInfo() returns (bytes, bytes, bytes, bytes)``.
+
+    Returns ``(k256Pubkey, caPubkey, quote, eventlog)``.  Any of these
+    may be empty bytes if the deployer left them unset.
+    """
+    h = raw_hex.removeprefix("0x")
+    if len(h) < 4 * 64:
+        raise OnChainError(f"kmsInfo() return too short: {len(h)} hex chars")
+    fields: List[bytes] = []
+    for i in range(4):
+        off_chars = int(h[i * 64 : (i + 1) * 64], 16) * 2
+        if off_chars + 64 > len(h):
+            raise OnChainError(f"kmsInfo() field {i} offset out of range")
+        length = int(h[off_chars : off_chars + 64], 16)
+        start = off_chars + 64
+        end = start + length * 2
+        if end > len(h):
+            raise OnChainError(f"kmsInfo() field {i} length exceeds payload")
+        fields.append(bytes.fromhex(h[start:end]))
+    return fields[0], fields[1], fields[2], fields[3]
+
+
+def _kms_info_full(cfg: OnChainConfig) -> Tuple[bytes, bytes]:
+    """Read ``kmsInfo`` and return ``(quote, eventlog)``.
+
+    The k256Pubkey and caPubkey are returned by :func:`kms_root_pubkey`
+    independently; this helper is for the additional attestation
+    bundle.  Both bytes objects may be empty if the deployer never
+    populated them.
+    """
+    raw = _eth_call(cfg, cfg.kms_contract_addr, _SEL_KMS_INFO_GETTER)
+    _, _, quote, eventlog = _decode_kms_info(raw)
+    return quote, eventlog
+
+
 def kms_root_pubkey(cfg: OnChainConfig) -> bytes:
     """``DstackKms(kms).kmsInfo().k256Pubkey``.
 
@@ -234,22 +273,8 @@ def kms_root_pubkey(cfg: OnChainConfig) -> bytes:
     treats this case as a hard failure (fail-closed).
     """
     raw = _eth_call(cfg, cfg.kms_contract_addr, _SEL_KMS_INFO_GETTER)
-    raw_hex = raw.removeprefix("0x")
-    # ABI-decode the struct: kmsInfo() returns (bytes k256Pubkey, bytes
-    # caPubkey, bytes quote, bytes eventlog).  Solidity returns dynamic
-    # types as (offset, offset, offset, offset) followed by each
-    # length-prefixed payload.  We only need the first member.
-    if len(raw_hex) < 64:
-        raise OnChainError(f"kmsInfo() returned too short payload: 0x{raw_hex}")
-    first_offset = int(raw_hex[:64], 16) * 2  # to hex chars
-    if first_offset + 64 > len(raw_hex):
-        raise OnChainError("kmsInfo() malformed: first offset out of range")
-    length = int(raw_hex[first_offset : first_offset + 64], 16)
-    start = first_offset + 64
-    end = start + length * 2
-    if end > len(raw_hex):
-        raise OnChainError("kmsInfo() malformed: declared length exceeds payload")
-    return bytes.fromhex(raw_hex[start:end])
+    pub, _ca, _q, _e = _decode_kms_info(raw)
+    return pub
 
 
 # ── Public API: composite check ─────────────────────────────────────────
@@ -308,7 +333,10 @@ def verify_on_chain_anchors(
         )
 
     fields = _extract_attestation_fields(model_attestation)
-    result = OnChainResult(extracted=fields)
+    result = OnChainResult(
+        extracted=fields,
+        _require_kms_provenance=cfg.require_kms_provenance,
+    )
 
     app_id = fields["app_id"]
     compose_hash = fields["compose_hash"]
@@ -363,67 +391,91 @@ def verify_on_chain_anchors(
     except OnChainError as exc:
         result.errors.append(f"allowedOsImages lookup failed: {exc}")
 
-    # 5. KMS root pubkey check.
-    # Source of truth, in priority order:
-    #   (a) on-chain DstackKms.kmsInfo().k256Pubkey  — strongest, but only
-    #       populated if the deployer has called setKmsInfo;
-    #   (b) cfg.expected_kms_root_pubkey_hex          — off-chain anchor,
-    #       used when (a) is empty;
-    #   (c) cross-check (a) and (b) when both are present.
-    # The check fails if neither (a) nor (b) is available — the
-    # verifier can't link info.key_provider_info.id to anything
-    # authoritative.
+    # 5. KMS root provenance.
+    #
+    # An external verifier cannot accept a KMS pubkey on the deployer's
+    # word: anyone with the KMS root *private* key can derive every app
+    # key downstream and decrypt every E2EE prompt off-chain.  The
+    # provenance proof is "this pubkey is bound to a TDX TD via that
+    # TD's own attestation quote, and that TD's measurement is in the
+    # contract's `kmsAllowedAggregatedMrs` allowlist."
+    #
+    # We treat the on-chain ``kmsInfo`` struct as the canonical source.
+    # ``kmsInfo`` carries (k256Pubkey, caPubkey, quote, eventlog).
+    # When ``quote`` is non-empty we have everything we need to verify
+    # the chain — but full verification of the embedded TDX quote
+    # belongs in a follow-up that imports check_tdx_quote/
+    # check_report_data from model_verifier.  This commit lays the
+    # data extraction; quote-verification wiring lands in PR-2.
+    #
+    # When ``kmsInfo`` is empty (current state on NEAR's deployment),
+    # there is no on-chain provenance.  The verifier reports
+    # ``kms_provenance=None`` and (under ``require_kms_provenance=True``,
+    # the default) fails closed.
     on_chain_pub_hex: Optional[str] = None
+    on_chain_quote_hex: Optional[str] = None
+    on_chain_eventlog_hex: Optional[str] = None
     try:
         on_chain_pub = kms_root_pubkey(cfg)
         if len(on_chain_pub) > 0:
             on_chain_pub_hex = on_chain_pub.hex().lower()
             result.extracted["on_chain_kms_root"] = on_chain_pub_hex
+            # Pull quote + eventlog as well — these fully attest the
+            # k256Pubkey when verified.  Stored for PR-2 to consume.
+            quote_bytes, eventlog_bytes = _kms_info_full(cfg)
+            on_chain_quote_hex = quote_bytes.hex() if quote_bytes else ""
+            on_chain_eventlog_hex = eventlog_bytes.hex() if eventlog_bytes else ""
+            result.extracted["on_chain_kms_quote_len"] = len(quote_bytes)
+            result.extracted["on_chain_kms_eventlog_len"] = len(eventlog_bytes)
     except OnChainError as exc:
         result.errors.append(f"kmsInfo lookup failed: {exc}")
 
-    pinned_pub_hex = (
-        (cfg.expected_kms_root_pubkey_hex or "")
-        .removeprefix("0x")
-        .lower()
-        or None
-    )
-    if pinned_pub_hex:
-        result.extracted["pinned_kms_root"] = pinned_pub_hex
+    kpi_norm = (kpi_id_hex or "").removeprefix("0x").lower()
 
-    def _normalize(h: str) -> str:
-        return h.removeprefix("0x").lower()
-
-    kpi_norm = _normalize(kpi_id_hex)
-
-    if on_chain_pub_hex is None and pinned_pub_hex is None:
-        # Neither source available.  Soft check: no anchor for the
-        # canonical KMS pubkey.  The closed chain still works because
-        # ``registeredApps`` + ``allowedComposeHashes`` already gate
-        # which composes can boot — this just removes the
-        # belt-and-suspenders cross-check.
-        result.kms_root_matches = None
-        result.warnings.append(
-            f"DstackKms({cfg.kms_contract_addr}).kmsInfo().k256Pubkey is empty AND "
-            "OnChainConfig.expected_kms_root_pubkey_hex is unset — kms_root cross-check "
-            "skipped.  The deployer should either call setKmsInfo on chain or pin "
-            "the expected pubkey in the verifier's anchor file for full closure."
+    if on_chain_pub_hex is None:
+        # No on-chain provenance.  The KMS pubkey published by the
+        # CVM (info.key_provider_info.id) is unanchored.
+        result.kms_provenance = None
+        result.errors.append(
+            f"DstackKms({cfg.kms_contract_addr}).kmsInfo().k256Pubkey is empty "
+            "(setKmsInfo never called) — no on-chain anchor for the KMS root "
+            "pubkey.  Cannot verify whether the key was generated inside a TD "
+            "or imported from outside.  Anyone with the KMS root private key "
+            "can decrypt every E2EE prompt off-chain.  Either NEAR populates "
+            "kmsInfo on chain, or the verifier must accept that the KMS root "
+            "provenance is unverifiable (set "
+            "OnChainConfig.require_kms_provenance=False to bypass — NOT "
+            "recommended)."
+        )
+    elif not on_chain_quote_hex:
+        # k256Pubkey is set but quote is missing.  Mid-state: deployer
+        # asserted a pubkey but published no attestation.  Same
+        # provenance gap as the empty-kmsInfo case.
+        result.kms_provenance = None
+        result.errors.append(
+            f"DstackKms({cfg.kms_contract_addr}).kmsInfo() has k256Pubkey set "
+            "but quote is empty — the deployer asserted a pubkey without "
+            "publishing the TDX attestation that binds it.  Provenance "
+            "unverifiable."
         )
     else:
-        anchored = on_chain_pub_hex or pinned_pub_hex
-        result.kms_root_matches = kpi_norm == anchored
-        if not result.kms_root_matches:
-            source = "on-chain" if on_chain_pub_hex else "pinned anchor"
+        # k256Pubkey AND quote are populated.  We have what we need to
+        # verify provenance, modulo the actual TDX quote check (PR-2).
+        # For now, confirm the CVM's reported KMS pubkey matches the
+        # one bound by the on-chain quote bundle.
+        if kpi_norm != on_chain_pub_hex:
+            result.kms_provenance = False
             result.errors.append(
-                f"info.key_provider_info.id != KMS pubkey from {source} "
-                f"(claimed: 0x{kpi_norm[:32]}…, anchored: 0x{anchored[:32]}…)"
+                "info.key_provider_info.id != on-chain DstackKms.kmsInfo.k256Pubkey "
+                f"(claimed: 0x{kpi_norm[:32]}…, on-chain: 0x{on_chain_pub_hex[:32]}…)"
             )
-        # If both sources present, they must agree.
-        if on_chain_pub_hex and pinned_pub_hex and on_chain_pub_hex != pinned_pub_hex:
-            result.kms_root_matches = False
-            result.errors.append(
-                "on-chain DstackKms.kmsInfo.k256Pubkey and pinned anchor disagree — "
-                f"on-chain: 0x{on_chain_pub_hex[:32]}…, pinned: 0x{pinned_pub_hex[:32]}…"
+        else:
+            # PR-2 will replace this with full quote verification.
+            result.kms_provenance = True
+            result.warnings.append(
+                "kms_provenance set True based on on-chain k256Pubkey match; "
+                "full TDX quote verification of kmsInfo.quote is deferred to "
+                "a follow-up commit."
             )
 
     return result

@@ -89,35 +89,35 @@ def _word(value: int) -> str:
     return "0x" + hex(value)[2:].rjust(64, "0")
 
 
-def _kms_info_payload(k256_pubkey_hex: str) -> str:
-    """Build a kmsInfo() return: (k256, ca, quote, eventlog) all bytes.
+def _kms_info_payload_full(
+    k256: str = "", ca: str = "", quote: str = "", eventlog: str = ""
+) -> str:
+    """Build a kmsInfo() ABI-encoded return.  All four args are hex
+    strings (no 0x); empty string = zero-length bytes."""
+    parts = [k256, ca, quote, eventlog]
+    lengths = [len(p) // 2 for p in parts]
+    word_counts = [(L + 31) // 32 for L in lengths]
+    padded = [
+        p + "00" * (word_counts[i] * 32 - lengths[i]) for i, p in enumerate(parts)
+    ]
+    # Compute offsets (in bytes from start of return data)
+    base = 4 * 32
+    offsets = []
+    cur = base
+    for wc in word_counts:
+        offsets.append(cur)
+        cur += 32 + wc * 32
+    out = ""
+    for off in offsets:
+        out += hex(off)[2:].rjust(64, "0")
+    for i, L in enumerate(lengths):
+        out += hex(L)[2:].rjust(64, "0") + padded[i]
+    return "0x" + out
 
-    Returns the 0x-prefixed hex of the ABI-encoded tuple.  Only the
-    first member's content is variable; the others are zero-length.
-    """
-    pub = k256_pubkey_hex
-    pub_bytes = len(pub) // 2
-    pub_words = (pub_bytes + 31) // 32
-    pub_padded = pub + "00" * (pub_words * 32 - pub_bytes)
-    # Four offsets (each 32B), then for each member: length(32B)+padded data
-    # Calculate offsets
-    base = 4 * 32  # bytes after the four offsets
-    off1 = base
-    off2 = off1 + 32 + pub_words * 32
-    off3 = off2 + 32  # zero-length
-    off4 = off3 + 32  # zero-length
-    payload = (
-        hex(off1)[2:].rjust(64, "0")
-        + hex(off2)[2:].rjust(64, "0")
-        + hex(off3)[2:].rjust(64, "0")
-        + hex(off4)[2:].rjust(64, "0")
-        + hex(pub_bytes)[2:].rjust(64, "0")
-        + pub_padded
-        + "00" * 32  # caPubkey length=0
-        + "00" * 32  # quote length=0
-        + "00" * 32  # eventlog length=0
-    )
-    return "0x" + payload
+
+# Back-compat shim for older tests that only varied k256_pubkey.
+def _kms_info_payload(k256_pubkey_hex: str) -> str:
+    return _kms_info_payload_full(k256=k256_pubkey_hex)
 
 
 # ── _eth_call stub helper ───────────────────────────────────────────────
@@ -138,11 +138,25 @@ class _Router:
 
 
 def _route_all_pass(*, kms_pub_hex: str = KMS_ROOT_HEX):
+    """Routes for the happy-path: all hard checks pass, kmsInfo
+    populated with k256+quote+eventlog so kms_provenance succeeds.
+
+    Set ``kms_pub_hex=""`` to simulate an uninitialized KMS contract.
+    """
+    if kms_pub_hex:
+        kmsinfo = _kms_info_payload_full(
+            k256=kms_pub_hex,
+            ca="",
+            quote="bb" * 100,  # non-empty placeholder for provenance
+            eventlog="cc" * 50,
+        )
+    else:
+        kmsinfo = _kms_info_payload_full()  # all empty
     return {
         (KMS.lower(), _SEL_REGISTERED_APPS): _word(1),
         (APP.lower(), _SEL_ALLOWED_COMPOSE_HASHES): _word(1),
         (KMS.lower(), _SEL_ALLOWED_OS_IMAGES): _word(1),
-        (KMS.lower(), _SEL_KMS_INFO_GETTER): _kms_info_payload(kms_pub_hex),
+        (KMS.lower(), _SEL_KMS_INFO_GETTER): kmsinfo,
     }
 
 
@@ -217,7 +231,7 @@ def test_verify_happy_path():
     assert result.app_registered is True
     assert result.compose_allowed is True
     assert result.os_image_allowed is True
-    assert result.kms_root_matches is True
+    assert result.kms_provenance is True
     assert result.model_app_id_matches is True
     assert result.errors == []
 
@@ -263,82 +277,115 @@ def test_verify_os_image_not_allowed():
     assert any("allowedOsImages" in e for e in result.errors)
 
 
-def test_verify_kms_root_mismatch():
-    different = "f" * len(KMS_ROOT_HEX)
-    routes = _route_all_pass(kms_pub_hex=different)
-    with patch.object(on_chain, "_eth_call", _Router(routes)):
-        result = verify_on_chain_anchors(_attestation(), CONFIG, expected_app_id=APP)
-    assert result.valid is False
-    assert result.kms_root_matches is False
-    assert any("key_provider_info.id" in e for e in result.errors)
-
-
-def test_verify_kms_root_uninitialized_warns_but_still_valid():
+def test_verify_kms_provenance_uninitialized_fails_closed():
     """Today's NEAR production state: kmsInfo().k256Pubkey is empty.
 
-    The kms_root check is a *cross-check*, not load-bearing — the closed
-    chain still holds via registeredApps + allowedComposeHashes +
-    allowedOsImages + the model→app_id anchor.  When kmsInfo is empty
-    AND no off-chain anchor is pinned, kms_root_matches is None
-    (unanchored) with a warning, and the overall result remains valid.
+    The kms_provenance check is hard.  Without the on-chain attestation
+    bundle (kmsInfo populated with quote+eventlog), the verifier
+    cannot show the KMS root key was generated inside a TD.  Anyone
+    with the private key can decrypt every E2EE prompt off-chain.
+    Default ``require_kms_provenance=True`` fails closed.
     """
     routes = _route_all_pass(kms_pub_hex="")
     with patch.object(on_chain, "_eth_call", _Router(routes)):
         result = verify_on_chain_anchors(_attestation(), CONFIG, expected_app_id=APP)
-    assert result.valid is True
-    assert result.kms_root_matches is None
-    assert any("kmsInfo" in w and "skipped" in w for w in result.warnings)
+    assert result.valid is False
+    assert result.kms_provenance is None
+    assert any("kmsInfo" in e and "empty" in e for e in result.errors)
 
 
-def test_verify_kms_root_uninitialized_with_pinned_anchor_passes():
-    """When on-chain kmsInfo is empty but the anchor file pins the
-    expected KMS pubkey, kms_root_matches is decided against the pin.
+def test_verify_kms_provenance_permissive_mode_skips_check():
+    """``require_kms_provenance=False`` lets the verification succeed
+    despite a missing on-chain anchor.  This is the historical mode
+    (trust the deployer's word) — used only as a transitional
+    fallback.
     """
     cfg = OnChainConfig(
         kms_contract_addr=KMS,
         rpc_url="http://stub-rpc/",
         chain_id=8453,
-        expected_kms_root_pubkey_hex=KMS_ROOT_HEX,
+        require_kms_provenance=False,
     )
     routes = _route_all_pass(kms_pub_hex="")
     with patch.object(on_chain, "_eth_call", _Router(routes)):
         result = verify_on_chain_anchors(_attestation(), cfg, expected_app_id=APP)
+    # Hard checks pass; provenance is None but permissive mode tolerates.
     assert result.valid is True
-    assert result.kms_root_matches is True
+    assert result.kms_provenance is None
 
 
-def test_verify_kms_root_pinned_anchor_disagrees_with_attestation():
-    """If the anchor file pins a pubkey that disagrees with
-    info.key_provider_info.id, fail closed.
+def test_verify_kms_provenance_pubkey_set_but_quote_missing_fails():
+    """Mid-state: deployer set k256Pubkey but didn't include the quote.
+
+    The contract has setKmsInfo / setKmsQuote / setKmsEventlog as
+    separate setters, so partial population is possible.  Even with
+    the pubkey set, no quote means no provenance.
     """
-    cfg = OnChainConfig(
-        kms_contract_addr=KMS,
-        rpc_url="http://stub-rpc/",
-        chain_id=8453,
-        expected_kms_root_pubkey_hex="ff" * 32,
-    )
-    routes = _route_all_pass(kms_pub_hex="")
+    routes = {
+        (KMS.lower(), _SEL_REGISTERED_APPS): _word(1),
+        (APP.lower(), _SEL_ALLOWED_COMPOSE_HASHES): _word(1),
+        (KMS.lower(), _SEL_ALLOWED_OS_IMAGES): _word(1),
+        # k256Pubkey set but quote+eventlog empty
+        (KMS.lower(), _SEL_KMS_INFO_GETTER): _kms_info_payload_full(
+            k256=KMS_ROOT_HEX, ca="", quote="", eventlog=""
+        ),
+    }
     with patch.object(on_chain, "_eth_call", _Router(routes)):
-        result = verify_on_chain_anchors(_attestation(), cfg, expected_app_id=APP)
+        result = verify_on_chain_anchors(_attestation(), CONFIG, expected_app_id=APP)
     assert result.valid is False
-    assert result.kms_root_matches is False
-    assert any("pinned anchor" in e for e in result.errors)
+    assert result.kms_provenance is None
+    assert any("quote is empty" in e or "Provenance unverifiable" in e for e in result.errors)
 
 
-def test_verify_kms_root_onchain_and_pinned_must_agree():
-    """If both sources are present, they must agree."""
-    cfg = OnChainConfig(
-        kms_contract_addr=KMS,
-        rpc_url="http://stub-rpc/",
-        chain_id=8453,
-        expected_kms_root_pubkey_hex="aa" * 32,
-    )
-    routes = _route_all_pass(kms_pub_hex=KMS_ROOT_HEX)
+def test_verify_kms_provenance_full_kmsinfo_passes():
+    """When kmsInfo is fully populated and the pubkey matches
+    info.key_provider_info.id, provenance check passes.
+
+    NOTE: This commit confirms the pubkey match; full TDX-quote
+    verification of kmsInfo.quote is deferred to a follow-up.
+    """
+    routes = {
+        (KMS.lower(), _SEL_REGISTERED_APPS): _word(1),
+        (APP.lower(), _SEL_ALLOWED_COMPOSE_HASHES): _word(1),
+        (KMS.lower(), _SEL_ALLOWED_OS_IMAGES): _word(1),
+        (KMS.lower(), _SEL_KMS_INFO_GETTER): _kms_info_payload_full(
+            k256=KMS_ROOT_HEX,
+            ca="aa" * 91,
+            quote="bb" * 5006,
+            eventlog="cc" * 100,
+        ),
+    }
     with patch.object(on_chain, "_eth_call", _Router(routes)):
-        result = verify_on_chain_anchors(_attestation(), cfg, expected_app_id=APP)
+        result = verify_on_chain_anchors(_attestation(), CONFIG, expected_app_id=APP)
+    assert result.valid is True
+    assert result.kms_provenance is True
+    assert result.extracted["on_chain_kms_quote_len"] == 5006
+
+
+def test_verify_kms_provenance_kpi_disagrees_with_onchain():
+    """If on-chain kmsInfo.k256Pubkey is set AND attested via quote,
+    but the CVM's info.key_provider_info.id reports a different
+    pubkey, fail closed.
+    """
+    different_kpi = "ff" * (len(KMS_ROOT_HEX) // 2)
+    routes = {
+        (KMS.lower(), _SEL_REGISTERED_APPS): _word(1),
+        (APP.lower(), _SEL_ALLOWED_COMPOSE_HASHES): _word(1),
+        (KMS.lower(), _SEL_ALLOWED_OS_IMAGES): _word(1),
+        (KMS.lower(), _SEL_KMS_INFO_GETTER): _kms_info_payload_full(
+            k256=KMS_ROOT_HEX,
+            ca="",
+            quote="bb" * 100,
+            eventlog="cc" * 100,
+        ),
+    }
+    with patch.object(on_chain, "_eth_call", _Router(routes)):
+        result = verify_on_chain_anchors(
+            _attestation(kpi_id=different_kpi), CONFIG, expected_app_id=APP
+        )
     assert result.valid is False
-    assert result.kms_root_matches is False
-    assert any("disagree" in e for e in result.errors)
+    assert result.kms_provenance is False
+    assert any("key_provider_info.id" in e for e in result.errors)
 
 
 def test_verify_rpc_error_surfaced():
