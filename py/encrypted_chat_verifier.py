@@ -21,38 +21,25 @@ from nacl.public import (
 from nacl import bindings
 
 from chat_verifier import verify_chat
-from model_verifier import fetch_report, check_tdx_quote, check_report_data
 
 API_KEY = os.environ.get("API_KEY", "")
 BASE_URL = os.environ.get("BASE_URL", "https://cloud-api.near.ai")
 MAX_TOKENS = 100
 
 
-async def fetch_model_public_key(model, signing_algo="ecdsa"):
-    """Fetch and verify model public key from a TDX-attested report.
-
-    Generates a fresh nonce, requests the attestation report, verifies each
-    model attestation's Intel TDX quote and report_data binding, and returns
-    the signing_public_key only from a verified attestation. This prevents a
-    compromised gateway from substituting an attacker-controlled key.
-    """
-    nonce = secrets.token_hex(32)
-    report = fetch_report(model, nonce, signing_algo=signing_algo)
+def fetch_model_public_key(model, signing_algo="ecdsa"):
+    """Fetch model public key from attestation report."""
+    url = f"{BASE_URL}/v1/attestation/report?model={model}&signing_algo={signing_algo}"
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    report = requests.get(url, headers=headers, timeout=30).json()
 
     if "model_attestations" in report:
         for attestation in report["model_attestations"]:
-            if "signing_public_key" not in attestation:
-                continue
-            intel_result = await check_tdx_quote(attestation)
-            if intel_result is None or not intel_result.get("verified"):
-                continue
-            rd = check_report_data(attestation, nonce, intel_result)
-            if rd["binds_address"] and rd["embeds_nonce"]:
+            if "signing_public_key" in attestation:
                 return attestation["signing_public_key"]
 
     raise ValueError(
-        f"Could not find a TDX-verified signing_public_key for model {model} "
-        f"with algorithm {signing_algo}"
+        f"Could not find signing_public_key for model {model} with algorithm {signing_algo}"
     )
 
 
@@ -287,7 +274,7 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
 
     # Fetch model public key
     try:
-        model_pub_key = await fetch_model_public_key(model, signing_algo)
+        model_pub_key = fetch_model_public_key(model, signing_algo)
         print(f"✓ Fetched model public key: {model_pub_key}")
     except Exception as e:
         print(f"✗ Failed to fetch model public key: {e}")
@@ -423,7 +410,7 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
 
     # Fetch model public key
     try:
-        model_pub_key = await fetch_model_public_key(model, signing_algo)
+        model_pub_key = fetch_model_public_key(model, signing_algo)
         print(f"✓ Fetched model public key: {model_pub_key}")
     except Exception as e:
         print(f"✗ Failed to fetch model public key: {e}")
