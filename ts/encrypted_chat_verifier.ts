@@ -14,6 +14,12 @@ import * as ed2curve from 'ed2curve';
 import {
   verifyChat,
 } from './chat_verifier';
+import {
+  checkTdxQuote,
+  checkReportData,
+  AttestationReport,
+  IntelResult,
+} from './model_verifier';
 
 const API_KEY = process.env.API_KEY || '';
 const BASE_URL = process.env.BASE_URL || 'https://cloud-api.near.ai';
@@ -99,23 +105,39 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
 }
 
 /**
- * Fetch model public key from attestation report
+ * Fetch and verify model public key from a TDX-attested report.
+ *
+ * Generates a fresh nonce, requests the attestation report, verifies each model
+ * attestation's Intel TDX quote and report_data binding, and returns the
+ * signing_public_key only from a verified attestation. This prevents a
+ * compromised gateway from substituting an attacker-controlled key.
  */
 async function fetchModelPublicKey(model: string, signingAlgo: string = 'ecdsa'): Promise<string> {
-  const url = `${BASE_URL}/v1/attestation/report?model=${encodeURIComponent(model)}&signing_algo=${encodeURIComponent(signingAlgo)}`;
+  const nonce = crypto.randomBytes(32).toString('hex');
+  const url = `${BASE_URL}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${encodeURIComponent(nonce)}&signing_algo=${encodeURIComponent(signingAlgo)}`;
   const headers = { Authorization: `Bearer ${API_KEY}` };
   const report = await makeRequest(url, { headers });
 
-  // Try to get signing_public_key from model_attestations
   if (report.model_attestations && Array.isArray(report.model_attestations)) {
     for (const attestation of report.model_attestations) {
-      if (attestation.signing_public_key) {
-        return attestation.signing_public_key;
+      if (!attestation.signing_public_key) continue;
+      let intelResult: IntelResult;
+      try {
+        intelResult = await checkTdxQuote(attestation as AttestationReport);
+      } catch {
+        continue;
+      }
+      if (!intelResult.quote.verified) continue;
+      const rd = checkReportData(attestation as AttestationReport, nonce, intelResult);
+      if (rd.binds_address && rd.embeds_nonce) {
+        return attestation.signing_public_key as string;
       }
     }
   }
 
-  throw new Error(`Could not find signing_public_key for model ${model} with algorithm ${signingAlgo}`);
+  throw new Error(
+    `Could not find a TDX-verified signing_public_key for model ${model} with algorithm ${signingAlgo}`
+  );
 }
 
 /**

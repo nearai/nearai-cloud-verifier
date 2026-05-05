@@ -312,9 +312,22 @@ pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --test-both
 
 **Default model**: `deepseek-ai/DeepSeek-V3.1`
 
+### Key Fetch Security
+
+The `fetch_model_public_key` / `fetchModelPublicKey` functions do **not** trust the key from the attestation JSON directly. Before accepting any `signing_public_key` they:
+
+1. Generate a fresh random nonce
+2. Fetch the attestation report **with that nonce**
+3. Verify the Intel TDX quote cryptographically (`check_tdx_quote` / `checkTdxQuote`)
+4. Confirm the `report_data` in the verified quote binds the signing address **and** the nonce (`check_report_data` / `checkReportData`)
+5. Return the key only if both checks pass
+
+This prevents a compromised gateway from substituting an attacker-controlled encryption key — the key is accepted only after the hardware TEE quote proves it originated from a genuine enclave.
+
 ### What It Tests
 
-- ✅ **End-to-End Encryption** - Request messages encrypted with model's public key
+- ✅ **TDX-Verified Key Fetch** - Signing key accepted only after Intel TDX quote + nonce binding checks pass
+- ✅ **End-to-End Encryption** - Request messages encrypted with the hardware-attested model public key
 - ✅ **Response Decryption** - Response content decrypted with client's private key
 - ✅ **ECDSA Encryption** - ECIES (Elliptic Curve Integrated Encryption Scheme) with AES-GCM
 - ✅ **Ed25519 Encryption** - X25519 key exchange with ChaCha20-Poly1305
@@ -327,7 +340,7 @@ The verifier automatically includes the following headers for encrypted requests
 
 - `X-Signing-Algo`: Either `ecdsa` or `ed25519`
 - `X-Client-Pub-Key`: Client's public key in hex format
-- `X-Model-Pub-Key`: Model's public key from attestation report
+- `X-Model-Pub-Key`: Model's public key from TDX-verified attestation report
 
 ## 🌐 Domain Verifier
 
