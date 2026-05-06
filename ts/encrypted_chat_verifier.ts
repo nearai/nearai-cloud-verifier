@@ -106,7 +106,6 @@ async function fetchModelPublicKey(model: string, signingAlgo: string = 'ecdsa')
   const headers = { Authorization: `Bearer ${API_KEY}` };
   const report = await makeRequest(url, { headers });
 
-  // Try to get signing_public_key from model_attestations
   if (report.model_attestations && Array.isArray(report.model_attestations)) {
     for (const attestation of report.model_attestations) {
       if (attestation.signing_public_key) {

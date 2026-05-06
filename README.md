@@ -39,7 +39,7 @@ Python and TypeScript tools for validating NEAR AI Cloud attestation reports and
 ### Installation
 
 ```bash
-git clone https://github.com/nearai-cloud/nearai-cloud-verifier.git
+git clone https://github.com/nearai/nearai-cloud-verifier.git
 cd nearai-cloud-verifier
 
 # For Python
@@ -96,6 +96,16 @@ pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1
 
 # TypeScript - Test both algorithms
 pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --test-both
+```
+
+### TLS Attestation Verification
+
+```bash
+# Python — verify TLS cert is held inside TEE
+python3 py/tls_verifier.py --url https://proxy.example.com:8443
+
+# TypeScript
+pnpm run tls -- --url https://proxy.example.com:8443
 ```
 
 ### Domain Verification (gateway TLS)
@@ -368,6 +378,61 @@ Fetching certificate from live server: cloud-api.near.ai:443
 Fingerprints match: True
 ```
 
+## 🔒 TLS Verifier
+
+Proves that a specific inference proxy's TLS certificate is held **inside the TEE** — not just trusted via CA chains. Uses a single TLS connection to fetch both the live certificate SPKI hash and the attestation report, preventing round-robin mismatches.
+
+**Verification steps:**
+1. Connects to the proxy over TLS and extracts the live certificate's SPKI hash
+2. Requests attestation with `include_tls_fingerprint=true` over the **same** connection
+3. Verifies the Intel TDX quote (`check_tdx_quote`)
+4. Checks `report_data[0..32] = SHA256(signing_address || spki_hash)` and `report_data[32..64] = nonce`
+5. Compares the live SPKI hash against the attested `tls_cert_fingerprint`
+
+```bash
+# Python — verify a specific inference proxy
+python3 py/tls_verifier.py --url https://proxy.example.com:8443
+
+# Python — with Ed25519 signing algo
+python3 py/tls_verifier.py --url https://proxy.example.com:8443 --signing-algo ed25519
+
+# TypeScript
+pnpm run tls -- --url https://proxy.example.com:8443
+```
+
+| Arg | Description |
+|-----|-------------|
+| `--url` | HTTPS URL of the inference proxy (required) |
+| `--signing-algo` | `ecdsa` (default) or `ed25519` |
+| `--token` | Bearer token if the proxy requires auth (defaults to `API_KEY` env) |
+
+### What It Verifies
+
+- ✅ **TLS Certificate Bound to TEE** - Live SPKI hash matches the attested fingerprint inside the TDX quote
+- ✅ **Intel TDX Quote** - Hardware attestation cryptographically verified
+- ✅ **Signing Address Binding** - Signing key tied to TLS cert inside the TEE
+- ✅ **Nonce Freshness** - Prevents replay attacks
+- ✅ **GPU Attestation** - NVIDIA NRAS verification (if `nvidia_payload` present)
+- ✅ **Compose Manifest** - Docker compose verified against mr_config
+
+## 🔍 Version Verifier
+
+Identifies the exact deployed `cloud-api` version by reading the Docker image digest out of its TDX-attested compose manifest, then resolving it to a git commit via GitHub's build attestation API.
+
+```bash
+python3 version_verifier.py
+```
+
+**Output:**
+```
+Image:   nearaidev/cloud-api@sha256:abc123...
+Commit:  a1b2c3d...
+Build:   https://github.com/nearai/cloud-api/actions/runs/...
+GitHub:  https://github.com/nearai/cloud-api/commit/a1b2c3d...
+```
+
+Requires `gh` CLI authenticated to GitHub.
+
 ## 📦 Sigstore Provenance
 
 Both scripts automatically extract all container image digests from the Docker compose manifest (matching `@sha256:xxx` patterns) and verify Sigstore accessibility for each image. This allows you to:
@@ -567,7 +632,8 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
 3. Make your changes
-4. Test with both Python and TypeScript verifiers:
+4. Clone from the correct URL: `https://github.com/nearai/nearai-cloud-verifier.git`
+5. Test with both Python and TypeScript verifiers:
 
 ```bash
 # Test Python verifiers

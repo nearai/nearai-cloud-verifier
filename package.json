@@ -27,7 +27,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nearai-cloud/nearai-cloud-verifier.git"
+    "url": "git+https://github.com/nearai/nearai-cloud-verifier.git"
   },
   "keywords": [
     "near",
@@ -38,7 +38,7 @@
   "author": "Robert Yan",
   "license": "Apache-2.0",
   "bugs": {
-    "url": "https://github.com/nearai-cloud/nearai-cloud-verifier/issues"
+    "url": "https://github.com/nearai/nearai-cloud-verifier/issues"
   },
-  "homepage": "https://github.com/nearai-cloud/nearai-cloud-verifier#readme"
+  "homepage": "https://github.com/nearai/nearai-cloud-verifier#readme"
 }

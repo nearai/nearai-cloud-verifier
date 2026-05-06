@@ -33,7 +33,6 @@ def fetch_model_public_key(model, signing_algo="ecdsa"):
     headers = {"Authorization": f"Bearer {API_KEY}"}
     report = requests.get(url, headers=headers, timeout=30).json()
 
-    # Try to get signing_public_key from model_attestations
     if "model_attestations" in report:
         for attestation in report["model_attestations"]:
             if "signing_public_key" in attestation:
