@@ -98,6 +98,38 @@ pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1
 pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1 --test-both
 ```
 
+### Encrypted Agent-Loop Verification (`web_context_search`)
+
+Drives a single chat completion that asks the model to use NEAR's
+server-side `web_context_search` tool, and decrypts every chunk on the
+wire so the full agent loop is visible in plaintext. Useful for
+validating that:
+
+- The E2EE handshake (Ed25519 + HKDF-SHA256 + XChaCha20-Poly1305,
+  protocol version 2) works end-to-end through `cloud-api`.
+- The agent loop runs entirely inside the CVM trust boundary: the
+  search query, the Brave results, and the model's final answer all
+  travel encrypted; only the search query egresses the CVM (directly
+  to Brave under TLS).
+
+```bash
+export API_KEY=sk-your-api-key-here
+
+# Default model (GLM-5.1-FP8) and a research question that should trigger the tool:
+python3 py/encrypted_agent_loop_verifier.py
+
+# Custom prompt:
+python3 py/encrypted_agent_loop_verifier.py \
+  --prompt 'What was the most recent SpaceX launch? Use web_context_search.'
+
+# Against staging:
+BASE_URL=https://cloud-stg-api.near.ai \
+  python3 py/encrypted_agent_loop_verifier.py
+```
+
+Exit code `0` indicates a clean tool round-trip; the script's summary
+explains the most likely cause when it fails.
+
 ### TLS Attestation Verification
 
 ```bash
