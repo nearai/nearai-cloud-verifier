@@ -84,9 +84,20 @@ function canonicalizeJson(value: unknown): string {
 
 function checkComposeManagerActions(report: Record<string, unknown>): ComposeManagerResult | void {
   const cm = report.compose_manager_attestation;
-  if (!cm) return;
+  if (!cm) {
+    console.log('\n⚠️  No compose_manager_attestation in report; skipping actions hash check');
+    return;
+  }
 
-  const cmObj = typeof cm === 'string' ? JSON.parse(cm) : cm as Record<string, unknown>;
+  console.log('\n🔐 Compose-manager actions hash');
+
+  let cmObj: Record<string, unknown>;
+  try {
+    cmObj = typeof cm === 'string' ? JSON.parse(cm) : cm as Record<string, unknown>;
+  } catch (e) {
+    console.log('  could not parse compose_manager_attestation:', (e as Error).message);
+    return { actions_hash_valid: false };
+  }
 
   const actions = cmObj.actions;
   const actionsHash = cmObj.actions_hash;
@@ -94,8 +105,6 @@ function checkComposeManagerActions(report: Record<string, unknown>): ComposeMan
     console.log('  compose_manager_attestation present but missing actions/actions_hash — skipping');
     return;
   }
-
-  console.log('\n🔐 Compose-manager actions hash');
 
   const canonical = canonicalizeJson(actions);
   const computed = crypto.createHash('sha256').update(canonical).digest('hex');
@@ -107,15 +116,22 @@ function checkComposeManagerActions(report: Record<string, unknown>): ComposeMan
     console.log('    actual:  ', actionsHash);
   }
 
+  // Self-consistency check: actions_hash should match report_data[:32] from
+  // compose-manager's response. NOT hardware-bound (quote not verified here).
   const cmReportData = cmObj.report_data as string | undefined;
   if (cmReportData) {
-    const reportDataBytes = Buffer.from(cmReportData.replace(/^0x/i, ''), 'hex');
-    const rdActionsHash = reportDataBytes.subarray(0, 32).toString('hex');
-    const bindsReportData = rdActionsHash === actionsHash;
-    console.log('  actions_hash matches compose-manager report_data[:32]:', bindsReportData);
-    if (!bindsReportData) {
-      console.log('    expected:', rdActionsHash);
-      console.log('    actual:  ', actionsHash);
+    const hex = cmReportData.replace(/^0x/i, '');
+    if (/^[0-9a-fA-F]*$/.test(hex) && hex.length >= 64) {
+      const reportDataBytes = Buffer.from(hex, 'hex');
+      const rdActionsHash = reportDataBytes.subarray(0, 32).toString('hex');
+      const bindsReportData = rdActionsHash === actionsHash;
+      console.log('  actions_hash matches compose-manager report_data[:32] (unverified quote):', bindsReportData);
+      if (!bindsReportData) {
+        console.log('    expected:', rdActionsHash);
+        console.log('    actual:  ', actionsHash);
+      }
+    } else {
+      console.log('  could not decode compose-manager report_data: invalid hex');
     }
   }
 
