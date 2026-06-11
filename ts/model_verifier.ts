@@ -66,6 +66,62 @@ interface GpuResult {
   verdict: string;
 }
 
+interface ComposeManagerResult {
+  actions_hash_valid: boolean;
+}
+
+function canonicalizeJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return '[' + value.map(canonicalizeJson).join(',') + ']';
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalizeJson(obj[k])).join(',') + '}';
+}
+
+function checkComposeManagerActions(report: Record<string, unknown>): ComposeManagerResult | void {
+  const cm = report.compose_manager_attestation;
+  if (!cm) return;
+
+  const cmObj = typeof cm === 'string' ? JSON.parse(cm) : cm as Record<string, unknown>;
+
+  const actions = cmObj.actions;
+  const actionsHash = cmObj.actions_hash;
+  if (actions === undefined || actionsHash === undefined) {
+    console.log('  compose_manager_attestation present but missing actions/actions_hash — skipping');
+    return;
+  }
+
+  console.log('\n🔐 Compose-manager actions hash');
+
+  const canonical = canonicalizeJson(actions);
+  const computed = crypto.createHash('sha256').update(canonical).digest('hex');
+
+  const matches = computed === actionsHash;
+  console.log('  actions_hash matches SHA-256(canonicalize(actions)):', matches);
+  if (!matches) {
+    console.log('    expected:', computed);
+    console.log('    actual:  ', actionsHash);
+  }
+
+  const cmReportData = cmObj.report_data as string | undefined;
+  if (cmReportData) {
+    const reportDataBytes = Buffer.from(cmReportData.replace(/^0x/i, ''), 'hex');
+    const rdActionsHash = reportDataBytes.subarray(0, 32).toString('hex');
+    const bindsReportData = rdActionsHash === actionsHash;
+    console.log('  actions_hash matches compose-manager report_data[:32]:', bindsReportData);
+    if (!bindsReportData) {
+      console.log('    expected:', rdActionsHash);
+      console.log('    actual:  ', actionsHash);
+    }
+  }
+
+  return { actions_hash_valid: matches };
+}
+
 /**
  * Make HTTP request and return JSON response
  */
@@ -467,6 +523,7 @@ async function verifyAttestation(
 
   showCompose(attestation, intelResult);
   await showSigstoreProvenance(attestation);
+  checkComposeManagerActions(attestation as unknown as Record<string, unknown>);
 }
 
 /**
@@ -537,6 +594,9 @@ async function main(): Promise<void> {
     console.log('========================================');
     await verifyAttestation(modelAttestation, requestNonce, true);
   }
+
+  // Top-level compose-manager attestation (present on model proxy responses)
+  checkComposeManagerActions(report as unknown as Record<string, unknown>);
 }
 
 // Run the main function if this file is executed directly
@@ -553,9 +613,12 @@ export {
   verifyAttestation,
   showSigstoreProvenance,
   showCompose,
+  checkComposeManagerActions,
+  canonicalizeJson,
   AttestationBaseInfo,
   AttestationReport,
   IntelResult,
   ReportDataResult,
-  GpuResult
+  GpuResult,
+  ComposeManagerResult,
 };
