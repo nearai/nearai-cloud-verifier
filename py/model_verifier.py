@@ -63,6 +63,68 @@ def _signing_address_padded32(signing_address, signing_algo):
     return raw.ljust(32, b"\x00")
 
 
+def check_compose_manager_actions(report):
+    """Verify compose-manager actions_hash matches SHA-256 of canonicalized actions.
+
+    Canonicalization: json.dumps(actions, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=False)
+    Then: sha256(canonical.encode("utf-8")).hexdigest() == actions_hash
+
+    Note: ensure_ascii=False is required because serde_json emits raw UTF-8 for
+    non-ASCII, while Python defaults to \\uXXXX escaping. All DeploymentAction
+    values are strings (no numeric type ambiguity).
+
+    The report_data cross-check below is NOT hardware-bound: the quote field
+    from compose-manager's response is not verified here (only the model proxy's
+    quote is verified by check_tdx_quote). This is a self-consistency check.
+    """
+    cm = report.get("compose_manager_attestation")
+    if not cm:
+        print("\n⚠️  No compose_manager_attestation in report; skipping actions hash check")
+        return
+
+    print("\n🔐 Compose-manager actions hash")
+
+    try:
+        if isinstance(cm, str):
+            cm = json.loads(cm)
+        actions = cm.get("actions")
+        actions_hash = cm.get("actions_hash")
+    except (json.JSONDecodeError, ValueError) as e:
+        print("  could not parse compose_manager_attestation:", e)
+        return {"actions_hash_valid": False}
+
+    if actions is None or actions_hash is None:
+        print("  compose_manager_attestation present but missing actions/actions_hash — skipping")
+        return
+
+    canonical = json.dumps(actions, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    computed = sha256(canonical.encode("utf-8")).hexdigest()
+
+    matches = computed == actions_hash
+    print("  actions_hash matches SHA-256(canonicalize(actions)):", matches)
+    if not matches:
+        print("    expected:", computed)
+        print("    actual:  ", actions_hash)
+
+    # Self-consistency check: actions_hash should match report_data[:32] from
+    # compose-manager's response. NOT hardware-bound (quote not verified here).
+    cm_report_data = cm.get("report_data")
+    if cm_report_data:
+        try:
+            report_data_bytes = bytes.fromhex(cm_report_data.removeprefix("0x"))
+            rd_actions_hash = report_data_bytes[:32].hex()
+            binds_report_data = rd_actions_hash == actions_hash
+            print("  actions_hash matches compose-manager report_data[:32] (unverified quote):", binds_report_data)
+            if not binds_report_data:
+                print("    expected:", rd_actions_hash)
+                print("    actual:  ", actions_hash)
+        except ValueError as e:
+            print("  could not decode compose-manager report_data:", e)
+
+    return {"actions_hash_valid": matches}
+
+
 def check_report_data(attestation, request_nonce, intel_result):
     """Verify TDX report_data binds signing address and nonce.
 
@@ -312,6 +374,7 @@ async def verify_attestation(attestation, request_nonce, verify_model=False):
 
     show_compose(attestation, intel_result)
     show_sigstore_provenance(attestation)
+    check_compose_manager_actions(attestation)
 
 
 async def verify_gateway_tls_binding(signing_address, model, signing_algo="ecdsa"):
@@ -360,6 +423,9 @@ async def main() -> None:
         print(f"🔐 Model attestations: (#{index})")
         print("========================================")
         await verify_attestation(model_attestation, request_nonce, verify_model=True)
+
+    # Top-level compose-manager attestation (present on model proxy responses)
+    check_compose_manager_actions(report)
 
 if __name__ == "__main__":
     import asyncio
