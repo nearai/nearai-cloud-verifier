@@ -266,7 +266,15 @@ def run(model: str, prompt: str, max_tokens: int) -> int:
     chat_id: Optional[str] = None
     iterations = 0
     saw_tool_call_name = False
+    # `saw_tool_result` is only set to True once a nearai_tool_result chunk
+    # arrives *and* its `output` field decrypts successfully.  A present-but-
+    # undecryptable output is a hard verification failure (see `tool_result_decrypt_failed`).
     saw_tool_result = False
+    tool_result_decrypt_failed = False
+    # `saw_tool_args_decrypted` tracks that at least one tool_call.arguments
+    # chunk decrypted successfully.  Because X-Encrypt-All-Fields is always
+    # sent, arguments that never decrypt indicate a gap in the E2EE coverage.
+    saw_tool_args_decrypted = False
     accumulated_args = ""
     accumulated_content = ""
 
@@ -322,6 +330,7 @@ def run(model: str, prompt: str, max_tokens: int) -> int:
                 if fn.get("arguments"):
                     decoded = try_decrypt(fn["arguments"], client_priv)
                     if decoded is not None:
+                        saw_tool_args_decrypted = True
                         accumulated_args += decoded
                         print(decoded, end="", flush=True)
 
@@ -329,7 +338,6 @@ def run(model: str, prompt: str, max_tokens: int) -> int:
             # grounding the model sees on the next iteration.
             tr = delta.get("nearai_tool_result")
             if tr:
-                saw_tool_result = True
                 output_blob = tr.get("output")
                 output_decoded = try_decrypt(output_blob, client_priv) if output_blob else None
                 print()
@@ -340,13 +348,20 @@ def run(model: str, prompt: str, max_tokens: int) -> int:
                     f"name={tr.get('name')} status={tr.get('status')}"
                 )
                 if output_decoded is not None:
+                    # Only mark the tool result as verified once output decrypts.
+                    saw_tool_result = True
                     preview = output_decoded[:800]
                     print(f"[output decrypted, {len(output_decoded)} chars]")
                     print(preview)
                     if len(output_decoded) > len(preview):
                         print(f"… ({len(output_decoded) - len(preview)} more chars)")
                 else:
-                    print("[output NOT decrypted — looks plaintext or invalid hex]")
+                    # `output` is a required encrypted field — failure to decrypt
+                    # means E2EE is broken or the field was sent in plaintext,
+                    # which is a hard verification failure.
+                    tool_result_decrypt_failed = True
+                    print("[FAIL] output field present but could NOT be decrypted")
+                    print("       (required encrypted field missing or ciphertext corrupt)")
                     print(repr(output_blob)[:300])
                 print("─" * 70)
 
@@ -360,14 +375,24 @@ def run(model: str, prompt: str, max_tokens: int) -> int:
     print("=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"chat_id              : {chat_id}")
-    print(f"iterations           : {iterations}")
-    print(f"saw tool_call name?  : {saw_tool_call_name}")
-    print(f"accumulated args     : {accumulated_args!r}")
-    print(f"saw nearai_tool_result?: {saw_tool_result}")
-    print(f"final content chars  : {len(accumulated_content)}")
+    print(f"chat_id                    : {chat_id}")
+    print(f"iterations                 : {iterations}")
+    print(f"saw tool_call name?        : {saw_tool_call_name}")
+    print(f"tool args decrypted?       : {saw_tool_args_decrypted}")
+    print(f"accumulated args           : {accumulated_args!r}")
+    print(f"saw nearai_tool_result?    : {saw_tool_result}")
+    print(f"tool_result decrypt failed?: {tool_result_decrypt_failed}")
+    print(f"final content chars        : {len(accumulated_content)}")
     print()
-    if saw_tool_result and saw_tool_call_name and accumulated_content:
+
+    # Hard failure: a nearai_tool_result arrived but its `output` did not
+    # decrypt — the E2EE chain is broken even if the model produced content.
+    if tool_result_decrypt_failed:
+        print("❌ FAIL: nearai_tool_result.output was present but could not be decrypted.")
+        print("   The required encrypted field must decrypt for verification to pass.")
+        return 1
+
+    if saw_tool_result and saw_tool_call_name and saw_tool_args_decrypted and accumulated_content:
         print(f"✅ Agent loop fired end-to-end against {BASE_URL} with full E2EE")
         return 0
     print("⚠ Did not observe a complete encrypted tool round-trip.")
@@ -377,6 +402,9 @@ def run(model: str, prompt: str, max_tokens: int) -> int:
         print("       (needs PR nearai/cloud-api#676 deployed).")
         print("     • Model decided not to call the tool — try a more")
         print("       explicit prompt or increase --max-tokens.")
+    if saw_tool_call_name and not saw_tool_args_decrypted:
+        print("   - Tool was invoked but tool_call.arguments did not decrypt.")
+        print("     Check that X-Encrypt-All-Fields is active server-side.")
     if saw_tool_call_name and not saw_tool_result:
         print("   - Tool was invoked but no synthetic result chunk arrived.")
         print("     Check that the CVM has WEB_CONTEXT_SEARCH_URL +")
