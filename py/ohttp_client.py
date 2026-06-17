@@ -120,28 +120,69 @@ def bhttp_encode_request(
 
 
 def bhttp_decode_response(data: bytes) -> tuple[int, dict[str, str], bytes]:
-    """Decode a known-length BHTTP response (framing=0x01).
+    """Decode a BHTTP response.
 
+    Supports framing 0x01 (known-length) and 0x03 (indeterminate-length).
     Returns (status_code, headers, body).
     """
-    assert data[0] == 0x01, f"Expected known-length response framing 0x01, got {data[0]:#04x}"
+    framing = data[0]
+    assert framing in (0x01, 0x03), f"Unsupported BHTTP response framing: {framing:#04x}"
     off = 1
-    status, off = _quic_decode(data, off)
-    hdr_len, off = _quic_decode(data, off)
-    hdr_end = off + hdr_len
+
+    # For indeterminate-length, status may be preceded by 1xx informational responses
+    while True:
+        status, off = _quic_decode(data, off)
+        if framing == 0x01:
+            break  # known-length has no informational responses in this usage
+        if status >= 200:
+            break
+        # Skip 1xx informational field section (indeterminate format)
+        while True:
+            nlen, off = _quic_decode(data, off)
+            if nlen == 0:
+                break
+            off += nlen  # skip name
+            vlen, off = _quic_decode(data, off)
+            off += vlen  # skip value
+
     headers: dict[str, str] = {}
-    while off < hdr_end:
-        name_len, off = _quic_decode(data, off)
-        name = data[off : off + name_len].decode()
-        off += name_len
-        val_len, off = _quic_decode(data, off)
-        val = data[off : off + val_len].decode()
-        off += val_len
-        headers[name] = val
-    off = hdr_end
-    # Known-Length Content: quic_int(length) + bytes (RFC 9292 §3.1)
-    content_len, off = _quic_decode(data, off)
-    body = data[off : off + content_len]
+    if framing == 0x01:
+        # Known-length field section: quic(total_bytes) + field_lines
+        hdr_len, off = _quic_decode(data, off)
+        hdr_end = off + hdr_len
+        while off < hdr_end:
+            name_len, off = _quic_decode(data, off)
+            name = data[off : off + name_len].decode()
+            off += name_len
+            val_len, off = _quic_decode(data, off)
+            val = data[off : off + val_len].decode()
+            off += val_len
+            headers[name] = val
+        off = hdr_end
+        content_len, off = _quic_decode(data, off)
+        body = data[off : off + content_len]
+    else:
+        # Indeterminate-length field section: [quic(nlen) + name + quic(vlen) + val]* + quic(0)
+        while True:
+            nlen, off = _quic_decode(data, off)
+            if nlen == 0:
+                break
+            name = data[off : off + nlen].decode()
+            off += nlen
+            vlen, off = _quic_decode(data, off)
+            val = data[off : off + vlen].decode()
+            off += vlen
+            headers[name] = val
+        # Indeterminate-length body: [quic(chunk_len > 0) + chunk]* + quic(0)
+        parts: list[bytes] = []
+        while True:
+            chunk_len, off = _quic_decode(data, off)
+            if chunk_len == 0:
+                break
+            parts.append(data[off : off + chunk_len])
+            off += chunk_len
+        body = b"".join(parts)
+
     return status, headers, body
 
 
@@ -195,6 +236,16 @@ def _hpke_setup_sender(
     return _HpkeSenderContext(enc, key, base_nonce, exporter_secret, hpke_suite_id)
 
 
+# ─── Chunked OHTTP helpers ────────────────────────────────────────────────────
+
+_MAX_CHUNK_PLAINTEXT = 1 << 14  # 16 384 bytes (ohttp 0.7.2 stream.rs)
+
+
+def _compute_nonce(base_nonce: bytes, seq: int) -> bytes:
+    """RFC 9180 §5.2: base_nonce XOR I2OSP(seq, Nn)."""
+    return bytes(a ^ b for a, b in zip(base_nonce, seq.to_bytes(len(base_nonce), "big")))
+
+
 # ─── OHTTP request/response (RFC 9458) ───────────────────────────────────────
 
 @dataclass
@@ -228,6 +279,75 @@ def _ohttp_encapsulate(key_config: bytes, bhttp_request: bytes) -> tuple[bytes, 
     enc_request = header + ctx.enc + ct
     state = _OhttpState(ctx.enc, ctx.exporter_secret, ctx.hpke_suite_id)
     return enc_request, state
+
+
+def _ohttp_encapsulate_chunked(key_config: bytes, bhttp_request: bytes) -> tuple[bytes, _OhttpState]:
+    """Encapsulate a BHTTP request using chunked OHTTP (RFC 9458).
+
+    Uses Content-Type message/ohttp-chunked-req. Wire format:
+      header(7) + enc(32) + [varint(ct_len) + ct]* + varint(0) + final_ct(16)
+    Each non-final chunk uses AAD=b""; the final empty chunk uses AAD=b"final".
+    """
+    key_id    = key_config[0]
+    kem_id    = struct.unpack(">H", key_config[1:3])[0]
+    server_pk = key_config[3:35]
+    kdf_id    = struct.unpack(">H", key_config[37:39])[0]
+    aead_id   = struct.unpack(">H", key_config[39:41])[0]
+
+    header = bytes([key_id]) + struct.pack(">HHH", kem_id, kdf_id, aead_id)
+    info   = b"message/bhttp chunked request\x00" + header  # different from standard OHTTP
+
+    ctx = _hpke_setup_sender(server_pk, kem_id, kdf_id, aead_id, info)
+    result = bytearray(header + ctx.enc)
+
+    # Non-final chunks
+    seq, offset = 0, 0
+    while offset < len(bhttp_request):
+        chunk = bhttp_request[offset : offset + _MAX_CHUNK_PLAINTEXT]
+        offset += len(chunk)
+        ct = AESGCM(ctx.key).encrypt(_compute_nonce(ctx.base_nonce, seq), chunk, b"")
+        seq += 1
+        result += _quic_encode(len(ct)) + ct
+
+    # Final chunk: seal(b"final", b"") = 16-byte GCM tag only
+    final_ct = AESGCM(ctx.key).encrypt(_compute_nonce(ctx.base_nonce, seq), b"", b"final")
+    result += _quic_encode(0) + final_ct
+
+    state = _OhttpState(ctx.enc, ctx.exporter_secret, ctx.hpke_suite_id)
+    return bytes(result), state
+
+
+def _ohttp_decapsulate_response_chunked(data: bytes, state: _OhttpState) -> bytes:
+    """Decapsulate a chunked OHTTP response (Content-Type message/ohttp-chunked-res).
+
+    Wire format: response_nonce(16) + [varint(ct_len) + ct]* + varint(0) + final_ct(16)
+    """
+    Nmax = max(state.Nk, state.Nn)
+    response_nonce = data[:Nmax]
+    pos = Nmax
+
+    # HPKE Export with chunked response label, then make_aead via plain HKDF
+    secret = _labeled_expand(
+        state.hpke_suite_id, "sec", state.exporter_secret,
+        b"message/bhttp chunked response", Nmax,
+    )
+    prk          = _hkdf_extract(state.enc + response_nonce, secret)
+    key_r        = _hkdf_expand(prk, b"key",   state.Nk)
+    nonce_base_r = _hkdf_expand(prk, b"nonce", state.Nn)
+
+    plaintext, seq = bytearray(), 0
+    while pos < len(data):
+        ct_len, pos = _quic_decode(data, pos)
+        if ct_len == 0:
+            # Final chunk — remaining bytes are the 16-byte GCM tag of empty plaintext
+            AESGCM(key_r).decrypt(_compute_nonce(nonce_base_r, seq), data[pos:], b"final")
+            break
+        ct = data[pos : pos + ct_len]
+        pos += ct_len
+        plaintext += AESGCM(key_r).decrypt(_compute_nonce(nonce_base_r, seq), ct, b"")
+        seq += 1
+
+    return bytes(plaintext)
 
 
 def _ohttp_decapsulate_response(enc_response: bytes, state: _OhttpState) -> bytes:
@@ -313,6 +433,43 @@ class OhttpClient:
         )
 
         bhttp_resp = _ohttp_decapsulate_response(resp.content, state)
+        return bhttp_decode_response(bhttp_resp)
+
+    def request_chunked(
+        self,
+        method: str,
+        path: str,
+        headers: list[tuple[str, str]],
+        body: bytes | str,
+    ) -> tuple[int, dict[str, str], bytes]:
+        """Send an OHTTP-encapsulated request using the chunked format.
+
+        Content-Type message/ohttp-chunked-req — wire-format uses counter-nonce AEAD
+        chunks, which is the format required for true server-side streaming.
+        Returns (inner_status, inner_headers, inner_body).
+        """
+        bhttp_req = bhttp_encode_request(
+            method=method,
+            scheme="https",
+            authority=self.base_url.removeprefix("https://").removeprefix("http://"),
+            path=path,
+            headers=headers,
+            body=body,
+        )
+        enc_req, state = _ohttp_encapsulate_chunked(self.key_config, bhttp_req)
+
+        resp = self._http.post(
+            f"{self.base_url}/ohttp",
+            data=enc_req,
+            headers={"content-type": "message/ohttp-chunked-req"},
+            timeout=120,
+        )
+        assert resp.status_code == 200, f"OHTTP transport error: {resp.status_code} {resp.text[:200]}"
+        assert resp.headers.get("content-type") == "message/ohttp-chunked-res", (
+            f"Expected message/ohttp-chunked-res, got {resp.headers.get('content-type')}"
+        )
+
+        bhttp_resp = _ohttp_decapsulate_response_chunked(resp.content, state)
         return bhttp_decode_response(bhttp_resp)
 
     def chat(
@@ -581,6 +738,35 @@ def example_tool_calls_streaming(client: OhttpClient, model: str) -> None:
     print("  PASS ✓")
 
 
+def example_chunked(client: OhttpClient, model: str) -> None:
+    print(f"\n{'='*60}")
+    print(f"Example 6: Chunked OHTTP (message/ohttp-chunked-req)  (model={model})")
+    print("="*60)
+    print("  Sends the request as counter-nonce AEAD chunks (the format")
+    print("  required for true server-side streaming responses).")
+
+    status, hdrs, body_bytes = client.request_chunked(
+        "POST",
+        "/v1/chat/completions",
+        headers=[
+            ("authorization", f"Bearer {client.api_key}"),
+            ("content-type", "application/json"),
+        ],
+        body=json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply with exactly: chunked OK"}],
+            "max_tokens": 15,
+            "stream": False,
+        }),
+    )
+    assert status == 200, f"Unexpected status {status}"
+    body = json.loads(body_bytes)
+    content = body["choices"][0]["message"]["content"]
+    print(f"  Status:   {status}")
+    print(f"  Response: {content!r}")
+    print("  PASS ✓")
+
+
 def example_multi_turn(client: OhttpClient, model: str) -> None:
     print(f"\n{'='*60}")
     print(f"Example 5: Multi-turn conversation  (model={model})")
@@ -639,6 +825,7 @@ def main() -> None:
     example_tool_calls(client, args.model)
     example_tool_calls_streaming(client, args.model)
     example_multi_turn(client, args.model)
+    example_chunked(client, args.model)
 
     print(f"\n{'='*60}")
     print("All OHTTP examples PASSED")

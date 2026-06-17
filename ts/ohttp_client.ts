@@ -173,43 +173,113 @@ interface BhttpResponse {
 }
 
 function bhttpDecodeResponse(data: Buffer): BhttpResponse {
-  if (data[0] !== 0x01) throw new Error(`Expected response framing 0x01, got ${data[0]}`);
+  const framing = data[0];
+  if (framing !== 0x01 && framing !== 0x03) throw new Error(`Unsupported BHTTP response framing: ${framing}`);
   let off = 1;
-  let status: number;
-  [status, off] = quicDecode(data, off);
-  let hdrLen: number;
-  [hdrLen, off] = quicDecode(data, off);
-  const hdrEnd = off + hdrLen;
-  const headers: Record<string, string> = {};
-  while (off < hdrEnd) {
-    let nLen: number, vLen: number;
-    [nLen, off] = quicDecode(data, off);
-    const name = data.subarray(off, off + nLen).toString();
-    off += nLen;
-    [vLen, off] = quicDecode(data, off);
-    headers[name] = data.subarray(off, off + vLen).toString();
-    off += vLen;
+  let status = 0;
+
+  // For 0x03, skip any 1xx informational responses before reading the final status
+  while (true) {
+    [status, off] = quicDecode(data, off);
+    if (framing === 0x01 || status >= 200) break;
+    // Skip indeterminate-length informational field section
+    while (true) {
+      let nLen: number;
+      [nLen, off] = quicDecode(data, off);
+      if (nLen === 0) break;
+      off += nLen;
+      let vLen: number;
+      [vLen, off] = quicDecode(data, off);
+      off += vLen;
+    }
   }
-  off = hdrEnd;
-  let contentLen: number;
-  [contentLen, off] = quicDecode(data, off);
-  return { status, headers, body: data.subarray(off, off + contentLen) };
+
+  const headers: Record<string, string> = {};
+  let body: Buffer;
+
+  if (framing === 0x01) {
+    // Known-length: quic(total_bytes) + field_lines
+    let hdrLen: number;
+    [hdrLen, off] = quicDecode(data, off);
+    const hdrEnd = off + hdrLen;
+    while (off < hdrEnd) {
+      let nLen: number, vLen: number;
+      [nLen, off] = quicDecode(data, off);
+      const name = data.subarray(off, off + nLen).toString();
+      off += nLen;
+      [vLen, off] = quicDecode(data, off);
+      headers[name] = data.subarray(off, off + vLen).toString();
+      off += vLen;
+    }
+    off = hdrEnd;
+    let contentLen: number;
+    [contentLen, off] = quicDecode(data, off);
+    body = data.subarray(off, off + contentLen);
+  } else {
+    // Indeterminate-length: [quic(nlen>0)+name+quic(vlen)+val]* + quic(0)
+    while (true) {
+      let nLen: number;
+      [nLen, off] = quicDecode(data, off);
+      if (nLen === 0) break;
+      const name = data.subarray(off, off + nLen).toString();
+      off += nLen;
+      let vLen: number;
+      [vLen, off] = quicDecode(data, off);
+      headers[name] = data.subarray(off, off + vLen).toString();
+      off += vLen;
+    }
+    // Indeterminate-length body: [quic(chunk_len>0) + chunk]* + quic(0)
+    const parts: Buffer[] = [];
+    while (true) {
+      let chunkLen: number;
+      [chunkLen, off] = quicDecode(data, off);
+      if (chunkLen === 0) break;
+      parts.push(data.subarray(off, off + chunkLen));
+      off += chunkLen;
+    }
+    body = Buffer.concat(parts);
+  }
+
+  return { status, headers, body };
 }
 
 // ─── AES-128-GCM ──────────────────────────────────────────────────────────────
 
-function aesgcmEncrypt(key: Buffer, nonce: Buffer, plaintext: Buffer): Buffer {
+function aesgcmEncrypt(key: Buffer, nonce: Buffer, plaintext: Buffer, aad?: Buffer): Buffer {
   const cipher = crypto.createCipheriv('aes-128-gcm', key, nonce);
+  if (aad && aad.length > 0) cipher.setAAD(aad);
   const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   return Buffer.concat([ct, cipher.getAuthTag()]);
 }
 
-function aesgcmDecrypt(key: Buffer, nonce: Buffer, ciphertextWithTag: Buffer): Buffer {
+function aesgcmDecrypt(key: Buffer, nonce: Buffer, ciphertextWithTag: Buffer, aad?: Buffer): Buffer {
   const tag = ciphertextWithTag.subarray(ciphertextWithTag.length - 16);
   const ct  = ciphertextWithTag.subarray(0, ciphertextWithTag.length - 16);
   const decipher = crypto.createDecipheriv('aes-128-gcm', key, nonce);
   decipher.setAuthTag(tag);
+  if (aad && aad.length > 0) decipher.setAAD(aad);
   return Buffer.concat([decipher.update(ct), decipher.final()]);
+}
+
+// ─── Chunked OHTTP helpers ────────────────────────────────────────────────────
+
+const MAX_CHUNK_PLAINTEXT = 1 << 14; // 16 384 bytes (ohttp 0.7.2 stream.rs)
+
+function computeNonce(baseNonce: Buffer, seq: number): Buffer {
+  // RFC 9180 §5.2: base_nonce XOR I2OSP(seq, Nn=12)
+  const nonce = Buffer.from(baseNonce);
+  // XOR last 8 bytes (seq is u64, first 4 bytes of I2OSP(seq,12) are always 0)
+  const hi = Math.floor(seq / 0x100000000);
+  const lo = seq >>> 0;
+  nonce[4]  ^= (hi >>> 24) & 0xff;
+  nonce[5]  ^= (hi >>> 16) & 0xff;
+  nonce[6]  ^= (hi >>>  8) & 0xff;
+  nonce[7]  ^= hi & 0xff;
+  nonce[8]  ^= (lo >>> 24) & 0xff;
+  nonce[9]  ^= (lo >>> 16) & 0xff;
+  nonce[10] ^= (lo >>>  8) & 0xff;
+  nonce[11] ^= lo & 0xff;
+  return nonce;
 }
 
 // ─── HPKE sender setup (RFC 9180, base mode, DHKEM-X25519) ───────────────────
@@ -305,6 +375,76 @@ function ohttpEncapsulate(keyConfig: Buffer, bhttpRequest: Buffer): [Buffer, Oht
   ];
 }
 
+function ohttpEncapsulateChunked(keyConfig: Buffer, bhttpRequest: Buffer): [Buffer, OhttpState] {
+  const keyId    = keyConfig[0];
+  const kemId    = keyConfig.readUInt16BE(1);
+  const serverPk = keyConfig.subarray(3, 35);
+  const kdfId    = keyConfig.readUInt16BE(37);
+  const aeadId   = keyConfig.readUInt16BE(39);
+
+  const headerBuf = Buffer.alloc(7);
+  headerBuf[0] = keyId;
+  headerBuf.writeUInt16BE(kemId,  1);
+  headerBuf.writeUInt16BE(kdfId,  3);
+  headerBuf.writeUInt16BE(aeadId, 5);
+  const info = Buffer.concat([Buffer.from('message/bhttp chunked request\x00'), headerBuf]);
+
+  const ctx = hpkeSetupSender(serverPk, kemId, kdfId, aeadId, info);
+  const parts: Buffer[] = [headerBuf, ctx.enc];
+
+  // Non-final chunks (AAD = b"")
+  let seq = 0;
+  let offset = 0;
+  while (offset < bhttpRequest.length) {
+    const chunk = bhttpRequest.subarray(offset, offset + MAX_CHUNK_PLAINTEXT);
+    offset += chunk.length;
+    const ct = aesgcmEncrypt(ctx.key, computeNonce(ctx.baseNonce, seq), chunk);
+    seq++;
+    parts.push(quicEncode(ct.length), ct);
+  }
+
+  // Final chunk: seal(b"final", b"") = 16-byte GCM tag
+  const finalCt = aesgcmEncrypt(ctx.key, computeNonce(ctx.baseNonce, seq), Buffer.alloc(0), Buffer.from('final'));
+  parts.push(quicEncode(0), finalCt);
+
+  return [
+    Buffer.concat(parts),
+    { enc: ctx.enc, exporterSecret: ctx.exporterSecret, hpkeSuiteId: ctx.hpkeSuiteId, Nk: 16, Nn: 12 },
+  ];
+}
+
+function ohttpDecapsulateResponseChunked(data: Buffer, state: OhttpState): Buffer {
+  const Nmax = Math.max(state.Nk, state.Nn);
+  const responseNonce = data.subarray(0, Nmax);
+  let pos = Nmax;
+
+  // HPKE Export with chunked response label, then make_aead via plain HKDF
+  const secret = labeledExpand(
+    state.hpkeSuiteId, 'sec', state.exporterSecret,
+    Buffer.from('message/bhttp chunked response'), Nmax,
+  );
+  const prk        = hkdfExtract(Buffer.concat([state.enc, responseNonce]), secret);
+  const keyR       = hkdfExpand(prk, Buffer.from('key'),   state.Nk);
+  const nonceBaseR = hkdfExpand(prk, Buffer.from('nonce'), state.Nn);
+
+  const parts: Buffer[] = [];
+  let seq = 0;
+  while (pos < data.length) {
+    let ctLen: number;
+    [ctLen, pos] = quicDecode(data, pos);
+    if (ctLen === 0) {
+      // Final chunk — remaining bytes = 16-byte GCM tag of empty plaintext
+      aesgcmDecrypt(keyR, computeNonce(nonceBaseR, seq), data.subarray(pos), Buffer.from('final'));
+      break;
+    }
+    const ct = data.subarray(pos, pos + ctLen);
+    pos += ctLen;
+    parts.push(aesgcmDecrypt(keyR, computeNonce(nonceBaseR, seq), ct));
+    seq++;
+  }
+  return Buffer.concat(parts);
+}
+
 function ohttpDecapsulateResponse(encResponse: Buffer, state: OhttpState): Buffer {
   const Nmax = Math.max(state.Nk, state.Nn);
   const responseNonce = encResponse.subarray(0, Nmax);
@@ -372,6 +512,29 @@ class OhttpClient {
       throw new Error(`Expected message/ohttp-res, got ${respHdrs['content-type']}`);
     }
     return bhttpDecodeResponse(ohttpDecapsulateResponse(data, state));
+  }
+
+  async requestChunked(
+    method: string,
+    path: string,
+    headers: Array<[string, string]>,
+    body: Buffer | string,
+  ): Promise<BhttpResponse> {
+    const kc = await this.getKeyConfig();
+    const authority = this.baseUrl.replace(/^https?:\/\//, '');
+    const bhttp = bhttpEncodeRequest(method, 'https', authority, path, headers, body);
+    const [encReq, state] = ohttpEncapsulateChunked(kc, bhttp);
+
+    const { status, data, headers: respHdrs } = await httpRequest(
+      `${this.baseUrl}/ohttp`,
+      { method: 'POST', headers: { 'content-type': 'message/ohttp-chunked-req', 'content-length': String(encReq.length) } },
+      encReq,
+    );
+    if (status !== 200) throw new Error(`OHTTP transport error: ${status} ${data.toString().slice(0, 200)}`);
+    if (respHdrs['content-type'] !== 'message/ohttp-chunked-res') {
+      throw new Error(`Expected message/ohttp-chunked-res, got ${respHdrs['content-type']}`);
+    }
+    return bhttpDecodeResponse(ohttpDecapsulateResponseChunked(data, state));
   }
 
   async chat(payload: object, extraHeaders?: Array<[string, string]>): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -550,6 +713,28 @@ async function exampleToolCallsStreaming(client: OhttpClient, model: string): Pr
   console.log('  PASS ✓');
 }
 
+async function exampleChunked(client: OhttpClient, model: string): Promise<void> {
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`Example 6: Chunked OHTTP (message/ohttp-chunked-req)  (model=${model})`);
+  console.log('='.repeat(60));
+  console.log('  Sends the request as counter-nonce AEAD chunks (the format');
+  console.log('  required for true server-side streaming responses).');
+  const resp = await client.requestChunked(
+    'POST', '/v1/chat/completions',
+    [['authorization', `Bearer ${client.apiKey}`], ['content-type', 'application/json']],
+    JSON.stringify({
+      model, stream: false, max_tokens: 15,
+      messages: [{ role: 'user', content: 'Reply with exactly: chunked OK' }],
+    }),
+  );
+  const body = JSON.parse(resp.body.toString()) as Record<string, unknown>;
+  const choices = body['choices'] as Array<Record<string, unknown>>;
+  const content = (choices[0]['message'] as Record<string, unknown>)['content'];
+  console.log(`  Status:   ${resp.status}`);
+  console.log(`  Response: ${JSON.stringify(content)}`);
+  console.log('  PASS ✓');
+}
+
 async function exampleMultiTurn(client: OhttpClient, model: string): Promise<void> {
   console.log(`\n${'='.repeat(60)}`);
   console.log(`Example 5: Multi-turn conversation  (model=${model})`);
@@ -593,6 +778,7 @@ async function main(): Promise<void> {
   await exampleToolCalls(client, model);
   await exampleToolCallsStreaming(client, model);
   await exampleMultiTurn(client, model);
+  await exampleChunked(client, model);
 
   console.log(`\n${'='.repeat(60)}`);
   console.log('All OHTTP examples PASSED');
