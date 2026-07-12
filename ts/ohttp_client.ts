@@ -70,7 +70,7 @@ function hkdfExtract(salt: Buffer, ikm: Buffer): Buffer {
 
 function hkdfExpand(prk: Buffer, info: Buffer, length: number): Buffer {
   const out = Buffer.alloc(length);
-  let prev = Buffer.alloc(0);
+  let prev: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   let offset = 0;
   for (let counter = 1; offset < length; counter++) {
     const hmac = crypto.createHmac('sha256', prk);
