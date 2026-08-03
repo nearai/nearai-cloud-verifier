@@ -32,7 +32,8 @@ def fetch_report(model, nonce, signing_algo="ecdsa", include_tls=False, signing_
         url += "&include_tls_fingerprint=true"
     if signing_address:
         url += f"&signing_address={signing_address}"
-    return requests.get(url, timeout=30).json()
+    headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+    return requests.get(url, headers=headers, timeout=30).json()
 
 def fetch_nvidia_verification(payload):
     """Submit GPU evidence to NVIDIA NRAS for verification."""

@@ -14,6 +14,7 @@ pnpm install
 ### Model Verification
 
 ```bash
+export API_KEY=sk-your-api-key-here
 pnpm run model -- --model deepseek-ai/DeepSeek-V3.1
 pnpm run model -- --model deepseek-ai/DeepSeek-V3.1 --verify-tls
 ```
