@@ -12,7 +12,7 @@
     "domain": "tsx ts/domain_verifier.ts",
     "tls": "tsx ts/tls_verifier.ts",
     "ohttp": "tsx ts/ohttp_client.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "tsx --test ts/*.test.ts"
   },
   "dependencies": {
     "@phala/dcap-qvl-node": "^0.3.3",
