@@ -189,7 +189,7 @@ pnpm run model -- [--model MODEL_NAME]
 
 **Default model**: `deepseek-ai/DeepSeek-V3.1`
 
-The verifier fetches attestations from the `/v1/attestation/report` endpoint. No API key is required for this endpoint.
+The verifier fetches attestations from the `/v1/attestation/report` endpoint. Requests through the default Cloud API gateway require `API_KEY`; direct model endpoints remain keyless.
 
 ### Example Output for Gateway Attestation
 

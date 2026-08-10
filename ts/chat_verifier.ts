@@ -117,7 +117,8 @@ function recoverSigner(text: string, signature: string): string {
 async function fetchAttestationFor(signingAddress: string, model: string): Promise<[AttestationReport, string]> {
   const nonce = crypto.randomBytes(32).toString('hex');
   const url = `${BASE_URL}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=ecdsa&signing_address=${encodeURIComponent(signingAddress)}`;
-  const report = await makeRequest(url);
+  const headers = { Authorization: `Bearer ${API_KEY}` };
+  const report = await makeRequest(url, { headers });
 
   let attestation: AttestationReport;
   if (report.model_attestations) {

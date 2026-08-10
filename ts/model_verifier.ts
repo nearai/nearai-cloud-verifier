@@ -13,6 +13,7 @@ import {
 } from "@phala/dcap-qvl-node";
 
 const API_BASE = process.env.BASE_URL || "https://cloud-api.near.ai";
+const API_KEY = process.env.API_KEY || "";
 const GPU_VERIFIER_API = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 const SIGSTORE_SEARCH_BASE = "https://search.sigstore.dev/?hash=";
 
@@ -202,7 +203,8 @@ async function fetchReport(
   if (signingAddress) {
     url += `&signing_address=${encodeURIComponent(signingAddress)}`;
   }
-  return await makeRequest(url);
+  const headers = API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {};
+  return await makeRequest(url, { headers });
 }
 
 /**
