@@ -1,179 +1,48 @@
 #!/usr/bin/env node
 /**
- * TypeScript implementation of NEAR AI Cloud TEE Attestation Verifier
- * Straightforward walkthrough for checking a NEAR AI Cloud attestation.
+ * A readable, independent verifier for NEAR AI Cloud attestations.
+ *
+ * This file intentionally does not depend on the SDK. It shows the checks a
+ * client performs against the public Cloud API response: quote verification,
+ * nonce and signer binding, measured deployment, and optional GPU evidence.
  */
 
-import * as crypto from 'crypto';
 import { Buffer } from 'buffer';
+import * as crypto from 'crypto';
+import * as https from 'https';
+import * as tls from 'tls';
+import { URL } from 'url';
+import { js_get_collateral, js_verify } from '@phala/dcap-qvl-node';
 
-import {
-  js_verify,
-  js_get_collateral,
-} from "@phala/dcap-qvl-node";
+const GPU_VERIFIER_API = 'https://nras.attestation.nvidia.com/v3/attest/gpu';
+const SIGSTORE_SEARCH_BASE = 'https://search.sigstore.dev/?hash=';
+const INTEL_PCCS_URL =
+  'https://api.trustedservices.intel.com/tdx/certification/v4';
+const DSTACK_RUNTIME_EVENT_TYPE = 0x08000001;
 
-const API_BASE = process.env.BASE_URL || "https://cloud-api.near.ai";
-const API_KEY = process.env.API_KEY || "";
-const GPU_VERIFIER_API = "https://nras.attestation.nvidia.com/v3/attest/gpu";
-const SIGSTORE_SEARCH_BASE = "https://search.sigstore.dev/?hash=";
+export type SigningAlgo = 'ecdsa' | 'ed25519';
 
-interface AttestationBaseInfo {
+export interface AttestationBaseInfo {
   intel_quote: string;
   signing_address: string;
   signing_algo: string;
-  // Optional: gateway attestations may omit GPU evidence entirely.
-  nvidia_payload?: string;
-  tls_cert_fingerprint?: string;
-  info: {
-    tcb_info: string | {
-      app_compose: string;
-    };
-  };
-}
-
-interface AttestationReport extends AttestationBaseInfo {
+  event_log?: string | unknown[];
+  report_data?: string;
+  request_nonce?: string;
+  nvidia_payload?: string | null;
+  tls_cert_fingerprint?: string | null;
   model_name?: string;
-  model_attestations?: AttestationReport[];
-  gateway_attestation?: AttestationReport;
-}
-
-interface IntelResult {
-  quote: {
-    body: {
-      reportdata: string;
-      mrconfig: string;
-    };
-    verified: boolean;
-    message?: string;
+  info: {
+    tcb_info?:
+      | string
+      | {
+          app_compose?: string;
+        };
   };
-  message?: string;
 }
 
-interface NvidiaPayload {
-  nonce: string;
-}
+export interface AttestationReport extends AttestationBaseInfo {}
 
-interface NvidiaResponse {
-  x_nvidia_overall_att_result: string;
-}
-
-interface ReportDataResult {
-  binds_address: boolean;
-  embeds_nonce: boolean;
-}
-
-interface GpuResult {
-  nonce_matches: boolean;
-  verdict: string;
-}
-
-interface ComposeManagerResult {
-  actions_hash_valid: boolean;
-}
-
-function canonicalizeJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return '[' + value.map(canonicalizeJson).join(',') + ']';
-  }
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalizeJson(obj[k])).join(',') + '}';
-}
-
-function checkComposeManagerActions(report: Record<string, unknown>): ComposeManagerResult | void {
-  const cm = report.compose_manager_attestation;
-  if (!cm) {
-    console.log('\n⚠️  No compose_manager_attestation in report; skipping actions hash check');
-    return;
-  }
-
-  console.log('\n🔐 Compose-manager actions hash');
-
-  let cmObj: Record<string, unknown>;
-  try {
-    cmObj = typeof cm === 'string' ? JSON.parse(cm) : cm as Record<string, unknown>;
-  } catch (e) {
-    console.log('  could not parse compose_manager_attestation:', (e as Error).message);
-    return { actions_hash_valid: false };
-  }
-
-  const actions = cmObj.actions;
-  const actionsHash = cmObj.actions_hash;
-  if (actions === undefined || actionsHash === undefined) {
-    console.log('  compose_manager_attestation present but missing actions/actions_hash — skipping');
-    return;
-  }
-
-  const canonical = canonicalizeJson(actions);
-  const computed = crypto.createHash('sha256').update(canonical).digest('hex');
-
-  const matches = computed === actionsHash;
-  console.log('  actions_hash matches SHA-256(canonicalize(actions)):', matches);
-  if (!matches) {
-    console.log('    expected:', computed);
-    console.log('    actual:  ', actionsHash);
-  }
-
-  // Self-consistency check: actions_hash should match report_data[:32] from
-  // compose-manager's response. NOT hardware-bound (quote not verified here).
-  const cmReportData = cmObj.report_data as string | undefined;
-  if (cmReportData) {
-    const hex = cmReportData.replace(/^0x/i, '');
-    if (/^[0-9a-fA-F]*$/.test(hex) && hex.length >= 64) {
-      const reportDataBytes = Buffer.from(hex, 'hex');
-      const rdActionsHash = reportDataBytes.subarray(0, 32).toString('hex');
-      const bindsReportData = rdActionsHash === actionsHash;
-      console.log('  actions_hash matches compose-manager report_data[:32] (unverified quote):', bindsReportData);
-      if (!bindsReportData) {
-        console.log('    expected:', rdActionsHash);
-        console.log('    actual:  ', actionsHash);
-      }
-    } else {
-      console.log('  could not decode compose-manager report_data: invalid hex');
-    }
-  }
-
-  return { actions_hash_valid: matches };
-}
-
-/**
- * Make HTTP request and return JSON response
- */
-async function makeRequest(url: string, options: any = {}): Promise<any> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), options.timeout || 30000);
-
-  try {
-    const response = await fetch(url, {
-      method: options.method || 'GET',
-      headers: {
-        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-        ...(options.headers || {}),
-      },
-      body: options.body ? (typeof options.body === 'string' ? options.body : JSON.stringify(options.body)) : undefined,
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    return await response.json();
-  } catch (error) {
-    clearTimeout(timeoutId);
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('Request timeout');
-    }
-    throw error;
-  }
-}
-
-/** Full API response including gateway_attestation, model_attestations, tls_certificate */
 export interface AttestationApiReport {
   gateway_attestation?: AttestationReport;
   model_attestations?: AttestationReport[];
@@ -181,462 +50,1026 @@ export interface AttestationApiReport {
   [key: string]: unknown;
 }
 
-/**
- * Fetch attestation report from the API.
- * @param model - Model name (query param)
- * @param nonce - Request nonce hex (query param)
- * @param signingAlgo - Signing algorithm, default 'ecdsa'
- * @param includeTls - If true, appends include_tls_fingerprint=true (response includes tls_cert_fingerprint in gateway_attestation and tls_certificate)
- * @param signingAddress - Optional; when set, narrows gateway quote to this signer
- */
-async function fetchReport(
-  model: string,
-  nonce: string,
-  signingAlgo: string = 'ecdsa',
-  includeTls: boolean = false,
-  signingAddress?: string,
-): Promise<AttestationApiReport> {
-  let url = `${API_BASE}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=${signingAlgo}`;
-  if (includeTls) {
-    url += '&include_tls_fingerprint=true';
-  }
-  if (signingAddress) {
-    url += `&signing_address=${encodeURIComponent(signingAddress)}`;
-  }
-  const headers = API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {};
-  return await makeRequest(url, { headers });
+export interface IntelResult {
+  quote: {
+    body: {
+      reportdata: string;
+      mrconfig: string;
+      rtmr3: string;
+      tdattributes: string;
+    };
+    verified: true;
+    status: string;
+    advisory_ids: string[];
+    debug_enabled: boolean;
+    message?: string;
+  };
+  message?: string;
 }
 
-/**
- * Submit GPU evidence to NVIDIA NRAS for verification
- */
-async function fetchNvidiaVerification(payload: NvidiaPayload): Promise<any> {
-  const res = await fetch(GPU_VERIFIER_API, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`NRAS ${res.status}: ${text}`);
-  }
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
+export interface ReportDataResult {
+  binds_address: true;
+  embeds_nonce: true;
+  tls_fingerprint_bound: boolean;
 }
 
-/**
- * Decode the payload section of a JWT token
- */
-function base64urlDecodeJwtPayload(jwtToken: string): string {
-  const payloadB64 = jwtToken.split('.')[1];
-  const padded = payloadB64 + '='.repeat((4 - payloadB64.length % 4) % 4);
-  return Buffer.from(padded, 'base64url').toString('utf-8');
+export interface GpuResult {
+  status: 'not_provided' | 'verified';
+  verdict?: 'PASS';
 }
 
-/** report_data from intel quote body (hex string → Buffer) */
-function reportDataBufferFromIntel(intelResult: IntelResult): Buffer {
-  const hex = intelResult.quote.body.reportdata.replace(/^0x/i, '');
-  return Buffer.from(hex, 'hex');
+export interface FetchModelAttestationParams {
+  model: string;
+  nonce: string;
+  signingAlgo: SigningAlgo;
+  signingAddress: string;
 }
 
-/** Signing address as 32-byte buffer (right-padded with zeros), per algo */
-function signingAddressPadded32(signingAddress: string, signingAlgo: string): Buffer {
-  const algo = signingAlgo.toLowerCase();
-  const addrHex = algo === 'ecdsa' ? signingAddress.replace(/^0x/i, '') : signingAddress;
-  const signingAddressBytes = Buffer.from(addrHex, 'hex');
-  if (signingAddressBytes.length > 32) {
-    throw new Error(
-      `Signing address is too long: expected at most 32 bytes, got ${signingAddressBytes.length}`,
-    );
-  }
-  return Buffer.concat([signingAddressBytes, Buffer.alloc(32 - signingAddressBytes.length, 0)]);
+export interface FetchModelAttestationsParams {
+  model: string;
+  nonce: string;
+  signingAlgo?: SigningAlgo;
 }
 
-/**
- * Verify that TDX report data binds the signing address and request nonce.
- *
- * When attestation contains tls_cert_fingerprint (include_tls_fingerprint mode),
- * report_data[0..32] = SHA256(signing_address_bytes || fingerprint_bytes) and
- * report_data[32..64] = raw nonce.
- * Otherwise, report_data[0..32] = padded signing address and
- * report_data[32..64] = raw nonce.
- */
-function checkReportData(
-  attestation: AttestationReport,
-  requestNonce: string,
-  intelResult: IntelResult,
-): ReportDataResult {
-  const reportData = reportDataBufferFromIntel(intelResult);
-  const signingAlgo = (attestation.signing_algo || 'ecdsa').toLowerCase();
-
-  const embeddedFirst32 = reportData.subarray(0, 32);
-  const embeddedSecond32 = reportData.subarray(32, Math.min(64, reportData.length));
-
-  const tlsCertFingerprint = attestation.tls_cert_fingerprint;
-  let bindsAddress: boolean;
-
-  if (tlsCertFingerprint) {
-    // TLS binding mode: report_data[0..32] = SHA256(signing_address || fingerprint)
-    const addrHex = signingAlgo === 'ecdsa'
-      ? attestation.signing_address.replace(/^0x/i, '')
-      : attestation.signing_address;
-    const signingAddrBytes = Buffer.from(addrHex, 'hex');
-    const fpBytes = Buffer.from(tlsCertFingerprint, 'hex');
-    const expectedFirst32 = crypto.createHash('sha256').update(signingAddrBytes).update(fpBytes).digest();
-    bindsAddress = embeddedFirst32.equals(expectedFirst32);
-
-    console.log('Signing algorithm:', signingAlgo);
-    console.log('Report data binds signing address + TLS fingerprint:', bindsAddress);
-    if (!bindsAddress) {
-      console.log('  expected:', expectedFirst32.toString('hex'));
-      console.log('  actual:  ', embeddedFirst32.toString('hex'));
-    }
-  } else {
-    // Standard mode: report_data[0..32] = padded signing address
-    const expectedAddress = signingAddressPadded32(attestation.signing_address, signingAlgo);
-    bindsAddress = embeddedFirst32.equals(expectedAddress);
-
-    console.log('Signing algorithm:', signingAlgo);
-    console.log('Report data binds signing address:', bindsAddress);
-    if (!bindsAddress) {
-      console.log('  expected:', expectedAddress.toString('hex'), 'actual:', embeddedFirst32.toString('hex'));
-    }
-  }
-
-  // Nonce is always raw in second 32 bytes
-  const rawNonceBytes = Buffer.from(requestNonce, 'hex');
-  const embedsNonce = rawNonceBytes.length === 32 && embeddedSecond32.length === 32 && embeddedSecond32.equals(rawNonceBytes);
-  console.log('Report data embeds request nonce:', embedsNonce);
-  if (!embedsNonce) {
-    console.log('  expected:', requestNonce);
-    console.log('  actual:  ', embeddedSecond32.toString('hex'));
-  }
-
-  return { binds_address: bindsAddress, embeds_nonce: embedsNonce };
+export interface FetchGatewayAttestationParams {
+  nonce: string;
+  signingAlgo?: SigningAlgo;
 }
 
-/**
- * Verify GPU attestation evidence via NVIDIA NRAS
- */
-async function checkGpu(attestation: AttestationReport, requestNonce: string): Promise<GpuResult> {
-  if (!attestation.nvidia_payload) {
-    throw new Error('GPU verification requested but attestation has no nvidia_payload.');
-  }
-  const payload: NvidiaPayload = JSON.parse(attestation.nvidia_payload);
+export interface FetchedGatewayAttestation {
+  attestation: AttestationReport;
+  peerSpkiFingerprint?: string;
+}
 
-  // Verify GPU uses the same request_nonce
-  const nonceMatches = payload.nonce.toLowerCase() === requestNonce.toLowerCase();
-  console.log('GPU payload nonce matches request_nonce:', nonceMatches);
+export interface CheckReportDataParams {
+  attestation: AttestationReport;
+  requestNonce: string;
+  intelResult: IntelResult;
+  requireTlsFingerprint?: boolean;
+}
 
-  const body = await fetchNvidiaVerification(payload);
-  const jwtToken = body[0][1];
-  const verdict = JSON.parse(base64urlDecodeJwtPayload(jwtToken))['x-nvidia-overall-att-result'];
-  console.log('NVIDIA attestation verdict:', verdict);
+export interface CheckGpuParams {
+  attestation: AttestationReport;
+  requestNonce: string;
+}
 
+export interface VerifyAttestationParams {
+  attestation: AttestationReport;
+  requestNonce: string;
+  kind: 'model' | 'gateway';
+  peerSpkiFingerprint?: string;
+}
+
+export interface VerifyGatewayTlsBindingParams {
+  nonce?: string;
+  signingAlgo?: SigningAlgo;
+}
+
+type JsonRecord = Record<string, unknown>;
+
+type EventLogEntry = {
+  digest: string;
+  event: string;
+  event_payload: string;
+  event_type: number;
+  imr: number;
+};
+
+function cloudApiBaseUrl(): string {
+  return process.env.BASE_URL || 'https://cloud-api.near.ai';
+}
+
+function cloudApiHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const apiKey = process.env.API_KEY;
   return {
-    nonce_matches: nonceMatches,
-    verdict: verdict
+    'Accept-Encoding': 'identity',
+    ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+    ...extra,
   };
 }
 
-async function checkTdxQuote(attestation: AttestationBaseInfo): Promise<IntelResult> {
+function attestationReportUrl(query: Record<string, string>): URL {
+  const url = new URL('/v1/attestation/report', cloudApiBaseUrl());
+  for (const [name, value] of Object.entries(query)) {
+    url.searchParams.set(name, value);
+  }
+  return url;
+}
+
+function asRecord(value: unknown, label: string): JsonRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be a JSON object`);
+  }
+  return value as JsonRecord;
+}
+
+function requireString(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`${label} must be a non-empty string`);
+  }
+  return value;
+}
+
+function normalizeSigningAlgo(value: string): SigningAlgo {
+  const normalized = value.toLowerCase();
+  if (normalized === 'ecdsa' || normalized === 'ed25519') {
+    return normalized;
+  }
+  throw new Error(
+    `Unsupported signing algorithm ${JSON.stringify(value)}; expected ecdsa or ed25519`,
+  );
+}
+
+function stripHexPrefix(value: string): string {
+  return value.startsWith('0x') || value.startsWith('0X')
+    ? value.slice(2)
+    : value;
+}
+
+function hexBytes(value: string, label: string): Buffer {
+  const normalized = stripHexPrefix(value);
+  if (
+    normalized.length === 0 ||
+    normalized.length % 2 !== 0 ||
+    !/^[0-9a-fA-F]+$/.test(normalized)
+  ) {
+    throw new Error(`${label} must be hexadecimal bytes`);
+  }
+  return Buffer.from(normalized, 'hex');
+}
+
+function hexBytesOfLength(value: string, byteLength: number, label: string): Buffer {
+  const bytes = hexBytes(value, label);
+  if (bytes.length !== byteLength) {
+    throw new Error(`${label} must be ${byteLength} bytes, got ${bytes.length}`);
+  }
+  return bytes;
+}
+
+function signingAddressBytes(
+  signingAddress: string,
+  signingAlgo: SigningAlgo,
+): Buffer {
+  const expectedLength = signingAlgo === 'ecdsa' ? 20 : 32;
+  return hexBytesOfLength(signingAddress, expectedLength, 'signing_address');
+}
+
+function paddedSigningAddress(
+  signingAddress: string,
+  signingAlgo: SigningAlgo,
+): Buffer {
+  const address = signingAddressBytes(signingAddress, signingAlgo);
+  return Buffer.concat([address, Buffer.alloc(32 - address.length)]);
+}
+
+async function requestJson(
+  url: URL,
+  headers: Record<string, string>,
+): Promise<unknown> {
+  const response = await fetch(url, { headers });
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`Cloud API returned HTTP ${response.status}: ${body}`);
+  }
   try {
-    const rawQuote = Buffer.from(attestation.intel_quote, 'hex');
-    const now = BigInt(Math.floor(Date.now() / 1000));
-    const pccsUrl = "https://api.trustedservices.intel.com/tdx/certification/v4";
-    const quoteCollateral = await js_get_collateral(pccsUrl, rawQuote);
-    const rawResult: any = js_verify(rawQuote, quoteCollateral, now);
+    return JSON.parse(body);
+  } catch (cause) {
+    throw new Error(
+      `Cloud API returned invalid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+  }
+}
 
-    // Log full raw result similar to Python's to_json()
-    try {
-      console.log("TDX quote verification result:", JSON.stringify(rawResult, null, 2));
-    } catch (_) {
-      console.log("TDX quote verification result:", rawResult);
-    }
+/**
+ * Fetch JSON and, for HTTPS, capture the SPKI fingerprint of the TLS peer that
+ * served that exact response. Browsers do not expose peer certificates to
+ * JavaScript, so this is deliberately a Node-only helper.
+ */
+function requestJsonWithPeerSpki(
+  url: URL,
+  headers: Record<string, string>,
+): Promise<{ body: unknown; peerSpkiFingerprint?: string }> {
+  if (url.protocol !== 'https:') {
+    return requestJson(url, headers).then((body) => ({ body }));
+  }
 
-    // Extract report_data and mr_config_id if present (Python parity)
-    const td10 = rawResult && rawResult.report && rawResult.report.TD10 ? rawResult.report.TD10 : {};
-    const reportData: string = td10.report_data || '';
-    const mrConfig: string = td10.mr_config_id || '';
-
-    // TDX status: UpToDate is ideal; OutOfDate still has valid quote crypto—do not fail verification
-    const TDX_STATUS_OK = new Set(['UpToDate', 'OutOfDate']);
-    const status: string | undefined = typeof rawResult?.status === 'string' ? rawResult.status : undefined;
-    const verifiedFromStatus = status ? TDX_STATUS_OK.has(status) : undefined;
-    const verified = verifiedFromStatus ?? Boolean(rawResult?.quote?.verified);
-    if (status === 'OutOfDate') {
-      // Quote still verifies; Intel marks OutOfDate when platform TCB is below
-      // current advisory baseline—not a cryptographic failure.
-      console.log('Intel TDX quote status: OutOfDate');
-    }
-
-    const mapped: IntelResult = {
-      quote: {
-        body: {
-          reportdata: reportData,
-          mrconfig: mrConfig,
-        },
-        verified,
-        message: rawResult?.message,
+  return new Promise((resolve, reject) => {
+    const request = https.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || 443,
+        path: `${url.pathname}${url.search}`,
+        method: 'GET',
+        headers,
+        timeout: 30_000,
       },
-      message: rawResult?.message,
-    };
+      (response) => {
+        let peerSpkiFingerprint: string | undefined;
+        try {
+          const socket = response.socket as tls.TLSSocket;
+          const certificate = socket.getPeerX509Certificate();
+          if (certificate) {
+            const spkiDer = certificate.publicKey.export({
+              type: 'spki',
+              format: 'der',
+            });
+            peerSpkiFingerprint = crypto
+              .createHash('sha256')
+              .update(spkiDer)
+              .digest('hex');
+          }
+        } catch (cause) {
+          reject(
+            new Error(
+              `Could not read the TLS peer certificate: ${cause instanceof Error ? cause.message : String(cause)}`,
+            ),
+          );
+          response.resume();
+          return;
+        }
 
-    console.log('Intel TDX quote verified:', mapped.quote.verified);
-    if (mapped.message) {
-      console.log('Intel TDX verifier message:', mapped.message);
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+        response.on('error', reject);
+        response.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          if ((response.statusCode ?? 500) < 200 || (response.statusCode ?? 500) >= 300) {
+            reject(new Error(`Cloud API returned HTTP ${response.statusCode}: ${text}`));
+            return;
+          }
+          try {
+            resolve({ body: JSON.parse(text), peerSpkiFingerprint });
+          } catch (cause) {
+            reject(
+              new Error(
+                `Cloud API returned invalid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+              ),
+            );
+          }
+        });
+      },
+    );
+    request.on('error', reject);
+    request.on('timeout', () => {
+      request.destroy(new Error('Cloud API request timed out'));
+    });
+    request.end();
+  });
+}
+
+function parseAttestation(value: unknown, label: string): AttestationReport {
+  const record = asRecord(value, label);
+  const info = asRecord(record.info, `${label}.info`);
+  if (
+    record.nvidia_payload !== undefined &&
+    record.nvidia_payload !== null &&
+    typeof record.nvidia_payload !== 'string'
+  ) {
+    throw new Error(`${label}.nvidia_payload must be a string or null`);
+  }
+  if (
+    record.tls_cert_fingerprint !== undefined &&
+    record.tls_cert_fingerprint !== null &&
+    typeof record.tls_cert_fingerprint !== 'string'
+  ) {
+    throw new Error(`${label}.tls_cert_fingerprint must be a string or null`);
+  }
+  return {
+    intel_quote: requireString(record.intel_quote, `${label}.intel_quote`),
+    signing_address: requireString(record.signing_address, `${label}.signing_address`),
+    signing_algo: requireString(record.signing_algo, `${label}.signing_algo`),
+    info: {
+      tcb_info: info.tcb_info as AttestationBaseInfo['info']['tcb_info'],
+    },
+    ...(typeof record.event_log === 'string' || Array.isArray(record.event_log)
+      ? { event_log: record.event_log }
+      : {}),
+    ...(typeof record.report_data === 'string' ? { report_data: record.report_data } : {}),
+    ...(typeof record.request_nonce === 'string'
+      ? { request_nonce: record.request_nonce }
+      : {}),
+    ...(record.nvidia_payload === null || typeof record.nvidia_payload === 'string'
+      ? { nvidia_payload: record.nvidia_payload }
+      : {}),
+    ...(record.tls_cert_fingerprint === null || typeof record.tls_cert_fingerprint === 'string'
+      ? { tls_cert_fingerprint: record.tls_cert_fingerprint }
+      : {}),
+    ...(typeof record.model_name === 'string' ? { model_name: record.model_name } : {}),
+  };
+}
+
+function parseAttestationApiReport(value: unknown): AttestationApiReport {
+  const record = asRecord(value, 'Cloud API attestation response');
+  const report: AttestationApiReport = {};
+  if (record.gateway_attestation !== undefined) {
+    report.gateway_attestation = parseAttestation(
+      record.gateway_attestation,
+      'gateway_attestation',
+    );
+  }
+  if (record.model_attestations !== undefined) {
+    if (!Array.isArray(record.model_attestations)) {
+      throw new Error('model_attestations must be an array when present');
     }
+    report.model_attestations = record.model_attestations.map((item, index) =>
+      parseAttestation(item, `model_attestations[${index}]`),
+    );
+  }
+  if (typeof record.tls_certificate === 'string') {
+    report.tls_certificate = record.tls_certificate;
+  }
+  return report;
+}
 
-    return mapped;
-  } catch (error) {
-    console.error("Verification failed:", error);
-    throw error;
+function assertNonceEcho(attestation: AttestationReport, nonce: string): void {
+  const reportedNonce = hexBytesOfLength(
+    requireString(attestation.request_nonce, 'attestation.request_nonce'),
+    32,
+    'attestation.request_nonce',
+  );
+  const requestedNonce = hexBytesOfLength(nonce, 32, 'requested nonce');
+  const matches = reportedNonce.equals(requestedNonce);
+  console.log('Attestation request_nonce matches requested nonce:', matches);
+  if (!matches) {
+    throw new Error('Cloud API attestation request_nonce does not match the requested nonce');
   }
 }
 
-/**
- * Extract all @sha256:xxx image digests and return Sigstore search links
- */
-function extractSigstoreLinks(compose: string): string[] {
-  if (!compose) {
-    return [];
-  }
-
-  // Match @sha256:hexdigest pattern in Docker compose
-  const pattern = /@sha256:([0-9a-f]{64})/g;
-  const digests: string[] = [];
-  let match;
-
-  while ((match = pattern.exec(compose)) !== null) {
-    digests.push(match[1]);
-  }
-
-  // Deduplicate digests while preserving order
-  const seen = new Set<string>();
-  const uniqueDigests: string[] = [];
-  for (const digest of digests) {
-    if (!seen.has(digest)) {
-      seen.add(digest);
-      uniqueDigests.push(digest);
-    }
-  }
-
-  return uniqueDigests.map(digest => `${SIGSTORE_SEARCH_BASE}sha256:${digest}`);
-}
-
-/**
- * Check that Sigstore links are accessible (not 404)
- */
-async function checkSigstoreLinks(links: string[]): Promise<Array<[string, boolean, number | string]>> {
-  const results: Array<[string, boolean, number | string]> = [];
-  
-  for (const link of links) {
+/** Fetch exactly the NEAR model evidence bound to a completion signature. */
+export async function fetchModelAttestation({
+  model,
+  nonce,
+  signingAlgo,
+  signingAddress,
+}: FetchModelAttestationParams): Promise<AttestationReport> {
+  const report = parseAttestationApiReport(
+    await requestJson(
+      attestationReportUrl({
+        model,
+        nonce,
+        signing_algo: signingAlgo,
+        signing_address: signingAddress,
+        provider: 'near',
+        include_tls_fingerprint: 'false',
+      }),
+      cloudApiHeaders({ 'x-no-aliasing': 'true' }),
+    ),
+  );
+  const candidates = (report.model_attestations ?? []).filter((attestation) => {
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
-      const response = await fetch(link, { method: 'HEAD', redirect: 'follow', signal: controller.signal });
-      clearTimeout(timeoutId);
-      const accessible = response.status < 400;
-      results.push([link, accessible, response.status]);
-    } catch (error) {
-      results.push([link, false, error instanceof Error ? error.message : String(error)]);
+      return (
+        normalizeSigningAlgo(attestation.signing_algo) === signingAlgo &&
+        signingAddressBytes(attestation.signing_address, signingAlgo).equals(
+          signingAddressBytes(signingAddress, signingAlgo),
+        )
+      );
+    } catch {
+      return false;
     }
+  });
+
+  if (candidates.length !== 1) {
+    throw new Error(
+      `Expected exactly one NEAR model attestation for the signature signer; found ${candidates.length}`,
+    );
   }
-  
-  return results;
+  const attestation = candidates[0]!;
+  assertNonceEcho(attestation, nonce);
+  return attestation;
 }
 
-/** Parsed tcb_info object with optional app_compose string (shared by Sigstore + compose display). */
-function parsedTcbInfo(attestation: AttestationBaseInfo): Record<string, unknown> | null {
-  const raw = attestation.info?.tcb_info;
-  if (raw == null) return null;
-  return typeof raw === 'string' ? (JSON.parse(raw) as Record<string, unknown>) : (raw as Record<string, unknown>);
+/**
+ * Fetch every NEAR model evidence item Cloud API returns for a model audit.
+ * This does not connect an attestation to a particular completion signature.
+ */
+export async function fetchModelAttestations({
+  model,
+  nonce,
+  signingAlgo,
+}: FetchModelAttestationsParams): Promise<AttestationReport[]> {
+  const query: Record<string, string> = {
+    model,
+    nonce,
+    provider: 'near',
+    include_tls_fingerprint: 'false',
+  };
+  if (signingAlgo !== undefined) query.signing_algo = signingAlgo;
+  const report = parseAttestationApiReport(
+    await requestJson(
+      attestationReportUrl(query),
+      cloudApiHeaders({ 'x-no-aliasing': 'true' }),
+    ),
+  );
+  const attestations = report.model_attestations ?? [];
+  if (attestations.length === 0) {
+    throw new Error('Cloud API response does not contain model_attestations');
+  }
+  for (const attestation of attestations) {
+    assertNonceEcho(attestation, nonce);
+  }
+  return attestations;
 }
 
-async function showSigstoreProvenance(attestation: AttestationBaseInfo): Promise<void> {
-  const tcbInfo = parsedTcbInfo(attestation);
-  if (!tcbInfo) return;
-  const compose = tcbInfo.app_compose as string | undefined;
-  if (!compose) {
-    return;
+/**
+ * Fetch Gateway evidence with TLS fingerprint binding enabled. The returned
+ * peerSpkiFingerprint is observed from the HTTPS connection that served the
+ * evidence response, not from any completion request.
+ */
+export async function fetchGatewayAttestation({
+  nonce,
+  signingAlgo,
+}: FetchGatewayAttestationParams): Promise<FetchedGatewayAttestation> {
+  const query: Record<string, string> = {
+    nonce,
+    include_tls_fingerprint: 'true',
+  };
+  if (signingAlgo !== undefined) query.signing_algo = signingAlgo;
+  const response = await requestJsonWithPeerSpki(
+    attestationReportUrl(query),
+    cloudApiHeaders(),
+  );
+  const report = parseAttestationApiReport(response.body);
+  if (!report.gateway_attestation) {
+    throw new Error('Cloud API response does not contain gateway_attestation');
+  }
+  assertNonceEcho(report.gateway_attestation, nonce);
+  return {
+    attestation: report.gateway_attestation,
+    ...(response.peerSpkiFingerprint
+      ? { peerSpkiFingerprint: response.peerSpkiFingerprint }
+      : {}),
+  };
+}
+
+/** Submit GPU evidence to NVIDIA NRAS. */
+async function fetchNvidiaVerification(payload: unknown): Promise<unknown> {
+  const response = await fetch(GPU_VERIFIER_API, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`NVIDIA NRAS returned HTTP ${response.status}: ${text}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (cause) {
+    throw new Error(
+      `NVIDIA NRAS returned invalid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+  }
+}
+
+function quoteFieldBytes(
+  record: JsonRecord,
+  snakeCase: string,
+  camelCase: string,
+): Buffer {
+  const value = record[snakeCase] ?? record[camelCase];
+  if (typeof value === 'string') {
+    return hexBytes(value, `verified quote ${snakeCase}`);
+  }
+  if (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        typeof item === 'number' &&
+        Number.isInteger(item) &&
+        item >= 0 &&
+        item <= 255,
+    )
+  ) {
+    return Buffer.from(value);
+  }
+  throw new Error(`verified quote ${snakeCase} is not byte data`);
+}
+
+function quoteTd10(rawResult: unknown): JsonRecord {
+  const result = asRecord(rawResult, 'Intel DCAP result');
+  const report = asRecord(result.report, 'Intel DCAP result.report');
+  if (report.TD10 !== undefined) {
+    return asRecord(report.TD10, 'Intel DCAP result.report.TD10');
+  }
+  if (report.TD15 !== undefined) {
+    return asRecord(
+      asRecord(report.TD15, 'Intel DCAP result.report.TD15').base,
+      'Intel DCAP result.report.TD15.base',
+    );
+  }
+  throw new Error('Intel DCAP result does not contain a TD10 or TD15 report');
+}
+
+/** Verify the Intel quote and expose its authenticated measurements. */
+export async function checkTdxQuote(
+  attestation: AttestationBaseInfo,
+): Promise<IntelResult> {
+  const rawQuote = hexBytes(attestation.intel_quote, 'intel_quote');
+  const collateral = await js_get_collateral(INTEL_PCCS_URL, rawQuote);
+  const rawResult: unknown = js_verify(
+    rawQuote,
+    collateral,
+    BigInt(Math.floor(Date.now() / 1000)),
+  );
+
+  try {
+    console.log('TDX quote verification result:', JSON.stringify(rawResult, null, 2));
+  } catch {
+    console.log('TDX quote verification result:', rawResult);
   }
 
-  const sigstoreLinks = extractSigstoreLinks(compose);
-  if (sigstoreLinks.length === 0) {
-    return;
+  const result = asRecord(rawResult, 'Intel DCAP result');
+  const td10 = quoteTd10(rawResult);
+  const status = requireString(result.status, 'Intel DCAP result.status');
+  const accepted = status === 'UpToDate' || status === 'OutOfDate';
+  const tdAttributes = quoteFieldBytes(td10, 'td_attributes', 'tdAttributes');
+  if (tdAttributes.length === 0) {
+    throw new Error('verified quote td_attributes is empty');
+  }
+  const debugEnabled = (tdAttributes[0]! & 0x01) !== 0;
+  const advisoryIds = Array.isArray(result.advisory_ids)
+    ? result.advisory_ids.filter((value): value is string => typeof value === 'string')
+    : [];
+
+  console.log('Intel TDX quote status:', status);
+  console.log('Intel TDX quote debug mode disabled:', !debugEnabled);
+  if (!accepted) {
+    throw new Error(
+      `Intel TDX quote status ${JSON.stringify(status)} is not accepted (UpToDate and OutOfDate are accepted)`,
+    );
+  }
+  if (debugEnabled) {
+    throw new Error('Intel TDX quote has debug mode enabled');
   }
 
-  console.log('\n🔐 Sigstore provenance');
-  console.log('Checking Sigstore accessibility for container images...');
-  const linkResults = await checkSigstoreLinks(sigstoreLinks);
+  return {
+    quote: {
+      body: {
+        reportdata: quoteFieldBytes(td10, 'report_data', 'reportData').toString('hex'),
+        mrconfig: quoteFieldBytes(td10, 'mr_config_id', 'mrConfigId').toString('hex'),
+        rtmr3: quoteFieldBytes(td10, 'rt_mr3', 'rtMr3').toString('hex'),
+        tdattributes: tdAttributes.toString('hex'),
+      },
+      verified: true,
+      status,
+      advisory_ids: advisoryIds,
+      debug_enabled: debugEnabled,
+      ...(typeof result.message === 'string' ? { message: result.message } : {}),
+    },
+    ...(typeof result.message === 'string' ? { message: result.message } : {}),
+  };
+}
 
-  for (const [link, accessible, status] of linkResults) {
-    if (accessible) {
-      console.log(`  ✓ ${link} (HTTP ${status})`);
-    } else {
-      console.log(`  ✗ ${link} (HTTP ${status})`);
+/**
+ * Verify the quote's signer/nonce binding. The quote is the source of truth;
+ * report_data in JSON is checked only as a consistency copy.
+ */
+export function checkReportData({
+  attestation,
+  requestNonce,
+  intelResult,
+  requireTlsFingerprint = false,
+}: CheckReportDataParams): ReportDataResult {
+  assertNonceEcho(attestation, requestNonce);
+  const quoteReportData = hexBytesOfLength(
+    intelResult.quote.body.reportdata,
+    64,
+    'verified quote report_data',
+  );
+  const quotedNonce = quoteReportData.subarray(32, 64);
+  const expectedNonce = hexBytesOfLength(requestNonce, 32, 'request nonce');
+  const nonceMatches = quotedNonce.equals(expectedNonce);
+  console.log('Quote report_data embeds request nonce:', nonceMatches);
+  if (!nonceMatches) {
+    throw new Error('Quote report_data does not embed the requested nonce');
+  }
+
+  if (attestation.report_data !== undefined) {
+    const advertised = hexBytesOfLength(
+      attestation.report_data,
+      64,
+      'attestation.report_data',
+    );
+    const matchesQuote = advertised.equals(quoteReportData);
+    console.log('Advertised report_data matches verified quote:', matchesQuote);
+    if (!matchesQuote) {
+      throw new Error('attestation.report_data does not match the verified quote');
     }
+  }
+
+  const signingAlgo = normalizeSigningAlgo(attestation.signing_algo);
+  const firstHalf = quoteReportData.subarray(0, 32);
+  const fingerprint = attestation.tls_cert_fingerprint;
+  if (fingerprint !== undefined && fingerprint !== null) {
+    const fingerprintBytes = hexBytesOfLength(
+      fingerprint,
+      32,
+      'attestation.tls_cert_fingerprint',
+    );
+    const expected = crypto
+      .createHash('sha256')
+      .update(signingAddressBytes(attestation.signing_address, signingAlgo))
+      .update(fingerprintBytes)
+      .digest();
+    const matches = firstHalf.equals(expected);
+    console.log('Quote report_data binds signing address + TLS fingerprint:', matches);
+    if (!matches) {
+      throw new Error(
+        'Quote report_data does not bind the signing address and declared TLS fingerprint',
+      );
+    }
+    return {
+      binds_address: true,
+      embeds_nonce: true,
+      tls_fingerprint_bound: true,
+    };
+  }
+
+  if (requireTlsFingerprint) {
+    throw new Error('Gateway attestation is missing tls_cert_fingerprint');
+  }
+
+  const expected = paddedSigningAddress(attestation.signing_address, signingAlgo);
+  const matches = firstHalf.equals(expected);
+  console.log('Quote report_data binds signing address:', matches);
+  if (!matches) {
+    throw new Error('Quote report_data does not bind the signing address');
+  }
+  return {
+    binds_address: true,
+    embeds_nonce: true,
+    tls_fingerprint_bound: false,
+  };
+}
+
+function decodeJwtPayload(jwt: string): JsonRecord {
+  const segments = jwt.split('.');
+  if (segments.length < 2 || !segments[1]) {
+    throw new Error('NRAS response contains an invalid JWT');
+  }
+  try {
+    return asRecord(
+      JSON.parse(Buffer.from(segments[1], 'base64url').toString('utf8')),
+      'NRAS JWT payload',
+    );
+  } catch (cause) {
+    throw new Error(
+      `Could not decode NRAS JWT payload: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+  }
+}
+
+/** Verify model GPU evidence when the provider included it. */
+export async function checkGpu({
+  attestation,
+  requestNonce,
+}: CheckGpuParams): Promise<GpuResult> {
+  const payloadText = attestation.nvidia_payload;
+  if (payloadText === undefined || payloadText === null || payloadText === '') {
+    console.log('GPU evidence: not provided');
+    return { status: 'not_provided' };
+  }
+  let payload: JsonRecord;
+  try {
+    payload = asRecord(JSON.parse(payloadText), 'nvidia_payload');
+  } catch (cause) {
+    throw new Error(
+      `nvidia_payload is not valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+  }
+
+  const payloadNonce = requireString(payload.nonce, 'nvidia_payload.nonce');
+  const nonceMatches = hexBytesOfLength(
+    payloadNonce,
+    32,
+    'nvidia_payload.nonce',
+  ).equals(hexBytesOfLength(requestNonce, 32, 'request nonce'));
+  console.log('GPU payload nonce matches request nonce:', nonceMatches);
+  if (!nonceMatches) {
+    throw new Error('GPU payload nonce does not match the requested nonce');
+  }
+
+  const response = await fetchNvidiaVerification(payload);
+  if (!Array.isArray(response)) {
+    throw new Error('NRAS response must be an array');
+  }
+  const firstEntry = response[0];
+  if (
+    !Array.isArray(firstEntry) ||
+    firstEntry[0] !== 'JWT' ||
+    typeof firstEntry[1] !== 'string'
+  ) {
+    throw new Error('NRAS response does not contain an overall verdict JWT');
+  }
+  const verdict = decodeJwtPayload(firstEntry[1])['x-nvidia-overall-att-result'];
+  const passed = verdict === true || verdict === 'PASS';
+  console.log('NVIDIA attestation verdict:', verdict);
+  if (!passed) {
+    throw new Error(`NVIDIA NRAS rejected the GPU evidence: ${String(verdict)}`);
+  }
+  return { status: 'verified', verdict: 'PASS' };
+}
+
+function parseTcbInfo(attestation: AttestationBaseInfo): JsonRecord {
+  const tcbInfo = attestation.info.tcb_info;
+  if (typeof tcbInfo === 'string') {
+    try {
+      return asRecord(JSON.parse(tcbInfo), 'info.tcb_info');
+    } catch (cause) {
+      throw new Error(
+        `info.tcb_info is not valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+  }
+  return asRecord(tcbInfo, 'info.tcb_info');
+}
+
+/** Verify the dstack app_compose hash bound into MRCONFIGID. */
+export function checkAppComposeMeasurement(
+  attestation: AttestationBaseInfo,
+  intelResult: IntelResult,
+): void {
+  const appCompose = requireString(
+    parseTcbInfo(attestation).app_compose,
+    'info.tcb_info.app_compose',
+  );
+  const mrConfig = hexBytes(intelResult.quote.body.mrconfig, 'quote mr_config_id');
+  if (mrConfig.length < 33) {
+    throw new Error(`quote mr_config_id must be at least 33 bytes, got ${mrConfig.length}`);
+  }
+  const composeHash = crypto.createHash('sha256').update(appCompose, 'utf8').digest();
+  const versionMatches = mrConfig[0] === 0x01;
+  const hashMatches = mrConfig.subarray(1, 33).equals(composeHash);
+  console.log('\nApp compose SHA-256:', composeHash.toString('hex'));
+  console.log('MRCONFIGID uses app-compose format version 1:', versionMatches);
+  console.log('MRCONFIGID binds app compose:', hashMatches);
+  if (!versionMatches || !hashMatches) {
+    throw new Error('MRCONFIGID does not bind the attested app_compose');
+  }
+}
+
+function parseEventLog(eventLog: string | unknown[] | undefined): EventLogEntry[] {
+  if (eventLog === undefined) {
+    throw new Error('attestation.event_log is missing');
+  }
+  let parsed: unknown = eventLog;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch (cause) {
+      throw new Error(
+        `attestation.event_log is not valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error('attestation.event_log must be an array');
+  }
+  return parsed.map((item, index) => {
+    const record = asRecord(item, `event_log[${index}]`);
+    const eventType = record.event_type ?? 0;
+    const imr = record.imr;
+    if (
+      typeof eventType !== 'number' ||
+      !Number.isInteger(eventType) ||
+      eventType < 0 ||
+      eventType > 0xffff_ffff
+    ) {
+      throw new Error(`event_log[${index}].event_type must be an unsigned 32-bit integer`);
+    }
+    if (typeof imr !== 'number' || !Number.isInteger(imr)) {
+      throw new Error(`event_log[${index}].imr must be an integer`);
+    }
+    if (typeof record.digest !== 'string') {
+      throw new Error(`event_log[${index}].digest must be a string`);
+    }
+    return {
+      digest: record.digest,
+      event: typeof record.event === 'string' ? record.event : '',
+      event_payload:
+        typeof record.event_payload === 'string' ? record.event_payload : '',
+      event_type: eventType,
+      imr,
+    };
+  });
+}
+
+function eventDigest(entry: EventLogEntry): Buffer {
+  if (entry.event_type !== DSTACK_RUNTIME_EVENT_TYPE) {
+    return hexBytesOfLength(entry.digest, 48, 'event log digest');
+  }
+  const payload =
+    entry.event_payload === ''
+      ? Buffer.alloc(0)
+      : hexBytes(entry.event_payload, 'runtime event payload');
+  const eventType = Buffer.alloc(4);
+  eventType.writeUInt32LE(DSTACK_RUNTIME_EVENT_TYPE);
+  const computed = crypto
+    .createHash('sha384')
+    .update(eventType)
+    .update(':')
+    .update(entry.event)
+    .update(':')
+    .update(payload)
+    .digest();
+  if (entry.digest !== '') {
+    const declared = hexBytesOfLength(entry.digest, 48, 'runtime event digest');
+    if (!declared.equals(computed)) {
+      throw new Error('runtime event digest does not match its event name and payload');
+    }
+  }
+  return computed;
+}
+
+/** Replay RTMR3 so event-log metadata is linked to the verified quote. */
+export function checkEventLog(
+  attestation: AttestationBaseInfo,
+  intelResult: IntelResult,
+): void {
+  const expected = hexBytesOfLength(intelResult.quote.body.rtmr3, 48, 'quote RTMR3');
+  let replayed: Uint8Array = Buffer.alloc(48);
+  let count = 0;
+  for (const entry of parseEventLog(attestation.event_log)) {
+    if (entry.imr !== 3) continue;
+    count += 1;
+    replayed = crypto
+      .createHash('sha384')
+      .update(replayed)
+      .update(eventDigest(entry))
+      .digest();
+  }
+  const matches = count > 0 && Buffer.from(replayed).equals(expected);
+  console.log('RTMR3 event-log replay matches quote:', matches);
+  if (!matches) {
+    throw new Error(
+      count === 0
+        ? 'attestation.event_log has no RTMR3 events'
+        : 'RTMR3 event-log replay does not match the verified quote',
+    );
   }
 }
 
 /**
- * Display the Docker compose manifest and verify against mr_config from verified quote
+ * Print image-digest search links as a diagnostic convenience. This does not
+ * verify image provenance and is deliberately separate from attestation
+ * verification.
  */
-function showCompose(attestation: AttestationBaseInfo, intelResult: IntelResult): void {
-  const tcbInfo = parsedTcbInfo(attestation);
-  if (!tcbInfo) return;
-  const appCompose = tcbInfo.app_compose as string | undefined;
-  if (!appCompose) {
-    return;
-  }
-  
-  const dockerCompose = JSON.parse(appCompose).docker_compose_file;
-  
-  console.log('\nDocker compose manifest attested by the enclave:');
-  console.log(dockerCompose);
-
-  const composeHash = crypto.createHash('sha256').update(appCompose).digest('hex');
-  console.log('Compose sha256:', composeHash);
-
-  const mrConfig = intelResult.quote.body.mrconfig;
-  console.log('mr_config (from verified quote):', mrConfig);
-  const expectedMrConfig = '01' + composeHash;
-  console.log('mr_config matches compose hash:', mrConfig.toLowerCase().startsWith(expectedMrConfig.toLowerCase()));
-}
-
-/**
- * Verify a single attestation.
- *
- * When attestation contains tls_cert_fingerprint (from include_tls_fingerprint),
- * report_data[0..32] = SHA256(signing_address || fingerprint) is verified automatically.
- */
-async function verifyAttestation(
-  attestation: AttestationReport,
-  requestNonce: string,
-  verifyModel: boolean,
+export async function showImageDigestLookupLinks(
+  attestation: AttestationBaseInfo,
 ): Promise<void> {
-  console.log('🔐 Attestation');
-
-  console.log('Request nonce:', requestNonce);
-  if (attestation.signing_address) {
-    console.log('\nSigning address:', attestation.signing_address);
+  let appCompose: string;
+  try {
+    appCompose = requireString(
+      parseTcbInfo(attestation).app_compose,
+      'info.tcb_info.app_compose',
+    );
+  } catch {
+    return;
   }
+  const digests = [...appCompose.matchAll(/@sha256:([0-9a-f]{64})/gi)].map(
+    (match) => match[1]!,
+  );
+  if (digests.length === 0) return;
+  console.log('\nImage-digest lookup links (diagnostic only):');
+  for (const digest of new Set(digests)) {
+    console.log(`  ${SIGSTORE_SEARCH_BASE}sha256:${digest}`);
+  }
+}
+
+/**
+ * Verify one Cloud API evidence item. Each failed condition throws, so a
+ * printed false result can never be followed by a successful verification.
+ */
+export async function verifyAttestation({
+  attestation,
+  requestNonce,
+  kind,
+  peerSpkiFingerprint,
+}: VerifyAttestationParams): Promise<void> {
+  console.log(`\n🔐 ${kind === 'gateway' ? 'Gateway' : 'Model'} attestation`);
+  console.log('Signing address:', attestation.signing_address);
+  console.log('Signing algorithm:', attestation.signing_algo);
+  console.log('Request nonce:', requestNonce);
 
   console.log('\n🔐 Intel TDX quote');
   const intelResult = await checkTdxQuote(attestation);
 
-  console.log('\n🔐 TDX report data');
-  checkReportData(attestation, requestNonce, intelResult);
+  console.log('\n🔐 Quote bindings');
+  checkReportData({
+    attestation,
+    requestNonce,
+    intelResult,
+    requireTlsFingerprint: kind === 'gateway',
+  });
 
-  if (verifyModel) {
-    console.log('\n🔐 GPU attestation');
-    await checkGpu(attestation, requestNonce);
+  if (kind === 'gateway') {
+    if (!peerSpkiFingerprint) {
+      throw new Error(
+        'Gateway verification needs the TLS peer fingerprint observed while fetching its attestation',
+      );
+    }
+    const declared = hexBytesOfLength(
+      requireString(
+        attestation.tls_cert_fingerprint,
+        'gateway_attestation.tls_cert_fingerprint',
+      ),
+      32,
+      'gateway_attestation.tls_cert_fingerprint',
+    );
+    const peer = hexBytesOfLength(
+      peerSpkiFingerprint,
+      32,
+      'observed TLS peer SPKI fingerprint',
+    );
+    const matches = declared.equals(peer);
+    console.log('Observed TLS peer SPKI matches attested fingerprint:', matches);
+    if (!matches) {
+      throw new Error('Observed TLS peer SPKI fingerprint does not match gateway attestation');
+    }
   }
 
-  showCompose(attestation, intelResult);
-  await showSigstoreProvenance(attestation);
-  checkComposeManagerActions(attestation as unknown as Record<string, unknown>);
+  console.log('\n🔐 Measured deployment');
+  checkEventLog(attestation, intelResult);
+  checkAppComposeMeasurement(attestation, intelResult);
+
+  if (kind === 'model') {
+    console.log('\n🔐 GPU evidence');
+    await checkGpu({ attestation, requestNonce });
+  }
+
+  await showImageDigestLookupLinks(attestation);
 }
 
-/**
- * Gateway-only verification with TLS fingerprint binding.
- * Call from chat_verifier when --verify-tls; all logic lives here.
- */
-async function verifyGatewayTlsBinding(
-  signingAddress: string,
-  model: string,
-  signingAlgo: string = 'ecdsa',
-): Promise<void> {
-  const requestNonce = crypto.randomBytes(32).toString('hex');
-  const report = await fetchReport(model, requestNonce, signingAlgo, true, signingAddress);
-  const gateway = report.gateway_attestation;
-
-  if (!gateway) {
-    console.log('No gateway_attestation in report (cannot verify TLS binding).');
-    return;
-  }
-  if (!gateway.tls_cert_fingerprint) {
-    console.log(
-      'TLS verification requested but gateway has no tls_cert_fingerprint ' +
-        '(configure the gateway to include a TLS certificate fingerprint in attestation, or omit --verify-tls).',
-    );
-    return;
-  }
-
-  console.log('========================================');
-  console.log('🔐 Gateway attestation (include_tls_fingerprint)');
-  console.log('========================================');
-  await verifyAttestation(gateway, requestNonce, false);
+/** Fetch and verify Gateway evidence, including the live TLS peer binding. */
+export async function verifyGatewayTlsBinding({
+  nonce = crypto.randomBytes(32).toString('hex'),
+  signingAlgo,
+}: VerifyGatewayTlsBindingParams = {}): Promise<void> {
+  const gateway = await fetchGatewayAttestation({ nonce, signingAlgo });
+  await verifyAttestation({
+    attestation: gateway.attestation,
+    requestNonce: nonce,
+    kind: 'gateway',
+    peerSpkiFingerprint: gateway.peerSpkiFingerprint,
+  });
 }
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const modelIndex = args.indexOf('--model');
-  const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'deepseek-ai/DeepSeek-V3.1';
-  const includeTls = args.includes('--verify-tls');
+  const model =
+    modelIndex !== -1 && args[modelIndex + 1]
+      ? args[modelIndex + 1]
+      : 'deepseek-ai/DeepSeek-V3.1';
+  const algoIndex = args.indexOf('--signing-algo');
+  const signingAlgo =
+    algoIndex !== -1 && args[algoIndex + 1]
+      ? normalizeSigningAlgo(args[algoIndex + 1]!)
+      : undefined;
 
-  const requestNonce = crypto.randomBytes(32).toString('hex');
-  const report = await fetchReport(model, requestNonce, 'ecdsa', includeTls);
-
-  if (!report.gateway_attestation) {
-    console.log('No gateway attestation found');
-    return;
+  if (!process.env.API_KEY) {
+    throw new Error('API_KEY is required to fetch Cloud API attestations');
   }
 
   console.log('========================================');
-  console.log('🔐 Gateway attestation');
+  console.log('NEAR AI Cloud attestation walkthrough');
   console.log('========================================');
-  await verifyAttestation(
-    report.gateway_attestation,
-    requestNonce,
-    false,
-  );
 
-  // Verify model attestations
-  if (!report.model_attestations) {
-    console.log('No model attestations found');
-    return;
+  const gatewayNonce = crypto.randomBytes(32).toString('hex');
+  const gateway = await fetchGatewayAttestation({
+    nonce: gatewayNonce,
+    signingAlgo,
+  });
+  await verifyAttestation({
+    attestation: gateway.attestation,
+    requestNonce: gatewayNonce,
+    kind: 'gateway',
+    peerSpkiFingerprint: gateway.peerSpkiFingerprint,
+  });
+
+  const modelNonce = crypto.randomBytes(32).toString('hex');
+  const modelAttestations = await fetchModelAttestations({
+    model,
+    nonce: modelNonce,
+    signingAlgo,
+  });
+  for (const [index, attestation] of modelAttestations.entries()) {
+    console.log(`\n========================================\nModel attestation ${index + 1}\n========================================`);
+    await verifyAttestation({
+      attestation,
+      requestNonce: modelNonce,
+      kind: 'model',
+    });
   }
-
-  let idx = 0;
-  for (const modelAttestation of report.model_attestations) {
-    idx += 1;
-    console.log('\n\n\n========================================');
-    console.log(`🔐 Model attestations: (#${idx})`);
-    console.log('========================================');
-    await verifyAttestation(modelAttestation, requestNonce, true);
-  }
-
-  // Top-level compose-manager attestation (present on model proxy responses)
-  checkComposeManagerActions(report as unknown as Record<string, unknown>);
 }
 
-// Run the main function if this file is executed directly
 if (require.main === module) {
-  main().catch(console.error);
+  main().catch((error) => {
+    console.error('\nVerification failed:', error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
 }
-
-export {
-  fetchReport,
-  verifyGatewayTlsBinding,
-  checkTdxQuote,
-  checkReportData,
-  checkGpu,
-  verifyAttestation,
-  showSigstoreProvenance,
-  showCompose,
-  checkComposeManagerActions,
-  canonicalizeJson,
-  AttestationBaseInfo,
-  AttestationReport,
-  IntelResult,
-  ReportDataResult,
-  GpuResult,
-  ComposeManagerResult,
-};

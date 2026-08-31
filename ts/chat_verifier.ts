@@ -1,360 +1,563 @@
 #!/usr/bin/env node
 /**
- * TypeScript implementation of NEAR AI Cloud Signature Verifier
- * Minimal guide for checking signed chat responses.
+ * Verify a signed NEAR AI Cloud chat completion without using the SDK.
+ *
+ * A Cloud API signature is explicitly either model-serving (`provider_tee`) or
+ * Gateway (`gateway`) evidence. The kind selects both the signed text and the
+ * attestation that must contain the signing identity.
  */
 
+import { Buffer } from 'buffer';
 import * as crypto from 'crypto';
-import * as https from 'https';
 import * as http from 'http';
+import * as https from 'https';
 import { URL } from 'url';
 import { ethers } from 'ethers';
 import {
-  checkReportData,
-  checkGpu,
-  checkTdxQuote,
-  showSigstoreProvenance,
-  verifyGatewayTlsBinding,
-  AttestationReport
+  type AttestationReport,
+  type FetchedGatewayAttestation,
+  type SigningAlgo,
+  fetchGatewayAttestation,
+  fetchModelAttestation,
+  verifyAttestation,
 } from './model_verifier';
 
-const API_KEY = process.env.API_KEY || '';
-const BASE_URL = process.env.BASE_URL || 'https://cloud-api.near.ai';
+export type SignatureKind = 'provider_tee' | 'gateway';
 
-interface SignaturePayload {
-  text: string;
+export interface CompletionSignature {
+  signedText: string;
   signature: string;
-  signing_address: string;
+  signingAddress: string;
+  signingAlgo: SigningAlgo;
+  kind: SignatureKind;
 }
 
-interface ChatCompletionRequest {
+export interface FetchSignatureParams {
+  id: string;
+  signingAlgo?: SigningAlgo;
+}
+
+export interface SignatureTextParams {
+  kind: SignatureKind;
+  requestBody: Uint8Array;
+  responseBody: Uint8Array;
+  model?: string;
+}
+
+export interface FetchModelAttestationForSignatureParams {
+  model: string;
+  nonce: string;
+  signature: CompletionSignature;
+}
+
+export interface FetchGatewayAttestationForSignatureParams {
+  nonce: string;
+  signature: CompletionSignature;
+}
+
+export interface VerifyModelResponseParams {
+  requestBody: Uint8Array;
+  responseBody: Uint8Array;
+  signature: CompletionSignature;
+  attestation: AttestationReport;
+}
+
+export interface VerifyGatewayResponseParams {
+  requestBody: Uint8Array;
+  responseBody: Uint8Array;
+  signature: CompletionSignature;
+  attestation: AttestationReport;
+}
+
+export interface VerifyChatParams {
+  id: string;
+  requestBody: Uint8Array;
+  responseBody: Uint8Array;
+  label: string;
+  signingAlgo?: SigningAlgo;
+}
+
+interface RunExampleParams {
+  model: string;
+  stream: boolean;
+  signingAlgo?: SigningAlgo;
+}
+
+export interface ChatCompletionRequest {
   model: string;
   messages: Array<{ role: string; content: string }>;
   stream: boolean;
   max_tokens: number;
 }
 
-interface ChatCompletionResponse {
+export interface ChatCompletionResponse {
   id: string;
-  choices: Array<{
-    message: {
-      content: string;
-    };
-  }>;
 }
 
-/**
- * Make HTTP request and return JSON response
- */
-async function makeRequest(url: string, options: any = {}): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const isHttps = urlObj.protocol === 'https:';
-    const client = isHttps ? https : http;
-    
-    const requestOptions = {
-      hostname: urlObj.hostname,
-      port: urlObj.port || (isHttps ? 443 : 80),
-      path: urlObj.pathname + urlObj.search,
-      method: options.method || 'GET',
-      headers: options.headers || {},
-      timeout: options.timeout || 30000
-    };
+type JsonRecord = Record<string, unknown>;
 
-    const req = client.request(requestOptions, (res) => {
-      let data = '';
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (error) {
-          reject(new Error(`Failed to parse JSON response: ${error}`));
-        }
-      });
-    });
+type RawHttpResponse = {
+  body: Buffer;
+  statusCode: number;
+};
 
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Request timeout'));
-    });
-
-    if (options.body) {
-      req.write(options.body);
-    }
-    req.end();
-  });
+function cloudApiBaseUrl(): string {
+  return process.env.BASE_URL || 'https://cloud-api.near.ai';
 }
 
-/**
- * Calculate SHA256 hash of text
- */
-function sha256Text(text: string): string {
-  return crypto.createHash('sha256').update(text).digest('hex');
+function cloudApiHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const apiKey = process.env.API_KEY;
+  return {
+    'Accept-Encoding': 'identity',
+    ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+    ...extra,
+  };
 }
 
-/**
- * Fetch signature for a chat completion
- */
-async function fetchSignature(chatId: string, model: string, signingAlgo: string = 'ecdsa'): Promise<SignaturePayload> {
-  const url = `${BASE_URL}/v1/signature/${chatId}?model=${encodeURIComponent(model)}&signing_algo=${encodeURIComponent(signingAlgo)}`;
-  const headers = { Authorization: `Bearer ${API_KEY}` };
-  return await makeRequest(url, { headers });
-}
-
-/**
- * Recover Ethereum address from ECDSA signature
- */
-function recoverSigner(text: string, signature: string): string {
-  return ethers.utils.verifyMessage(text, signature);
-}
-
-/**
- * Fetch attestation for a specific signing address (model attestation path; no include_tls_fingerprint).
- */
-async function fetchAttestationFor(signingAddress: string, model: string): Promise<[AttestationReport, string]> {
-  const nonce = crypto.randomBytes(32).toString('hex');
-  const url = `${BASE_URL}/v1/attestation/report?model=${encodeURIComponent(model)}&nonce=${nonce}&signing_algo=ecdsa&signing_address=${encodeURIComponent(signingAddress)}`;
-  const headers = { Authorization: `Bearer ${API_KEY}` };
-  const report = await makeRequest(url, { headers });
-
-  let attestation: AttestationReport;
-  if (report.model_attestations) {
-    attestation = report.model_attestations.find(
-      (item: AttestationReport) => item.signing_address.toLowerCase() === signingAddress.toLowerCase()
-    )!;
-  } else {
-    attestation = report as unknown as AttestationReport;
+function asRecord(value: unknown, label: string): JsonRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be a JSON object`);
   }
-
-  return [attestation, nonce];
+  return value as JsonRecord;
 }
 
-/**
- * Verify model attestation (TDX + report data + GPU + sigstore). TLS PEM binding is handled in model_verifier.verifyGatewayTlsBinding.
- */
-async function checkAttestation(signingAddress: string, attestation: AttestationReport, nonce: string): Promise<void> {
-  const intelResult = await checkTdxQuote(attestation);
-  checkReportData(attestation, nonce, intelResult);
-  await checkGpu(attestation, nonce);
-  await showSigstoreProvenance(attestation);
+function requireString(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`${label} must be a non-empty string`);
+  }
+  return value;
 }
 
-/**
- * Verify a chat completion signature and attestation.
- * @param verifyTls if true, runs gateway TLS binding verification via model_verifier (separate fetch with include_tls_fingerprint=true).
- */
-async function verifyChat(
-  chatId: string,
-  requestBody: string,
-  responseText: string,
-  label: string,
-  model: string,
-  verifyTls: boolean = false,
-): Promise<void> {
-  const requestHash = sha256Text(requestBody);
-  const responseHash = sha256Text(responseText);
+function normalizeSigningAlgo(value: string): SigningAlgo {
+  const normalized = value.toLowerCase();
+  if (normalized === 'ecdsa' || normalized === 'ed25519') {
+    return normalized;
+  }
+  throw new Error(
+    `Unsupported signing algorithm ${JSON.stringify(value)}; expected ecdsa or ed25519`,
+  );
+}
 
-  console.log(`\n--- ${label} ---`);
-  const signaturePayload = await fetchSignature(chatId, model);
-  console.log(JSON.stringify(signaturePayload, null, 2));
+function sha256Bytes(value: Uint8Array): string {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
 
-  const hashedText = signaturePayload.text;
-  const parts = hashedText.split(':');
-  if (parts.length !== 2 && parts.length !== 3) {
+function hexBytes(value: string, label: string): Buffer {
+  const normalized = value.replace(/^0x/i, '');
+  if (
+    normalized.length === 0 ||
+    normalized.length % 2 !== 0 ||
+    !/^[0-9a-fA-F]+$/.test(normalized)
+  ) {
+    throw new Error(`${label} must be hexadecimal bytes`);
+  }
+  return Buffer.from(normalized, 'hex');
+}
+
+function signingAddressBytes(
+  signingAddress: string,
+  signingAlgo: SigningAlgo,
+): Buffer {
+  const bytes = hexBytes(signingAddress, 'signing_address');
+  const expectedLength = signingAlgo === 'ecdsa' ? 20 : 32;
+  if (bytes.length !== expectedLength) {
     throw new Error(
-      `Invalid signature payload text format: expected 2 or 3 colon-separated parts, got ${parts.length}: "${hashedText}"`,
+      `signing_address for ${signingAlgo} must be ${expectedLength} bytes, got ${bytes.length}`,
     );
   }
-  const requestHashServer = parts.length === 3 ? parts[1]! : parts[0]!;
-  const responseHashServer = parts.length === 3 ? parts[2]! : parts[1]!;
-  console.log('Request hash matches:', requestHash === requestHashServer);
-  console.log('Response hash matches:', responseHash === responseHashServer);
+  return bytes;
+}
 
-  const signature = signaturePayload.signature;
-  const signingAddress = signaturePayload.signing_address;
-  const recovered = recoverSigner(hashedText, signature);
-  console.log('Signature valid:', recovered.toLowerCase() === signingAddress.toLowerCase());
-
-  if (verifyTls) {
-    await verifyGatewayTlsBinding(signingAddress, model, 'ecdsa');
+/**
+ * Decode the public signature response. Missing `signature_kind` is rejected:
+ * old records have unknown provenance and cannot safely be routed to model or
+ * Gateway evidence.
+ */
+export function parseSignaturePayload(value: unknown): CompletionSignature {
+  const record = asRecord(value, 'signature response');
+  if (typeof record.error_code === 'string') {
+    const message = typeof record.message === 'string' ? `: ${record.message}` : '';
+    throw new Error(`Signature is unavailable (${record.error_code})${message}`);
   }
+  const kind = requireString(record.signature_kind, 'signature_kind');
+  if (kind !== 'provider_tee' && kind !== 'gateway') {
+    throw new Error(
+      `Unsupported signature_kind ${JSON.stringify(kind)}; expected provider_tee or gateway`,
+    );
+  }
+  return {
+    signedText: requireString(record.text, 'signature text'),
+    signature: requireString(record.signature, 'signature'),
+    signingAddress: requireString(record.signing_address, 'signing_address'),
+    signingAlgo: normalizeSigningAlgo(
+      requireString(record.signing_algo, 'signing_algo'),
+    ),
+    kind,
+  };
+}
 
-  const [attestation, nonce] = await fetchAttestationFor(signingAddress, model);
-  if (!attestation || "error" in attestation) {
-    console.log(`Attestation not found for signing address: ${signingAddress}.`, attestation);
+/** Build the exact text that the selected signature kind must cover. */
+export function signatureTextFor({
+  kind,
+  requestBody,
+  responseBody,
+  model,
+}: SignatureTextParams): string {
+  const requestHash = sha256Bytes(requestBody);
+  const responseHash = sha256Bytes(responseBody);
+  if (kind === 'gateway') {
+    return `${requestHash}:${responseHash}`;
+  }
+  if (!model) {
+    throw new Error('provider_tee signature verification needs the canonical model ID');
+  }
+  return `${model}:${requestHash}:${responseHash}`;
+}
+
+/** Fetch the stored signature for a completion or response ID. */
+export async function fetchSignature({
+  id,
+  signingAlgo,
+}: FetchSignatureParams): Promise<CompletionSignature> {
+  const url = new URL(`/v1/signature/${encodeURIComponent(id)}`, cloudApiBaseUrl());
+  if (signingAlgo !== undefined) {
+    url.searchParams.set('signing_algo', signingAlgo);
+  }
+  const response = await fetch(url, { headers: cloudApiHeaders() });
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`Cloud API returned HTTP ${response.status}: ${body}`);
+  }
+  try {
+    return parseSignaturePayload(JSON.parse(body));
+  } catch (cause) {
+    if (cause instanceof Error) throw cause;
+    throw new Error(`Cloud API returned an invalid signature response: ${String(cause)}`);
+  }
+}
+
+/** Fetch the one NEAR model attestation for a provider-TEE signature. */
+export async function fetchModelAttestationForSignature({
+  model,
+  nonce,
+  signature,
+}: FetchModelAttestationForSignatureParams): Promise<AttestationReport> {
+  if (signature.kind !== 'provider_tee') {
+    throw new Error('Model evidence can only verify a provider_tee signature');
+  }
+  return fetchModelAttestation({
+    model,
+    nonce,
+    signingAlgo: signature.signingAlgo,
+    signingAddress: signature.signingAddress,
+  });
+}
+
+/** Fetch Gateway evidence for a gateway-signed response. */
+export async function fetchGatewayAttestationForSignature({
+  nonce,
+  signature,
+}: FetchGatewayAttestationForSignatureParams): Promise<FetchedGatewayAttestation> {
+  if (signature.kind !== 'gateway') {
+    throw new Error('Gateway evidence can only verify a gateway signature');
+  }
+  return fetchGatewayAttestation({
+    nonce,
+    signingAlgo: signature.signingAlgo,
+  });
+}
+
+function verifySignatureBytes(signature: CompletionSignature): void {
+  if (signature.signingAlgo === 'ecdsa') {
+    const declared = signingAddressBytes(signature.signingAddress, 'ecdsa');
+    const signatureBytes = hexBytes(signature.signature, 'ECDSA signature');
+    if (signatureBytes.length !== 65) {
+      throw new Error(`ECDSA signature must be 65 bytes, got ${signatureBytes.length}`);
+    }
+    let recovered: string;
+    try {
+      recovered = ethers.utils.verifyMessage(signature.signedText, signature.signature);
+    } catch (cause) {
+      throw new Error(
+        `ECDSA signature verification failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+    const matches = signingAddressBytes(recovered, 'ecdsa').equals(declared);
+    console.log('ECDSA signature matches declared signer:', matches);
+    if (!matches) {
+      throw new Error('ECDSA signature does not match its declared signing_address');
+    }
     return;
   }
-  console.log('\nAttestation signer:', attestation.signing_address);
-  console.log('Attestation nonce:', nonce);
-  await checkAttestation(signingAddress, attestation, nonce);
+
+  const publicKey = signingAddressBytes(signature.signingAddress, 'ed25519');
+  const signedBytes = hexBytes(signature.signature, 'Ed25519 signature');
+  if (signedBytes.length !== 64) {
+    throw new Error(`Ed25519 signature must be 64 bytes, got ${signedBytes.length}`);
+  }
+  const spkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
+  const key = crypto.createPublicKey({
+    key: Buffer.concat([spkiPrefix, publicKey]),
+    format: 'der',
+    type: 'spki',
+  });
+  const valid = crypto.verify(
+    null,
+    Buffer.from(signature.signedText, 'utf8'),
+    key,
+    signedBytes,
+  );
+  console.log('Ed25519 signature matches declared signer:', valid);
+  if (!valid) {
+    throw new Error('Ed25519 signature does not match its declared signing_address');
+  }
+}
+
+function verifySignatureAndEvidence(
+  signature: CompletionSignature,
+  expectedText: string,
+  attestation: AttestationReport,
+): void {
+  const textMatches = signature.signedText === expectedText;
+  console.log('Signature text matches request and response bytes:', textMatches);
+  if (!textMatches) {
+    throw new Error('Signature text does not match the request and response bytes');
+  }
+  verifySignatureBytes(signature);
+  const algoMatches =
+    attestation.signing_algo.toLowerCase() === signature.signingAlgo;
+  const signerMatches = signingAddressBytes(
+    attestation.signing_address,
+    signature.signingAlgo,
+  ).equals(signingAddressBytes(signature.signingAddress, signature.signingAlgo));
+  console.log('Attestation signing algorithm matches signature:', algoMatches);
+  console.log('Attestation signer matches signature:', signerMatches);
+  if (!algoMatches || !signerMatches) {
+    throw new Error('Signature signer does not match the verified attestation');
+  }
+}
+
+/** Verify a model-serving signature against the selected model evidence. */
+export function verifyModelResponse({
+  requestBody,
+  responseBody,
+  signature,
+  attestation,
+}: VerifyModelResponseParams): void {
+  if (signature.kind !== 'provider_tee') {
+    throw new Error('verifyModelResponse requires a provider_tee signature');
+  }
+  verifySignatureAndEvidence(
+    signature,
+    signatureTextFor({
+      kind: 'provider_tee',
+      requestBody,
+      responseBody,
+      model: modelFromRequest(requestBody),
+    }),
+    attestation,
+  );
+}
+
+/** Verify a gateway signature against the selected Gateway evidence. */
+export function verifyGatewayResponse({
+  requestBody,
+  responseBody,
+  signature,
+  attestation,
+}: VerifyGatewayResponseParams): void {
+  if (signature.kind !== 'gateway') {
+    throw new Error('verifyGatewayResponse requires a gateway signature');
+  }
+  verifySignatureAndEvidence(
+    signature,
+    signatureTextFor({ kind: 'gateway', requestBody, responseBody }),
+    attestation,
+  );
+}
+
+function modelFromRequest(requestBody: Uint8Array): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(requestBody).toString('utf8'));
+  } catch (cause) {
+    throw new Error(
+      `The provider_tee signature requires a JSON completion request: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+  }
+  return requireString(asRecord(parsed, 'completion request').model, 'completion request model');
 }
 
 /**
- * Streaming example
+ * Verify the signature and evidence for one exact response. requestBody and
+ * responseBody must be the bytes sent and received on the wire.
  */
-async function streamingExample(model: string, verifyTls: boolean = false): Promise<void> {
-  const body: ChatCompletionRequest = {
-    model,
-    messages: [{ role: 'user', content: 'Hello, how are you?' }],
-    stream: true,
-    max_tokens: 1
-  };
-  
-  const bodyJson = JSON.stringify(body);
+export async function verifyChat({
+  id,
+  requestBody,
+  responseBody,
+  label,
+  signingAlgo,
+}: VerifyChatParams): Promise<void> {
+  console.log(`\n========================================\n${label}\n========================================`);
+  const signature = await fetchSignature({ id, signingAlgo });
+  console.log('Signature kind:', signature.kind);
+  console.log('Signature algorithm:', signature.signingAlgo);
+  console.log('Signature signer:', signature.signingAddress);
 
+  const nonce = crypto.randomBytes(32).toString('hex');
+  if (signature.kind === 'provider_tee') {
+    const model = modelFromRequest(requestBody);
+    const attestation = await fetchModelAttestationForSignature({
+      model,
+      nonce,
+      signature,
+    });
+    await verifyAttestation({
+      attestation,
+      requestNonce: nonce,
+      kind: 'model',
+    });
+    verifyModelResponse({ requestBody, responseBody, signature, attestation });
+    return;
+  }
+
+  const gateway = await fetchGatewayAttestationForSignature({ nonce, signature });
+  await verifyAttestation({
+    attestation: gateway.attestation,
+    requestNonce: nonce,
+    kind: 'gateway',
+    peerSpkiFingerprint: gateway.peerSpkiFingerprint,
+  });
+  verifyGatewayResponse({
+    requestBody,
+    responseBody,
+    signature,
+    attestation: gateway.attestation,
+  });
+}
+
+function requestBytes(
+  url: URL,
+  method: 'GET' | 'POST',
+  headers: Record<string, string>,
+  body?: Uint8Array,
+): Promise<RawHttpResponse> {
   return new Promise((resolve, reject) => {
-    const urlObj = new URL(`${BASE_URL}/v1/chat/completions`);
-    const isHttps = urlObj.protocol === 'https:';
-    const client = isHttps ? https : http;
-
-    const requestOptions = {
-      hostname: urlObj.hostname,
-      port: urlObj.port || (isHttps ? 443 : 80),
-      path: urlObj.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${API_KEY}`
+    const client = url.protocol === 'https:' ? https : http;
+    const request = client.request(
+      {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: `${url.pathname}${url.search}`,
+        method,
+        headers,
+        timeout: 30_000,
       },
-      timeout: 30000
-    };
-
-    const req = client.request(requestOptions, (res) => {
-      if (res.statusCode !== 200) {
-        let errorData = '';
-        res.on('data', (chunk) => {
-          errorData += chunk.toString();
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+        response.on('error', reject);
+        response.on('end', () => {
+          resolve({
+            body: Buffer.concat(chunks),
+            statusCode: response.statusCode ?? 500,
+          });
         });
-        res.on('end', () => {
-          reject(new Error(`HTTP ${res.statusCode}: ${errorData}`));
-        });
-        res.on('error', reject);
-        return;
-      }
-
-      let buffer = '';
-      let responseText = '';
-      let chatId: string | null = null;
-      
-      res.on('data', (chunk) => {
-        buffer += chunk.toString();
-        responseText += chunk.toString();
-        
-        let newlineIndex;
-        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
-          const line = buffer.substring(0, newlineIndex).trim();
-          buffer = buffer.substring(newlineIndex + 1);
-          
-          if (line.length === 0 || line.startsWith(':')) {
-            continue;
-          }
-          
-          if (line.startsWith('data: ') && chatId === null) {
-            const dataStr = line.substring(6);
-            if (dataStr === '[DONE]') {
-              continue;
-            }
-            try {
-              const data = JSON.parse(dataStr);
-              if (data.id) {
-                chatId = data.id;
-              }
-            } catch {
-              // ignore
-            }
-          }
-        }
-      });
-      
-      res.on('end', async () => {
-        if (!chatId) {
-          reject(new Error('Failed to extract chat ID from streaming response'));
-          return;
-        }
-        try {
-          await verifyChat(chatId, bodyJson, responseText, 'Streaming example', model, verifyTls);
-          resolve();
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Request timeout'));
-    });
-
-    req.write(bodyJson);
-    req.end();
+      },
+    );
+    request.on('error', reject);
+    request.on('timeout', () => request.destroy(new Error('Cloud API request timed out')));
+    if (body !== undefined) request.write(body);
+    request.end();
   });
 }
 
-/**
- * Non-streaming example
- */
-async function nonStreamingExample(model: string, verifyTls: boolean = false): Promise<void> {
-  const body: ChatCompletionRequest = {
+function completionId(responseBody: Uint8Array, stream: boolean): string {
+  const text = Buffer.from(responseBody).toString('utf8');
+  if (!stream) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (cause) {
+      throw new Error(
+        `Cloud API returned invalid completion JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+    return requireString(asRecord(parsed, 'completion response').id, 'completion response id');
+  }
+
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('data: ')) continue;
+    const data = line.slice('data: '.length);
+    if (data === '[DONE]') continue;
+    try {
+      const id = asRecord(JSON.parse(data), 'stream event').id;
+      if (typeof id === 'string' && id.length > 0) return id;
+    } catch {
+      // A malformed non-ID stream line does not affect the raw bytes retained
+      // for signature verification. Keep scanning for the first event ID.
+    }
+  }
+  throw new Error('Could not find a completion ID in the stream');
+}
+
+async function runExample({ model, stream, signingAlgo }: RunExampleParams): Promise<void> {
+  const request: ChatCompletionRequest = {
     model,
     messages: [{ role: 'user', content: 'Hello, how are you?' }],
-    stream: false,
-    max_tokens: 1
+    stream,
+    max_tokens: 1,
   };
-  
-  const bodyJson = JSON.stringify(body);
-  const response = await makeRequest(`${BASE_URL}/v1/chat/completions`, {
-    method: 'POST',
-    headers: {
+  const requestBody = Buffer.from(JSON.stringify(request), 'utf8');
+  const url = new URL('/v1/chat/completions', cloudApiBaseUrl());
+  const response = await requestBytes(
+    url,
+    'POST',
+    cloudApiHeaders({
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${API_KEY}`
-    },
-    body: bodyJson
+      'Content-Length': String(requestBody.length),
+      'x-no-aliasing': 'true',
+    }),
+    requestBody,
+  );
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(
+      `Cloud API returned HTTP ${response.statusCode}: ${response.body.toString('utf8')}`,
+    );
+  }
+  await verifyChat({
+    id: completionId(response.body, stream),
+    requestBody,
+    responseBody: response.body,
+    label: stream ? 'Streaming completion' : 'Non-streaming completion',
+    signingAlgo,
   });
-
-  const payload: ChatCompletionResponse = response;
-  const chatId = payload.id;
-  await verifyChat(chatId, bodyJson, JSON.stringify(response), 'Non-streaming example', model, verifyTls);
 }
 
-/**
- * Main function
- */
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const modelIndex = args.indexOf('--model');
-  const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'deepseek-ai/DeepSeek-V3.1';
-  const verifyTls = args.includes('--verify-tls');
-
-  if (!API_KEY) {
-    console.log('Error: API_KEY environment variable is required');
-    console.log('Set it with: export API_KEY=your-api-key');
-    return;
+  const model =
+    modelIndex !== -1 && args[modelIndex + 1]
+      ? args[modelIndex + 1]
+      : 'deepseek-ai/DeepSeek-V3.1';
+  const algoIndex = args.indexOf('--signing-algo');
+  const signingAlgo =
+    algoIndex !== -1 && args[algoIndex + 1]
+      ? normalizeSigningAlgo(args[algoIndex + 1]!)
+      : undefined;
+  if (!process.env.API_KEY) {
+    throw new Error('API_KEY is required');
   }
 
-  if (verifyTls) {
-    console.log('TLS PEM binding: handled in model_verifier.verifyGatewayTlsBinding (--verify-tls)');
-  }
-  await streamingExample(model, verifyTls);
-  await nonStreamingExample(model, verifyTls);
+  await runExample({ model, stream: true, signingAlgo });
+  await runExample({ model, stream: false, signingAlgo });
 }
 
 if (require.main === module) {
-  main().catch(console.error);
+  main().catch((error) => {
+    console.error('\nVerification failed:', error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
 }
-
-export {
-  fetchSignature,
-  recoverSigner,
-  fetchAttestationFor,
-  checkAttestation,
-  verifyChat,
-  streamingExample,
-  nonStreamingExample,
-  SignaturePayload,
-  ChatCompletionRequest,
-  ChatCompletionResponse
-};

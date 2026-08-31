@@ -13,11 +13,6 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
-from nacl.public import (
-    PrivateKey as X25519PrivateKeyNaCl,
-    PublicKey as X25519PublicKeyNaCl,
-    Box,
-)
 from nacl import bindings
 
 from chat_verifier import verify_chat
@@ -27,15 +22,40 @@ BASE_URL = os.environ.get("BASE_URL", "https://cloud-api.near.ai")
 MAX_TOKENS = 100
 
 
-def fetch_model_public_key(model, signing_algo="ecdsa"):
-    """Fetch model public key from attestation report."""
-    url = f"{BASE_URL}/v1/attestation/report?model={model}&signing_algo={signing_algo}"
-    headers = {"Authorization": f"Bearer {API_KEY}"}
-    report = requests.get(url, headers=headers, timeout=30).json()
+def cloud_api_url(path: str) -> str:
+    """Build a Cloud API URL whether BASE_URL includes /v1 or not."""
 
-    if "model_attestations" in report:
+    base = BASE_URL.rstrip("/")
+    prefix = base if base.endswith("/v1") else f"{base}/v1"
+    return f"{prefix}/{path.lstrip('/')}"
+
+
+def fetch_model_public_key(model, signing_algo="ecdsa"):
+    """Fetch the NEAR model public key without aliasing or TLS binding."""
+
+    response = requests.get(
+        cloud_api_url("attestation/report"),
+        params={
+            "model": model,
+            "provider": "near",
+            "nonce": secrets.token_hex(32),
+            "signing_algo": signing_algo,
+            "include_tls_fingerprint": "false",
+        },
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "x-no-aliasing": "true",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    report = response.json()
+
+    if isinstance(report, dict) and isinstance(report.get("model_attestations"), list):
         for attestation in report["model_attestations"]:
-            if "signing_public_key" in attestation:
+            if isinstance(attestation, dict) and isinstance(
+                attestation.get("signing_public_key"), str
+            ):
                 return attestation["signing_public_key"]
 
     raise ValueError(
@@ -172,45 +192,56 @@ def decrypt_ecdsa(encrypted_data: bytes, private_key_obj) -> bytes:
     return plaintext
 
 
+def ed25519_v2_key(shared_secret: bytes) -> bytes:
+    """Derive the v2 E2EE key from an X25519 shared secret."""
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"ed25519_encryption",
+        backend=default_backend(),
+    ).derive(shared_secret)
+
+
 def encrypt_ed25519(data: bytes, public_key_hex: str) -> bytes:
-    """Encrypt data using Ed25519 public key via PyNaCl Box (X25519 + ChaCha20-Poly1305)."""
-    # Parse public key from hex
+    """Encrypt data with the Ed25519 E2EE v2 protocol.
+
+    The protocol converts the recipient key to X25519, then uses X25519 ECDH,
+    HKDF-SHA256, and XChaCha20-Poly1305. Its wire format is
+    ``[ephemeral public key][nonce][ciphertext + tag]``.
+    """
     public_key_bytes = bytes.fromhex(public_key_hex)
     if len(public_key_bytes) != 32:
         raise ValueError(
             f"Ed25519 public key must be 32 bytes, got {len(public_key_bytes)}"
         )
 
-    # Convert Ed25519 public key to X25519 public key (PyNaCl format)
-    x25519_public = X25519PublicKeyNaCl(
-        bindings.crypto_sign_ed25519_pk_to_curve25519(public_key_bytes)
+    recipient_x25519_public = bindings.crypto_sign_ed25519_pk_to_curve25519(
+        public_key_bytes
     )
-
-    # Generate ephemeral X25519 key pair using PyNaCl
-    ephemeral_private = X25519PrivateKeyNaCl.generate()
-    ephemeral_public = ephemeral_private.public_key
-
-    # Create Box for encryption
-    box = Box(ephemeral_private, x25519_public)
-
-    # Encrypt using PyNaCl Box
-    encrypted = box.encrypt(data)
-
-    # Format: [ephemeral_public_key (32 bytes)][nonce (24 bytes)][ciphertext]
-    ephemeral_public_bytes = bytes(ephemeral_public)
-    return ephemeral_public_bytes + encrypted
+    ephemeral_private = secrets.token_bytes(32)
+    ephemeral_public = bindings.crypto_scalarmult_base(ephemeral_private)
+    shared_secret = bindings.crypto_scalarmult(
+        ephemeral_private, recipient_x25519_public
+    )
+    nonce = secrets.token_bytes(
+        bindings.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
+    )
+    ciphertext = bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(
+        data, None, nonce, ed25519_v2_key(shared_secret)
+    )
+    return ephemeral_public + nonce + ciphertext
 
 
 def decrypt_ed25519(encrypted_data: bytes, private_key_obj) -> bytes:
-    """Decrypt data using Ed25519 private key via PyNaCl Box."""
+    """Decrypt data with the Ed25519 E2EE v2 protocol."""
     if len(encrypted_data) < 72:
         raise ValueError("Encrypted data too short")
 
-    # Extract components
     ephemeral_public_bytes = encrypted_data[:32]
-    box_encrypted = encrypted_data[32:]  # Contains [nonce (24 bytes)][ciphertext]
+    nonce = encrypted_data[32:56]
+    ciphertext = encrypted_data[56:]
 
-    # Get Ed25519 private key and convert to X25519 private (PyNaCl format)
     seed_bytes = private_key_obj.private_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PrivateFormat.Raw,
@@ -224,18 +255,17 @@ def decrypt_ed25519(encrypted_data: bytes, private_key_obj) -> bytes:
     x25519_private_bytes = bindings.crypto_sign_ed25519_sk_to_curve25519(
         ed25519_secret_key
     )
-    x25519_private = X25519PrivateKeyNaCl(x25519_private_bytes)
+    shared_secret = bindings.crypto_scalarmult(
+        x25519_private_bytes, ephemeral_public_bytes
+    )
+    return bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
+        ciphertext, None, nonce, ed25519_v2_key(shared_secret)
+    )
 
-    # Convert ephemeral public key to X25519 (PyNaCl format)
-    ephemeral_public = X25519PublicKeyNaCl(ephemeral_public_bytes)
 
-    # Create Box for decryption
-    box = Box(x25519_private, ephemeral_public)
-
-    # Decrypt using PyNaCl Box
-    plaintext = box.decrypt(box_encrypted)
-
-    return plaintext
+def encryption_version_header(signing_algo: str) -> dict[str, str]:
+    """Request the current Ed25519 encryption protocol when it is in use."""
+    return {"X-Encryption-Version": "2"} if signing_algo == "ed25519" else {}
 
 
 def encrypt_message_content(
@@ -312,7 +342,7 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
         "stream": True,
         "max_tokens": MAX_TOKENS,
     }
-    body_json = json.dumps(body)
+    request_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
 
     # Make request with encryption headers
     headers = {
@@ -321,13 +351,16 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
         "X-Signing-Algo": signing_algo,
         "X-Client-Pub-Key": client_pub_key_hex,
         "X-Model-Pub-Key": model_pub_key,
+        "Accept-Encoding": "identity",
+        "x-no-aliasing": "true",
+        **encryption_version_header(signing_algo),
     }
 
     try:
         response = requests.post(
-            f"{BASE_URL}/v1/chat/completions",
+            cloud_api_url("chat/completions"),
             headers=headers,
-            data=body_json,
+            data=request_body,
             stream=True,
             timeout=30,
         )
@@ -349,13 +382,13 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
         return
 
     chat_id = None
-    response_text = ""
     decrypted_content = ""
+    decryption_failures = []
 
     print("\nReceiving stream...")
-    for chunk in response.iter_lines():
-        line = chunk.decode() if chunk else ""
-        response_text += line + "\n"
+    response_body = b"".join(response.iter_content(chunk_size=None))
+    for raw_line in response_body.splitlines():
+        line = raw_line.decode("utf-8")
 
         if line.startswith("data: {") and chat_id is None:
             try:
@@ -367,38 +400,48 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
                 print(f"✗ Failed to parse chat ID: {e}")
                 print(f"  Line: {line}")
 
-        # Try to decrypt content from streaming chunks
+        # Content and reasoning fields are independently encrypted in each
+        # streaming event.
         if line.startswith("data: {") and not line.endswith("[DONE]"):
             try:
                 data = json.loads(line[6:])
                 if "choices" in data and len(data["choices"]) > 0:
                     delta = data["choices"][0].get("delta", {})
-                    if "content" in delta:
-                        content_hex = delta["content"]
-                        if isinstance(content_hex, str) and len(content_hex) > 0:
+                    for field in ["content", "reasoning_content", "reasoning"]:
+                        encrypted_value = delta.get(field)
+                        if isinstance(encrypted_value, str) and encrypted_value:
                             try:
                                 decrypted_chunk = decrypt_message_content(
-                                    content_hex, client_priv_key, signing_algo
+                                    encrypted_value, client_priv_key, signing_algo
                                 )
-                                decrypted_content += decrypted_chunk
-                                print(f"  Decrypted chunk: {decrypted_chunk}\n", end="", flush=True)
+                                if field == "content":
+                                    decrypted_content += decrypted_chunk
+                                print(
+                                    f"  Decrypted {field} chunk: {decrypted_chunk}\n",
+                                    end="",
+                                    flush=True,
+                                )
                             except Exception as e:
-                                print(f"✗ Failed to decrypt content: {e}")
-                                print(f"  Encrypted content: {content_hex}")
+                                print(f"✗ Failed to decrypt {field}: {e}")
+                                decryption_failures.append(f"{field}: {e}")
             except Exception as e:
-                print(f"✗ Failed to decrypt content: {e}")
-                print(f"  Encrypted content: {line}")
+                print(f"✗ Failed to parse encrypted stream event: {e}")
 
     print(f"\n\n✓ Complete decrypted response: {decrypted_content}")
-    print(f"✓ Total response length: {len(response_text)} bytes")
-
-    if chat_id:
-        await verify_chat(
-            chat_id,
-            body_json,
-            response_text,
-            f"Verifying Encrypted Streaming ({signing_algo.upper()})",
-            model,
+    print(f"✓ Total response length: {len(response_body)} bytes")
+    if chat_id is None:
+        raise ValueError("Streaming response did not contain a completion id")
+    await verify_chat(
+        chat_id,
+        request_body,
+        response_body,
+        f"Verifying Encrypted Streaming ({signing_algo.upper()})",
+        signing_algo=signing_algo,
+    )
+    if decryption_failures:
+        raise RuntimeError(
+            "Could not decrypt encrypted stream fields: "
+            + "; ".join(decryption_failures)
         )
 
 
@@ -448,7 +491,7 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
         "stream": False,
         "max_tokens": MAX_TOKENS,
     }
-    body_json = json.dumps(body)
+    request_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
 
     # Make request with encryption headers
     headers = {
@@ -457,13 +500,16 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
         "X-Signing-Algo": signing_algo,
         "X-Client-Pub-Key": client_pub_key_hex,
         "X-Model-Pub-Key": model_pub_key,
+        "Accept-Encoding": "identity",
+        "x-no-aliasing": "true",
+        **encryption_version_header(signing_algo),
     }
 
     try:
         response = requests.post(
-            f"{BASE_URL}/v1/chat/completions",
+            cloud_api_url("chat/completions"),
             headers=headers,
-            data=body_json,
+            data=request_body,
             timeout=30,
         )
         response.raise_for_status()
@@ -483,8 +529,11 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
         print(f"✗ Request failed: {e}")
         return
 
-    payload = response.json()
-    chat_id = payload.get("id", "unknown")
+    response_body = response.content
+    payload = json.loads(response_body)
+    chat_id = payload.get("id") if isinstance(payload, dict) else None
+    if not isinstance(chat_id, str):
+        raise ValueError("Non-streaming response did not contain a completion id")
     print(f"✓ Chat ID: {chat_id}")
 
     # Check finish_reason to see if response was truncated
@@ -494,6 +543,8 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
         print(f"✓ Finish reason: {finish_reason}")
         if finish_reason == "length":
             print(f"  ⚠ Response was truncated due to max_tokens limit")
+
+    decryption_failures = []
 
     # Decrypt response content (including all encrypted fields)
     if "choices" in payload and len(payload["choices"]) > 0:
@@ -520,6 +571,7 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
                             print(
                                 f"  Encrypted {field} (first 100 chars): {encrypted_value[:100]}"
                             )
+                            decryption_failures.append(f"{field}: {e}")
                     else:
                         # Not encrypted, just plain text
                         decrypted_fields[field] = encrypted_value
@@ -555,11 +607,16 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
 
     await verify_chat(
         chat_id,
-        body_json,
-        response.text,
+        request_body,
+        response_body,
         f"Verifying Encrypted Non-Streaming ({signing_algo.upper()})",
-        model,
+        signing_algo=signing_algo,
     )
+    if decryption_failures:
+        raise RuntimeError(
+            "Could not decrypt encrypted response fields: "
+            + "; ".join(decryption_failures)
+        )
 
 
 async def main():

@@ -1,45 +1,81 @@
 import * as assert from 'node:assert/strict';
-import * as http from 'node:http';
 import { test } from 'node:test';
 
-test('fetchReport authenticates gateway attestation requests', async () => {
-  let authorizationHeader: string | undefined;
-  let requestUrl: string | undefined;
+import {
+  checkGpu,
+  checkReportData,
+  type AttestationReport,
+  type IntelResult,
+} from './model_verifier';
 
-  const server = http.createServer((request, response) => {
-    authorizationHeader = request.headers.authorization;
-    requestUrl = request.url;
-    response.writeHead(200, { 'Content-Type': 'application/json' });
-    response.end('{}');
-  });
+const nonce = 'ab'.repeat(32);
+const signingAddress = `0x${'11'.repeat(20)}`;
 
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+function reportData(): string {
+  return Buffer.concat([
+    Buffer.from(signingAddress.slice(2), 'hex'),
+    Buffer.alloc(12),
+    Buffer.from(nonce, 'hex'),
+  ]).toString('hex');
+}
+
+function attestation(): AttestationReport {
+  return {
+    intel_quote: 'aa',
+    signing_address: signingAddress,
+    signing_algo: 'ecdsa',
+    request_nonce: nonce,
+    info: { tcb_info: { app_compose: '{}' } },
+  };
+}
+
+function verifiedQuote(): IntelResult {
+  return {
+    quote: {
+      body: {
+        reportdata: reportData(),
+        mrconfig: '',
+        rtmr3: '',
+        tdattributes: '00',
+      },
+      verified: true,
+      status: 'UpToDate',
+      advisory_ids: [],
+      debug_enabled: false,
+    },
+  };
+}
+
+test('throws when the attestation response does not echo the requested nonce', () => {
+  assert.throws(
+    () =>
+      checkReportData({
+        attestation: { ...attestation(), request_nonce: 'cd'.repeat(32) },
+        requestNonce: nonce,
+        intelResult: verifiedQuote(),
+      }),
+    /request_nonce does not match/,
+  );
+});
+
+test('requires the NRAS overall verdict to be tagged as a JWT', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify([['unexpected', 'not-used']]), { status: 200 });
 
   try {
-    const address = server.address();
-    assert.ok(address && typeof address !== 'string');
-    process.env.API_KEY = 'test-api-key';
-    process.env.BASE_URL = `http://127.0.0.1:${address.port}`;
-
-    const { fetchReport } = await import('./model_verifier');
-    await fetchReport(
-      'test/model',
-      'test-nonce',
-      'ed25519',
-      true,
-      'test-signing-address',
+    await assert.rejects(
+      () =>
+        checkGpu({
+          attestation: {
+            ...attestation(),
+            nvidia_payload: JSON.stringify({ nonce }),
+          },
+          requestNonce: nonce,
+        }),
+      /overall verdict JWT/,
     );
-
-    assert.equal(authorizationHeader, 'Bearer test-api-key');
-    assert.match(requestUrl ?? '', /^\/v1\/attestation\/report\?/);
-    assert.match(requestUrl ?? '', /model=test%2Fmodel/);
-    assert.match(requestUrl ?? '', /nonce=test-nonce/);
-    assert.match(requestUrl ?? '', /signing_algo=ed25519/);
-    assert.match(requestUrl ?? '', /include_tls_fingerprint=true/);
-    assert.match(requestUrl ?? '', /signing_address=test-signing-address/);
   } finally {
-    await new Promise<void>((resolve, reject) => {
-      server.close((error) => error ? reject(error) : resolve());
-    });
+    globalThis.fetch = originalFetch;
   }
 });

@@ -33,8 +33,9 @@ import { Buffer } from 'buffer';
 import {
   checkTdxQuote,
   checkGpu,
-  showCompose,
-  showSigstoreProvenance,
+  checkEventLog,
+  checkAppComposeMeasurement,
+  showImageDigestLookupLinks,
   IntelResult,
   AttestationApiReport,
   AttestationReport,
@@ -172,6 +173,10 @@ function checkReportDataWithTls(
     console.log('  actual:  ', embeddedNonce.toString('hex'));
   }
 
+  if (!bindsAddressAndTls || !embedsNonce) {
+    throw new Error('Quote report_data does not bind the signer, TLS fingerprint, and nonce');
+  }
+
   return {
     binds_address_and_tls: bindsAddressAndTls,
     embeds_nonce: embedsNonce,
@@ -235,19 +240,21 @@ async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', 
   if (!tlsMatch) {
     console.log('  attested:', attestation.tls_cert_fingerprint);
     console.log('  live:    ', liveSpkiHash);
+    throw new Error('Live TLS SPKI fingerprint does not match the attestation');
   }
 
   // 6. GPU attestation (optional; cloud-api gateway has no GPU)
   console.log('\n🔐 GPU attestation');
   if (attestation.nvidia_payload) {
-    await checkGpu(attestation, requestNonce);
+    await checkGpu({ attestation, requestNonce });
   } else {
     console.log('No nvidia_payload in attestation (gateway without GPU); skipping GPU check.');
   }
 
   // 7. Compose and Sigstore
-  showCompose(attestation, intelResult);
-  await showSigstoreProvenance(attestation);
+  checkEventLog(attestation, intelResult);
+  checkAppComposeMeasurement(attestation, intelResult);
+  await showImageDigestLookupLinks(attestation);
 }
 
 async function main(): Promise<void> {

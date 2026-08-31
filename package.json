@@ -15,6 +15,7 @@
     "test": "tsx --test ts/*.test.ts"
   },
   "dependencies": {
+    "@noble/ciphers": "^1.3.0",
     "@phala/dcap-qvl-node": "^0.3.3",
     "ed2curve": "^0.3.0",
     "ethers": "^5.7.2",
