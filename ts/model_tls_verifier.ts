@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * TLS Certificate Verification for NEAR AI Inference Proxy
+ * TLS Certificate Verification for a NEAR AI Model Endpoint
  *
- * Verifies that an inference proxy's TLS connection terminates inside the TEE
+ * Verifies that a model-serving endpoint's TLS connection terminates inside the TEE
  * by checking that the live TLS certificate's SPKI hash is bound into the
  * Intel TDX attestation quote.
  *
  * How it works:
- *   1. Connects to the inference proxy and fetches an attestation report with
+ *   1. Connects to the model endpoint and fetches an attestation report with
  *      `include_tls_fingerprint=true`. This causes the proxy to include its
  *      TLS certificate's SPKI hash in the TDX report data.
  *   2. Verifies the Intel TDX quote via dcap-qvl.
@@ -21,8 +21,8 @@
  * hardware attestation, not from Certificate Authority trust chains.
  *
  * Usage:
- *   pnpm run tls -- --url https://proxy.example.com:8443
- *   pnpm run tls -- --url https://proxy.example.com --signing-algo ed25519
+ *   pnpm run model-tls -- --url https://your-model.completions.near.ai
+ *   pnpm run model-tls -- --url https://your-model.completions.near.ai --signing-algo ed25519
  */
 
 import * as crypto from 'crypto';
@@ -49,7 +49,7 @@ import {
  * backend, avoiding mismatches caused by DNS round-robin or load-balancer
  * routing between multiple backends.
  */
-function fetchAttestationAndSpki(
+function fetchModelAttestationAndSpki(
   hostname: string,
   port: number,
   nonce: string,
@@ -184,9 +184,9 @@ function checkReportDataWithTls(
 }
 
 /**
- * Main verification flow: prove that a proxy's TLS cert is bound to the TEE.
+ * Main verification flow: prove that a model endpoint's TLS certificate is bound to the TEE.
  */
-async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', token?: string): Promise<void> {
+async function verifyModelTlsAttestation(url: string, signingAlgo: string = 'ecdsa', token?: string): Promise<void> {
   const parsed = new URL(url);
   if (parsed.protocol !== 'https:') {
     throw new Error('URL must use https:// scheme for TLS verification');
@@ -201,14 +201,14 @@ async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', 
   // 2. Fetch attestation report AND live SPKI hash from the same TLS connection.
   //    This avoids round-robin mismatches when multiple backends share a domain.
   console.log(`\nFetching attestation from ${hostname}:${port} (single TLS connection) ...`);
-  const { attestation, liveSpkiHash } = await fetchAttestationAndSpki(
+  const { attestation, liveSpkiHash } = await fetchModelAttestationAndSpki(
     hostname, port, requestNonce, signingAlgo, token,
   );
 
   if (!attestation.tls_cert_fingerprint) {
     throw new Error(
       'Attestation report does not include tls_cert_fingerprint. ' +
-      'The proxy may not be configured to expose a TLS certificate fingerprint.'
+      'The model endpoint may not be configured to expose a TLS certificate fingerprint.'
     );
   }
 
@@ -248,7 +248,7 @@ async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', 
   if (attestation.nvidia_payload) {
     await checkGpu({ attestation, requestNonce });
   } else {
-    console.log('No nvidia_payload in attestation (gateway without GPU); skipping GPU check.');
+    console.log('No nvidia_payload in attestation; skipping GPU check.');
   }
 
   // 7. Compose and Sigstore
@@ -270,17 +270,17 @@ async function main(): Promise<void> {
   const token = tokenIndex !== -1 && args[tokenIndex + 1] ? args[tokenIndex + 1] : (process.env.API_KEY || undefined);
 
   if (!url) {
-    console.error('Usage: pnpm run tls -- --url https://proxy.example.com[:port] [--signing-algo ecdsa|ed25519] [--token TOKEN]');
+    console.error('Usage: pnpm run model-tls -- --url https://your-model.completions.near.ai[:port] [--signing-algo ecdsa|ed25519] [--token TOKEN]');
     process.exit(1);
   }
 
   console.log('========================================');
-  console.log('🔐 TLS Attestation Verification');
+  console.log('🔐 Model TLS Attestation Verification');
   console.log('========================================');
   console.log(`Target: ${url}`);
   console.log(`Signing algorithm: ${signingAlgo}`);
 
-  await verifyTlsAttestation(url, signingAlgo, token);
+  await verifyModelTlsAttestation(url, signingAlgo, token);
 }
 
 if (require.main === module) {

@@ -101,16 +101,16 @@ rather than the Cloud API Gateway envelope:
 
 ```bash
 # TypeScript
-pnpm run tls -- --url https://your-model.completions.near.ai
+pnpm run model-tls -- --url https://your-model.completions.near.ai
 
 # Python
-python3 py/tls_verifier.py --url https://your-model.completions.near.ai
+python3 py/model_tls_verifier.py --url https://your-model.completions.near.ai
 ```
 
-`domain_verifier` is a small Gateway-TLS-only utility for the configured Cloud
-API endpoint. `encrypted_chat_verifier` and the OHTTP examples are additional
-runnable utilities. They are not part of the primary Cloud API
-model-or-Gateway verification flow described above.
+`gateway_tls_verifier` is the equivalent Gateway-TLS utility for the configured
+Cloud API endpoint; run it with `pnpm run gateway-tls`. `encrypted_chat_verifier`
+and the OHTTP examples are additional runnable utilities. They are not part of
+the primary Cloud API model-or-Gateway verification flow described above.
 
 ## Development
 

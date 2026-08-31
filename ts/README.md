@@ -28,14 +28,14 @@ those bytes with JSON that has been parsed and serialized again.
 ## Other utilities
 
 ```bash
-# Verify the TLS peer binding on a direct inference endpoint.
-pnpm run tls -- --url https://your-model.completions.near.ai
+# Verify the TLS peer binding on a direct model endpoint.
+pnpm run model-tls -- --url https://your-model.completions.near.ai
 
 # Encrypted-completion example.
 pnpm run encrypted-chat -- --model deepseek-ai/DeepSeek-V3.1
 
 # Gateway-TLS and OHTTP examples.
-pnpm run domain
+pnpm run gateway-tls
 pnpm run ohttp
 ```
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-TLS Certificate Verification for NEAR AI Inference Proxy
+TLS Certificate Verification for a NEAR AI Model Endpoint
 
-Verifies that an inference proxy's TLS connection terminates inside the TEE
+Verifies that a model-serving endpoint's TLS connection terminates inside the TEE
 by checking that the live TLS certificate's SPKI hash is bound into the
 Intel TDX attestation quote.
 
 How it works:
-  1. Connects to the inference proxy and fetches an attestation report with
+  1. Connects to the model endpoint and fetches an attestation report with
      `include_tls_fingerprint=true`. This causes the proxy to include its
      TLS certificate's SPKI hash in the TDX report data.
   2. Verifies the Intel TDX quote via dcap-qvl.
@@ -21,8 +21,8 @@ This proves the TLS certificate is held by the TEE — trust comes from the
 hardware attestation, not from Certificate Authority trust chains.
 
 Usage:
-  python3 py/tls_verifier.py --url https://proxy.example.com:8443
-  python3 py/tls_verifier.py --url https://proxy.example.com --signing-algo ed25519
+  python3 py/model_tls_verifier.py --url https://your-model.completions.near.ai
+  python3 py/model_tls_verifier.py --url https://your-model.completions.near.ai --signing-algo ed25519
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ from model_verifier import (
 def _compute_spki_hash(cert_der: bytes) -> str:
     """Compute SHA-256 of a certificate's SPKI DER encoding.
 
-    Matches the inference proxy's ``compute_spki_hash()`` — hashes the
+    Matches the model endpoint's ``compute_spki_hash()`` — hashes the
     SubjectPublicKeyInfo (not the full certificate), making the hash stable
     across certificate renewals that reuse the same key.
     """
@@ -67,7 +67,7 @@ def _compute_spki_hash(cert_der: bytes) -> str:
     return sha256(spki_der).hexdigest()
 
 
-def fetch_attestation_and_spki(
+def fetch_model_attestation_and_spki(
     hostname: str,
     port: int,
     nonce: str,
@@ -182,10 +182,10 @@ def check_report_data_with_tls(
     }
 
 
-async def verify_tls_attestation(
+async def verify_model_tls_attestation(
     url: str, signing_algo: str = "ecdsa", token: str | None = None
 ) -> None:
-    """Main verification: prove a proxy's TLS cert is bound to the TEE."""
+    """Prove a model endpoint's TLS certificate is bound to the TEE."""
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise Exception("URL must use https:// scheme for TLS verification")
@@ -201,14 +201,19 @@ async def verify_tls_attestation(
     #    This avoids round-robin mismatches when multiple backends share a domain.
     print(f"\nFetching attestation from {hostname}:{port} (single TLS connection) ...")
     attestation, live_spki_hash = await asyncio.to_thread(
-        fetch_attestation_and_spki, hostname, port, request_nonce, signing_algo, token
+        fetch_model_attestation_and_spki,
+        hostname,
+        port,
+        request_nonce,
+        signing_algo,
+        token,
     )
 
     tls_cert_fingerprint = attestation.get("tls_cert_fingerprint")
     if not tls_cert_fingerprint:
         raise Exception(
             "Attestation report does not include tls_cert_fingerprint. "
-            "The proxy may not be configured to expose a TLS certificate fingerprint."
+            "The model endpoint may not be configured to expose a TLS certificate fingerprint."
         )
 
     # Extract model name from attestation (self-reported by the proxy inside the TEE)
@@ -252,7 +257,7 @@ async def verify_tls_attestation(
         if gpu.get("verified") is not True:
             raise RuntimeError("Provided NVIDIA GPU evidence did not verify")
     else:
-        print("No nvidia_payload in attestation (gateway without GPU); skipping GPU check.")
+        print("No nvidia_payload in attestation; skipping GPU check.")
 
     # 7. Measured deployment
     event_log = check_event_log(attestation, intel_result)
@@ -266,12 +271,12 @@ async def verify_tls_attestation(
 
 async def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Verify an inference proxy's TLS certificate is bound to the TEE"
+        description="Verify a model endpoint's TLS certificate is bound to the TEE"
     )
     parser.add_argument(
         "--url",
         required=True,
-        help="HTTPS URL of the inference proxy (e.g. https://proxy.example.com:8443)",
+        help="HTTPS URL of the model endpoint (e.g. https://your-model.completions.near.ai)",
     )
     parser.add_argument(
         "--signing-algo",
@@ -287,12 +292,12 @@ async def main() -> None:
     args = parser.parse_args()
 
     print("========================================")
-    print("🔐 TLS Attestation Verification")
+    print("🔐 Model TLS Attestation Verification")
     print("========================================")
     print(f"Target: {args.url}")
     print(f"Signing algorithm: {args.signing_algo}")
 
-    await verify_tls_attestation(args.url, args.signing_algo, args.token)
+    await verify_model_tls_attestation(args.url, args.signing_algo, args.token)
 
 
 if __name__ == "__main__":
