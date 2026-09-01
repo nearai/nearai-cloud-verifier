@@ -46,6 +46,7 @@ from py.common.dstack_attestation import (
     verify_nvidia_evidence,
     decode_hex,
     verify_dstack_deployment,
+    verify_attestation_nonce,
     verify_report_data_binding_with_tls_fingerprint,
 )
 
@@ -84,28 +85,32 @@ def fetch_model_attestation_and_spki(
     context.verify_mode = ssl.CERT_NONE  # Trust comes from TEE binding, not CA
 
     conn = http.client.HTTPSConnection(hostname, port, context=context, timeout=60)
-    conn.connect()
+    try:
+        conn.connect()
+        socket = conn.sock
+        if socket is None:
+            raise RuntimeError("TLS connection did not expose a socket")
 
-    # Extract live SPKI hash from this TLS session
-    cert_der = conn.sock.getpeercert(binary_form=True)
-    if not cert_der:
+        # Extract the certificate before sending the evidence request, from
+        # this same TLS connection that will serve the response.
+        cert_der = socket.getpeercert(binary_form=True)
+        if not cert_der:
+            raise RuntimeError("Failed to get certificate from server")
+        live_spki_hash = _compute_spki_hash(cert_der)
+
+        path = (
+            f"/v1/attestation/report"
+            f"?include_tls_fingerprint=true&nonce={nonce}&signing_algo={signing_algo}"
+        )
+        headers = {"Host": hostname}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        conn.request("GET", path, headers=headers)
+        resp = conn.getresponse()
+        body = resp.read()
+    finally:
         conn.close()
-        raise Exception("Failed to get certificate from server")
-    live_spki_hash = _compute_spki_hash(cert_der)
-
-    # Make the attestation request over the same connection
-    path = (
-        f"/v1/attestation/report"
-        f"?include_tls_fingerprint=true&nonce={nonce}&signing_algo={signing_algo}"
-    )
-    headers = {"Host": hostname}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    conn.request("GET", path, headers=headers)
-    resp = conn.getresponse()
-    body = resp.read()
-    conn.close()
 
     if resp.status != 200:
         raise Exception(f"HTTP {resp.status}: {body.decode()}")
@@ -142,6 +147,10 @@ async def verify_direct_model_tls_attestation(
         signing_algo,
         token,
     )
+    if not verify_attestation_nonce(attestation, request_nonce):
+        raise RuntimeError(
+            "Attestation request_nonce does not match the nonce sent by this verifier"
+        )
 
     tls_cert_fingerprint = attestation.get("tls_cert_fingerprint")
     if not tls_cert_fingerprint:
@@ -176,6 +185,10 @@ async def verify_direct_model_tls_attestation(
         request_nonce,
         intel_result,
     )
+    if not report_data["report_data_matches_quote"]:
+        raise RuntimeError(
+            "Attestation report_data does not match report_data in the verified quote"
+        )
     if not report_data["binds_signer"] or not report_data["embeds_nonce"]:
         raise RuntimeError(
             "Quote report_data does not bind the signer, TLS fingerprint, and nonce"

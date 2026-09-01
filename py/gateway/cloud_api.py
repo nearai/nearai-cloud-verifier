@@ -13,7 +13,7 @@ import os
 import secrets
 import ssl
 from hashlib import sha256
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode, urlsplit
 
 import requests
@@ -97,6 +97,32 @@ def fetch_model_attestations(
     return attestations, nonce
 
 
+def find_model_attestation_for_signature(
+    attestations: Sequence[Dict[str, Any]],
+    signature: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Select the one model attestation matching a ``provider_tee`` signer.
+
+    This only selects evidence by signer identity. The caller must still pass
+    the selected attestation to ``verify_model_attestation`` before treating
+    it as trusted.
+    """
+
+    if signature.get("signature_kind") != "provider_tee":
+        raise ValueError("Model evidence can only verify a provider_tee signature")
+    matches = [
+        attestation
+        for attestation in attestations
+        if signing_identities_match(attestation, signature)
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "Cloud API must return exactly one model attestation matching the signature signer; "
+            f"received {len(matches)} matching entries"
+        )
+    return matches[0]
+
+
 def _peer_spki_fingerprint(certificate_der: bytes) -> str:
     certificate = x509.load_der_x509_certificate(certificate_der)
     spki_der = certificate.public_key().public_bytes(
@@ -173,10 +199,8 @@ def fetch_model_attestation_for_signature(
     model: str,
     signature: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], str]:
-    """Fetch exactly one model attestation for a ``provider_tee`` signature."""
+    """Fetch model evidence, then select the entry matching ``signature``."""
 
-    if signature.get("signature_kind") != "provider_tee":
-        raise ValueError("Model evidence can only verify a provider_tee signature")
     signing_algo, _ = signing_identity(signature, "signature")
     signing_address = signature["signing_address"]
     attestations, nonce = fetch_model_attestations(
@@ -184,17 +208,7 @@ def fetch_model_attestation_for_signature(
         signing_algo=signing_algo,
         signing_address=signing_address,
     )
-    matches = [
-        attestation
-        for attestation in attestations
-        if signing_identities_match(attestation, signature)
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            "Cloud API must return exactly one model attestation matching the signature signer; "
-            f"received {len(matches)} matching entries"
-        )
-    return matches[0], nonce
+    return find_model_attestation_for_signature(attestations, signature), nonce
 
 
 def fetch_gateway_attestation_for_signature(

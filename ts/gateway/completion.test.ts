@@ -13,7 +13,11 @@ import {
   verifyGatewayResponse,
   verifyModelResponse,
 } from './completion';
-import { type AttestationReport, fetchModelAttestations } from './cloud_api';
+import {
+  type AttestationReport,
+  findModelAttestationForSignature,
+  fetchModelAttestations,
+} from './cloud_api';
 
 const nonce = 'ab'.repeat(32);
 const modelSigningAddress = `0x${'11'.repeat(20)}`;
@@ -59,6 +63,7 @@ function attestation(
     signing_address: signingAddress,
     signing_algo: signingAlgo,
     request_nonce: requestNonce,
+    report_data: '00'.repeat(64),
     event_log: [],
     info: { tcb_info: { app_compose: '{}' } },
   };
@@ -192,6 +197,35 @@ test('verifies an ECDSA provider_tee signature against matching model evidence',
   );
 });
 
+test('verifies an unprefixed ECDSA signature against matching model evidence', async () => {
+  const wallet = ethers.Wallet.createRandom();
+  const requestBody = Buffer.from('{"model":"canonical-model"}');
+  const responseBody = Buffer.from('{"id":"chat-1"}');
+  const signedText = signatureTextFor({
+    kind: 'provider_tee',
+    requestBody,
+    responseBody,
+    model: 'canonical-model',
+  });
+  const signature: CompletionSignature = {
+    kind: 'provider_tee',
+    signedText,
+    signature: (await wallet.signMessage(signedText)).slice(2),
+    signingAddress: wallet.address,
+    signingAlgo: 'ecdsa',
+  };
+  const evidence = attestation(nonce, wallet.address, 'ecdsa') as AttestationReport;
+
+  assert.doesNotThrow(() =>
+    verifyModelResponse({
+      requestBody,
+      responseBody,
+      signature,
+      verifiedAttestation: { attestation: evidence },
+    }),
+  );
+});
+
 test('verifies an Ed25519 gateway signature against matching Gateway evidence', () => {
   const keys = generateKeyPairSync('ed25519');
   const publicKeyDer = keys.publicKey.export({ type: 'spki', format: 'der' });
@@ -279,6 +313,28 @@ test('fetches NEAR model evidence only for a provider_tee signature', async () =
   );
 });
 
+test('selects model evidence matching a provider_tee signature', () => {
+  const signature = providerSignature();
+  const selected = attestation(nonce, modelSigningAddress, 'ecdsa') as AttestationReport;
+  const other = attestation(nonce, `0x${'33'.repeat(20)}`, 'ecdsa') as AttestationReport;
+
+  assert.equal(
+    findModelAttestationForSignature({
+      attestations: [other, selected],
+      signature,
+    }),
+    selected,
+  );
+  assert.throws(
+    () =>
+      findModelAttestationForSignature({
+        attestations: [selected],
+        signature: gatewaySignature(),
+      }),
+    /provider_tee/,
+  );
+});
+
 test('fetches an array of NEAR model evidence for a deployment audit', async () => {
   await withCloudApi(
     (url) => ({
@@ -342,6 +398,30 @@ test('fetches Gateway evidence only for a gateway signature', async () => {
       assert.equal(capture.url?.searchParams.has('model'), false);
       assert.equal(capture.url?.searchParams.has('provider'), false);
       assert.equal(capture.url?.searchParams.has('signing_address'), false);
+    },
+  );
+});
+
+test('requires report_data on Gateway evidence', async () => {
+  await withCloudApi(
+    (url) => {
+      const evidence = attestation(
+        url.searchParams.get('nonce') ?? '',
+        ed25519SigningAddress,
+        'ed25519',
+      );
+      delete evidence.report_data;
+      return { gateway_attestation: evidence };
+    },
+    async () => {
+      await assert.rejects(
+        () =>
+          fetchGatewayAttestationForSignature({
+            nonce,
+            signature: gatewaySignature(),
+          }),
+        /gateway_attestation\.report_data must be a string/,
+      );
     },
   );
 });

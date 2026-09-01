@@ -181,7 +181,12 @@ async def verify_gateway_attestation(
     )
 
     print("\n🔐 Gateway report-data and TLS binding")
-    report_data = verify_report_data_binding_with_tls_fingerprint(attestation, nonce, quote)
+    report_data = verify_report_data_binding_with_tls_fingerprint(
+        attestation,
+        nonce,
+        quote,
+        require_advertised_report_data=True,
+    )
     _record_failure(
         failures,
         "API report_data",

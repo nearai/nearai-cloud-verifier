@@ -112,7 +112,7 @@ def _report_data_bytes(intel_result: Dict[str, Any]) -> bytes:
 
 
 def verify_attestation_nonce(attestation: Dict[str, Any], request_nonce: str) -> bool:
-    """Check Cloud API's echoed request_nonce before inspecting the quote."""
+    """Check the report's echoed request_nonce before inspecting the quote."""
 
     actual = attestation.get("request_nonce")
     matches = isinstance(actual, str) and actual.lower() == request_nonce.lower()
@@ -129,6 +129,7 @@ def _check_report_data(
     intel_result: Optional[Dict[str, Any]],
     *,
     require_tls_fingerprint: bool = False,
+    require_advertised_report_data: bool = False,
 ) -> Dict[str, bool]:
     """Verify quote report-data, signer/TLS, and nonce bindings."""
 
@@ -151,14 +152,17 @@ def _check_report_data(
         print("  actual bytes:", len(report_data))
         return failed
 
-    if "report_data" not in attestation:
+    advertised = attestation.get("report_data")
+    if advertised is None:
         # This JSON field is a convenience copy. The verified quote is the
         # source of truth, and direct endpoints need not expose the copy.
-        advertised_matches = True
+        advertised_matches = not require_advertised_report_data
         print("JSON report_data is present:", False)
-        print("Using report_data from the verified quote directly.")
+        if advertised_matches:
+            print("Using report_data from the verified quote directly.")
+        else:
+            print("Cloud API Gateway evidence must include report_data.")
     else:
-        advertised = attestation["report_data"]
         try:
             advertised_bytes = decode_hex(advertised, "attestation.report_data")
             advertised_matches = len(advertised_bytes) == 64 and advertised_bytes == report_data
@@ -174,12 +178,9 @@ def _check_report_data(
     try:
         signing_algo, signing_address = signing_identity(attestation, "attestation")
         fingerprint_value = attestation.get("tls_cert_fingerprint")
-        if fingerprint_value is None:
-            if require_tls_fingerprint:
+        if require_tls_fingerprint:
+            if fingerprint_value is None:
                 raise ValueError("Gateway attestation is missing tls_cert_fingerprint")
-            expected_first32 = signing_address.ljust(32, b"\x00")
-            binding_label = "Report data binds signing address"
-        else:
             fingerprint = decode_hex(
                 fingerprint_value, "attestation.tls_cert_fingerprint"
             )
@@ -187,6 +188,13 @@ def _check_report_data(
                 raise ValueError("attestation.tls_cert_fingerprint must be 32 bytes")
             expected_first32 = sha256(signing_address + fingerprint).digest()
             binding_label = "Report data binds signing address + TLS fingerprint"
+        else:
+            if fingerprint_value is not None:
+                raise ValueError(
+                    "Attestation includes tls_cert_fingerprint; use TLS report-data binding"
+                )
+            expected_first32 = signing_address.ljust(32, b"\x00")
+            binding_label = "Report data binds signing address"
         binds_signer = report_data[:32] == expected_first32
         print("Signing algorithm:", signing_algo)
         print(f"{binding_label}:", binds_signer)
@@ -229,14 +237,21 @@ def verify_report_data_binding_with_tls_fingerprint(
     attestation: Dict[str, Any],
     request_nonce: str,
     intel_result: Optional[Dict[str, Any]],
+    *,
+    require_advertised_report_data: bool = False,
 ) -> Dict[str, bool]:
-    """Verify signer, TLS fingerprint, and nonce binding from the quote."""
+    """Verify signer, TLS fingerprint, and nonce binding from the quote.
+
+    Direct model reports may omit the JSON ``report_data`` convenience copy,
+    while Cloud API Gateway reports are expected to include it.
+    """
 
     return _check_report_data(
         attestation,
         request_nonce,
         intel_result,
         require_tls_fingerprint=True,
+        require_advertised_report_data=require_advertised_report_data,
     )
 
 

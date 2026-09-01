@@ -9,7 +9,7 @@ Gateway and a direct model endpoint make different claims.
 | Endpoint family | What the verifier checks | What it does not establish on its own |
 | --- | --- | --- |
 | **NEAR AI Cloud Gateway** (`cloud-api.near.ai`) | Gateway TEE evidence, or model-serving TEE evidence returned through the Gateway. | A relationship to any particular completion. |
-| **Direct model endpoint** (`*.completions.near.ai`) | The model endpoint's TEE and TLS certificate on a direct connection. | A relationship to a Cloud API completion. |
+| **Direct model endpoint** (`*.completions.near.ai`) | The model TEE and the TLS peer key observed while fetching its direct report. | Conventional CA/hostname identity for a later connection, or a relationship to a Cloud API completion. |
 | **Direct Compose Manager report** | A recorded Compose Manager deployment action and its hash-pinned compose files. | That the action is the current deployment, or that it produced a response. |
 
 The source tree follows those boundaries:
@@ -65,6 +65,9 @@ To establish a claim about one completion, preserve the exact request and
 response bytes, then fetch its signature. Cloud API returns `signature_kind`;
 the verifier reads that field and chooses exactly one evidence path.
 
+For a `provider_tee` completion, send the original request with a canonical
+model ID and `x-no-aliasing: true`; that model ID is part of the signed text.
+
 ```bash
 # TypeScript
 pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1
@@ -119,8 +122,10 @@ python3 -m py.direct.model_tls_attestation \
   --url https://your-model.completions.near.ai
 ```
 
-This is a direct-endpoint identity check. It does not use a Cloud API
-completion signature and does not make a claim about a Gateway response.
+This checks that the TLS peer key observed while fetching the direct report is
+bound in the verified quote. It does not use conventional CA/hostname
+validation, bind a later connection, or make a claim about a Cloud API
+completion or Gateway response.
 
 ## Direct Compose Manager report
 
@@ -151,6 +156,7 @@ pnpm test
 pnpm run build
 
 python3 -m pip install -r requirements.txt
+python3 -m unittest discover -s py -t .
 python3 -m compileall -q py
 ```
 

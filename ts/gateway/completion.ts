@@ -16,8 +16,9 @@ import { ethers } from 'ethers';
 import {
   type AttestationReport,
   type FetchedGatewayAttestation,
+  findModelAttestationForSignature,
   fetchGatewayAttestation,
-  fetchModelAttestation,
+  fetchModelAttestations,
 } from './cloud_api';
 import {
   type VerifiedGatewayAttestation,
@@ -216,15 +217,13 @@ export async function fetchModelAttestationForSignature({
   nonce,
   signature,
 }: FetchModelAttestationForSignatureParams): Promise<AttestationReport> {
-  if (signature.kind !== 'provider_tee') {
-    throw new Error('Model evidence can only verify a provider_tee signature');
-  }
-  return fetchModelAttestation({
+  const attestations = await fetchModelAttestations({
     model,
     nonce,
     signingAlgo: signature.signingAlgo,
     signingAddress: signature.signingAddress,
   });
+  return findModelAttestationForSignature({ attestations, signature });
 }
 
 /** Fetch Gateway evidence for a gateway-signed response. */
@@ -250,7 +249,10 @@ function verifySignatureBytes(signature: CompletionSignature): void {
     }
     let recovered: string;
     try {
-      recovered = ethers.utils.verifyMessage(signature.signedText, signature.signature);
+      recovered = ethers.utils.verifyMessage(
+        signature.signedText,
+        ethers.utils.hexlify(signatureBytes),
+      );
     } catch (cause) {
       throw new Error(
         `ECDSA signature verification failed: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -382,11 +384,11 @@ export async function verifyCompletion({
   const nonce = crypto.randomBytes(32).toString('hex');
   if (signature.kind === 'provider_tee') {
     const model = modelFromRequest(requestBody);
-    const attestation = await fetchModelAttestationForSignature({
+    const attestations = await fetchModelAttestations({
       model,
       nonce,
-      signature,
     });
+    const attestation = findModelAttestationForSignature({ attestations, signature });
     const verifiedAttestation = await verifyModelAttestation({ attestation, nonce });
     verifyModelResponse({ requestBody, responseBody, signature, verifiedAttestation });
     return;

@@ -11,6 +11,7 @@ import * as https from 'https';
 import * as tls from 'tls';
 import { URL } from 'url';
 
+import type { CompletionSignature } from './completion';
 import {
   type AttestationReport,
   type SigningAlgo,
@@ -28,17 +29,16 @@ export interface AttestationApiReport {
   [key: string]: unknown;
 }
 
-export interface FetchModelAttestationParams {
-  model: string;
-  nonce: string;
-  signingAlgo: SigningAlgo;
-  signingAddress: string;
-}
-
 export interface FetchModelAttestationsParams {
   model: string;
   nonce: string;
   signingAlgo?: SigningAlgo;
+  signingAddress?: string;
+}
+
+export interface FindModelAttestationForSignatureParams {
+  attestations: readonly AttestationReport[];
+  signature: CompletionSignature;
 }
 
 export interface FetchGatewayAttestationParams {
@@ -52,6 +52,12 @@ export interface FetchedGatewayAttestation {
 }
 
 type JsonRecord = Record<string, unknown>;
+
+interface ParseAttestationParams {
+  value: unknown;
+  label: string;
+  requireReportData?: boolean;
+}
 
 function cloudApiBaseUrl(): string {
   return process.env.BASE_URL || 'https://cloud-api.near.ai';
@@ -128,13 +134,16 @@ function requestJsonWithPeerSpki(
         path: `${url.pathname}${url.search}`,
         method: 'GET',
         headers,
+        // This is the connection whose TLS peer key is compared against the
+        // quote. Do not take it from a reused keep-alive agent.
+        agent: false,
         timeout: 30_000,
       },
       (response) => {
         let peerSpkiFingerprint: string | undefined;
         try {
           const socket = response.socket as tls.TLSSocket;
-          const certificate = socket.getPeerX509Certificate();
+          const certificate = peerCertificate(socket);
           if (certificate) {
             const spkiDer = certificate.publicKey.export({
               type: 'spki',
@@ -188,7 +197,25 @@ function requestJsonWithPeerSpki(
   });
 }
 
-function parseAttestation(value: unknown, label: string): AttestationReport {
+/**
+ * Node does not always retain an X509Certificate object for a live TLS
+ * socket. The raw peer certificate contains the same SPKI material.
+ */
+function peerCertificate(socket: tls.TLSSocket): crypto.X509Certificate | undefined {
+  const certificate = socket.getPeerX509Certificate();
+  if (certificate !== undefined) {
+    return certificate;
+  }
+
+  const peer = socket.getPeerCertificate(true);
+  return peer.raw === undefined ? undefined : new crypto.X509Certificate(peer.raw);
+}
+
+function parseAttestation({
+  value,
+  label,
+  requireReportData = false,
+}: ParseAttestationParams): AttestationReport {
   const record = asRecord(value, label);
   const info = asRecord(record.info, `${label}.info`);
   if (
@@ -204,6 +231,16 @@ function parseAttestation(value: unknown, label: string): AttestationReport {
     typeof record.tls_cert_fingerprint !== 'string'
   ) {
     throw new Error(`${label}.tls_cert_fingerprint must be a string or null`);
+  }
+  if (requireReportData && typeof record.report_data !== 'string') {
+    throw new Error(`${label}.report_data must be a string`);
+  }
+  if (
+    record.report_data !== undefined &&
+    record.report_data !== null &&
+    typeof record.report_data !== 'string'
+  ) {
+    throw new Error(`${label}.report_data must be a string or null`);
   }
   return {
     intel_quote: requireString(record.intel_quote, `${label}.intel_quote`),
@@ -233,17 +270,21 @@ function parseAttestationApiReport(value: unknown): AttestationApiReport {
   const record = asRecord(value, 'Cloud API attestation response');
   const report: AttestationApiReport = {};
   if (record.gateway_attestation !== undefined) {
-    report.gateway_attestation = parseAttestation(
-      record.gateway_attestation,
-      'gateway_attestation',
-    );
+    report.gateway_attestation = parseAttestation({
+      value: record.gateway_attestation,
+      label: 'gateway_attestation',
+      requireReportData: true,
+    });
   }
   if (record.model_attestations !== undefined) {
     if (!Array.isArray(record.model_attestations)) {
       throw new Error('model_attestations must be an array when present');
     }
     report.model_attestations = record.model_attestations.map((item, index) =>
-      parseAttestation(item, `model_attestations[${index}]`),
+      parseAttestation({
+        value: item,
+        label: `model_attestations[${index}]`,
+      }),
     );
   }
   if (typeof record.tls_certificate === 'string') {
@@ -252,56 +293,16 @@ function parseAttestationApiReport(value: unknown): AttestationApiReport {
   return report;
 }
 
-/** Fetch the one NEAR model attestation selected by a signature signer. */
-export async function fetchModelAttestation({
-  model,
-  nonce,
-  signingAlgo,
-  signingAddress,
-}: FetchModelAttestationParams): Promise<AttestationReport> {
-  const report = parseAttestationApiReport(
-    await requestJson(
-      attestationReportUrl({
-        model,
-        nonce,
-        signing_algo: signingAlgo,
-        signing_address: signingAddress,
-        provider: 'near',
-        include_tls_fingerprint: 'false',
-      }),
-      cloudApiHeaders({ 'x-no-aliasing': 'true' }),
-    ),
-  );
-  const candidates = (report.model_attestations ?? []).filter((attestation) => {
-    try {
-      return (
-        normalizeSigningAlgo(attestation.signing_algo) === signingAlgo &&
-        signingAddressBytes(attestation.signing_address, signingAlgo).equals(
-          signingAddressBytes(signingAddress, signingAlgo),
-        )
-      );
-    } catch {
-      return false;
-    }
-  });
-  if (candidates.length !== 1) {
-    throw new Error(
-      `Expected exactly one NEAR model attestation for the signature signer; found ${candidates.length}`,
-    );
-  }
-  const attestation = candidates[0]!;
-  verifyAttestationNonce(attestation, nonce);
-  return attestation;
-}
-
 /**
  * Fetch every NEAR model evidence item returned for a standalone deployment
- * audit. This does not associate the evidence with a completion signature.
+ * audit. Optional signer filters only narrow the API response; this does not
+ * associate the evidence with a completion signature.
  */
 export async function fetchModelAttestations({
   model,
   nonce,
   signingAlgo,
+  signingAddress,
 }: FetchModelAttestationsParams): Promise<AttestationReport[]> {
   const query: Record<string, string> = {
     model,
@@ -310,6 +311,7 @@ export async function fetchModelAttestations({
     include_tls_fingerprint: 'false',
   };
   if (signingAlgo !== undefined) query.signing_algo = signingAlgo;
+  if (signingAddress !== undefined) query.signing_address = signingAddress;
   const report = parseAttestationApiReport(
     await requestJson(
       attestationReportUrl(query),
@@ -324,6 +326,41 @@ export async function fetchModelAttestations({
     verifyAttestationNonce(attestation, nonce);
   }
   return attestations;
+}
+
+/**
+ * Select the one NEAR model evidence item whose advertised signer matches a
+ * provider-TEE signature. This does not verify the quote or the signature.
+ */
+export function findModelAttestationForSignature({
+  attestations,
+  signature,
+}: FindModelAttestationForSignatureParams): AttestationReport {
+  if (signature.kind !== 'provider_tee') {
+    throw new Error('Model evidence can only verify a provider_tee signature');
+  }
+
+  const candidates = attestations.filter((attestation) => {
+    try {
+      return (
+        normalizeSigningAlgo(attestation.signing_algo) === signature.signingAlgo &&
+        signingAddressBytes(
+          attestation.signing_address,
+          signature.signingAlgo,
+        ).equals(
+          signingAddressBytes(signature.signingAddress, signature.signingAlgo),
+        )
+      );
+    } catch {
+      return false;
+    }
+  });
+  if (candidates.length !== 1) {
+    throw new Error(
+      `Expected exactly one NEAR model attestation for the signature signer; found ${candidates.length}`,
+    );
+  }
+  return candidates[0]!;
 }
 
 /**

@@ -31,6 +31,9 @@ pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1
 
 `gateway/completion.ts` keeps the original request and response bytes. Do not
 parse and serialize those bytes again before the signature check.
+For `provider_tee`, use a canonical `--model`; the example sends
+`x-no-aliasing: true` and reconstructs the model portion from the saved
+request bytes.
 
 ## Run direct-endpoint checks
 
@@ -39,9 +42,11 @@ pnpm run model-tls -- --url https://your-model.completions.near.ai
 pnpm run compose-manager -- --url https://your-model.completions.near.ai
 ```
 
-These commands verify a direct endpoint's own evidence; they are not Gateway
-completion verifiers. Compose Manager verifies recorded deployment actions,
-not the current deployment state or a response.
+The model command checks the TLS peer key observed for its report connection
+against the verified quote; it is not conventional CA/hostname validation and
+does not bind a later connection. These commands are not Gateway completion
+verifiers. Compose Manager verifies recorded deployment actions, not the
+current deployment state or a response.
 
 ## Other examples
 

@@ -46,7 +46,8 @@ from py.gateway.cloud_api import (
     cloud_api_headers,
     cloud_api_url,
     fetch_gateway_attestation_for_signature,
-    fetch_model_attestation_for_signature,
+    fetch_model_attestations,
+    find_model_attestation_for_signature,
 )
 
 
@@ -307,9 +308,10 @@ async def verify_completion(
     try:
         if kind == "provider_tee":
             print("\n🔐 Model attestation for provider_tee signature")
-            attestation, nonce = fetch_model_attestation_for_signature(
-                _model_from_request(request_bytes), signature
+            attestations, nonce = fetch_model_attestations(
+                _model_from_request(request_bytes),
             )
+            attestation = find_model_attestation_for_signature(attestations, signature)
             verified_attestation = await verify_model_attestation(attestation, nonce)
             failures.extend(
                 verify_model_response(

@@ -35,6 +35,7 @@ import {
   verifyDstackQuote,
   verifyDstackDeployment,
   verifyNvidiaEvidence,
+  verifyAttestationNonce,
   verifyReportDataBindingWithTlsFingerprint,
   type AttestationReport,
 } from '../common/dstack_attestation';
@@ -69,11 +70,14 @@ function fetchModelAttestationAndSpki(
       headers,
       rejectUnauthorized: false, // Trust comes from TEE binding, not CA
       servername: hostname,
+      // The observed peer certificate must belong to the connection that
+      // served this report, rather than an agent-reused socket.
+      agent: false,
       timeout: 60000,
     }, (res) => {
       // Extract live SPKI hash from this TLS session
       const tlsSocket = res.socket as tls.TLSSocket;
-      const cert = tlsSocket.getPeerX509Certificate();
+      const cert = peerCertificate(tlsSocket);
       if (!cert) {
         reject(new Error('Failed to get certificate from server'));
         return;
@@ -113,6 +117,17 @@ function fetchModelAttestationAndSpki(
   });
 }
 
+/** Fall back to the raw peer certificate when Node did not retain X509 state. */
+function peerCertificate(socket: tls.TLSSocket): crypto.X509Certificate | undefined {
+  const certificate = socket.getPeerX509Certificate();
+  if (certificate !== undefined) {
+    return certificate;
+  }
+
+  const peer = socket.getPeerCertificate(true);
+  return peer.raw === undefined ? undefined : new crypto.X509Certificate(peer.raw);
+}
+
 /**
  * Main verification flow: prove that a model endpoint's TLS certificate is bound to the TEE.
  */
@@ -138,6 +153,10 @@ export async function verifyDirectModelTlsAttestation(
   const { attestation, liveSpkiHash } = await fetchModelAttestationAndSpki(
     hostname, port, requestNonce, signingAlgo, token,
   );
+
+  // Check the response's untrusted convenience echo before spending work on
+  // quote verification. Freshness is still established by quote report_data.
+  verifyAttestationNonce(attestation, requestNonce);
 
   if (!attestation.tls_cert_fingerprint) {
     throw new Error(
