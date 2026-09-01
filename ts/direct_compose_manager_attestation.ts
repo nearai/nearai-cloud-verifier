@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /**
- * Verify Compose Manager deployment-transparency evidence from a direct model
+ * Verify direct Compose Manager deployment-transparency evidence from a model
  * endpoint. This is intentionally separate from the Cloud API model/Gateway
- * flows: compose_manager_attestation is only exposed by a direct report.
+ * attestation flows: compose_manager_attestation is only exposed by a direct
+ * report.
  *
  * The nested quote binds SHA-256(canonical actions JSON) || client nonce. Each
  * compose action can in turn pin a file in nearai/cvm-compose-files by commit
@@ -18,11 +19,11 @@ import {
   checkEventLog,
   verifyDstackQuote,
   type AttestationBaseInfo,
-} from '../common/dstack_attestation';
+} from './utils/attestation';
 
 type JsonRecord = Record<string, unknown>;
 
-export interface VerifyComposeManagerAttestationParams {
+export interface VerifyDirectComposeManagerAttestationParams {
   url: string;
   signingAlgo?: string;
   token?: string;
@@ -305,11 +306,11 @@ function showComposeManagerImageLookup(actions: unknown[]): void {
  * checked. The report does not attest a current action, so the verifier never
  * chooses one as a model-specific deployment claim.
  */
-export async function verifyComposeManagerAttestation({
+export async function verifyDirectComposeManagerAttestation({
   url,
   signingAlgo,
   token,
-}: VerifyComposeManagerAttestationParams): Promise<void> {
+}: VerifyDirectComposeManagerAttestationParams): Promise<void> {
   const nonce = crypto.randomBytes(32).toString('hex');
   console.log('Request nonce:', nonce);
   const attestation = await fetchComposeManagerAttestation({
@@ -399,16 +400,16 @@ async function main(): Promise<void> {
   const url = optionValue(args, '--url');
   if (!url) {
     throw new Error(
-      'Usage: pnpm run compose-manager -- --url https://your-model.completions.near.ai ' +
+      'Usage: pnpm run direct-compose-manager-attestation -- --url https://your-model.completions.near.ai ' +
         '[--signing-algo ecdsa|ed25519] [--token TOKEN]',
     );
   }
 
   console.log('========================================');
-  console.log('🔐 Compose Manager deployment transparency');
+  console.log('🔐 Direct Compose Manager attestation');
   console.log('========================================');
   console.log(`Target: ${url}`);
-  await verifyComposeManagerAttestation({
+  await verifyDirectComposeManagerAttestation({
     url,
     signingAlgo: optionValue(args, '--signing-algo'),
     token: optionValue(args, '--token') ?? process.env.API_KEY,

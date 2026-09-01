@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
 from nacl import bindings
 
-from py.gateway.completion import verify_completion
+from py.completion import verify_completion
 
 API_KEY = os.environ.get("API_KEY", "")
 BASE_URL = os.environ.get("BASE_URL", "https://cloud-api.near.ai")

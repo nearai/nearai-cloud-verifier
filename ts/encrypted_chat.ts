@@ -12,8 +12,8 @@ import { ethers } from 'ethers';
 import * as nacl from 'tweetnacl';
 import * as ed2curve from 'ed2curve';
 import { xchacha20poly1305 } from '@noble/ciphers/chacha';
-import { verifyCompletion } from '../gateway/completion';
-import type { SigningAlgo } from '../common/dstack_attestation';
+import { verifyCompletion } from './completion';
+import type { SigningAlgo } from './utils/attestation';
 
 const API_KEY = process.env.API_KEY || '';
 const BASE_URL = process.env.BASE_URL || 'https://cloud-api.near.ai';

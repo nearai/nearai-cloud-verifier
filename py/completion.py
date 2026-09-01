@@ -18,8 +18,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import secrets
 from hashlib import sha256
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
 
 import nacl.exceptions
@@ -28,24 +29,24 @@ import requests
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
-from py.common.dstack_attestation import (
+from py.utils.attestation import (
     AttestationVerificationError,
     VerificationFailure,
     decode_hex,
     signing_identities_match,
     signing_identity,
 )
-from py.gateway.attestation import (
+from py.utils.verifier import (
     VerifiedGatewayAttestation,
     VerifiedModelAttestation,
     verify_gateway_attestation,
     verify_model_attestation,
 )
-from py.gateway.cloud_api import (
+from py.utils.api import (
     API_KEY,
     cloud_api_headers,
     cloud_api_url,
-    fetch_gateway_attestation_for_signature,
+    fetch_gateway_attestation,
     fetch_model_attestations,
     find_model_attestation_for_signature,
 )
@@ -117,6 +118,37 @@ def _require_signature_kind(signature: Dict[str, Any]) -> str:
             f"received {kind!r}"
         )
     return kind
+
+
+def fetch_model_attestation_for_signature(
+    model: str,
+    nonce: str,
+    signature: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Fetch the one model attestation for a ``provider_tee`` signature."""
+
+    if _require_signature_kind(signature) != "provider_tee":
+        raise ValueError("Model evidence can only verify a provider_tee signature")
+    signing_algo, _ = signing_identity(signature, "signature")
+    attestations = fetch_model_attestations(
+        model,
+        nonce,
+        signing_algo=signing_algo,
+        signing_address=signature["signing_address"],
+    )
+    return find_model_attestation_for_signature(attestations, signature)
+
+
+def fetch_gateway_attestation_for_signature(
+    nonce: str,
+    signature: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Fetch Gateway evidence for a ``gateway`` signature."""
+
+    if _require_signature_kind(signature) != "gateway":
+        raise ValueError("Gateway evidence can only verify a gateway signature")
+    signing_algo, _ = signing_identity(signature, "signature")
+    return fetch_gateway_attestation(nonce, signing_algo=signing_algo)
 
 
 def _model_from_request(request_body: bytes) -> str:
@@ -208,6 +240,8 @@ def verify_response_signature(
         )
 
     signing_algo = signature.get("signing_algo")
+    if isinstance(signing_algo, str):
+        signing_algo = signing_algo.lower()
     if signing_algo == "ecdsa":
         cryptographically_valid = _verify_ecdsa_signature(signature, signed_text)
     elif signing_algo == "ed25519":
@@ -305,11 +339,13 @@ async def verify_completion(
     signature = fetch_signature(chat_id, signing_algo=signing_algo)
     print(json.dumps(signature, indent=2))
     kind = _require_signature_kind(signature)
+    nonce = secrets.token_hex(32)
     try:
         if kind == "provider_tee":
             print("\n🔐 Model attestation for provider_tee signature")
-            attestations, nonce = fetch_model_attestations(
+            attestations = fetch_model_attestations(
                 _model_from_request(request_bytes),
+                nonce,
             )
             attestation = find_model_attestation_for_signature(attestations, signature)
             verified_attestation = await verify_model_attestation(attestation, nonce)
@@ -323,8 +359,9 @@ async def verify_completion(
             )
         else:
             print("\n🔐 Gateway attestation for gateway signature")
-            attestation, nonce, peer_spki = fetch_gateway_attestation_for_signature(
-                signature
+            attestation, peer_spki = fetch_gateway_attestation_for_signature(
+                nonce,
+                signature,
             )
             verified_attestation = await verify_gateway_attestation(
                 attestation,

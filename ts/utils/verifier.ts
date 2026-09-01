@@ -16,7 +16,7 @@ import {
   verifyNvidiaEvidence,
   verifyReportDataBinding,
   verifyReportDataBindingWithTlsFingerprint,
-} from '../common/dstack_attestation';
+} from './attestation';
 
 export interface VerifyModelAttestationParams {
   attestation: AttestationReport;

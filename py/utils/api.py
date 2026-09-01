@@ -1,8 +1,7 @@
 """Cloud API evidence retrieval and response decoding.
 
-These helpers fetch or select evidence only. The caller must pass the result
-to ``verify_gateway_attestation`` or ``verify_model_attestation`` before using
-it as verified evidence.
+These helpers fetch or select evidence only. Callers must verify the returned
+evidence separately before treating it as trusted.
 """
 
 from __future__ import annotations
@@ -10,19 +9,18 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import secrets
 import ssl
 from hashlib import sha256
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlencode, urlsplit
 
 import requests
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
-from py.common.dstack_attestation import (
+from py.utils.attestation import (
+    decode_hex,
     signing_identities_match,
-    signing_identity,
 )
 
 
@@ -68,12 +66,15 @@ def _request_json(
 
 def fetch_model_attestations(
     model: str,
+    nonce: str,
     signing_algo: Optional[str] = None,
     signing_address: Optional[str] = None,
-) -> Tuple[List[Dict[str, Any]], str]:
-    """Fetch NEAR model evidence with a fresh nonce and no TLS binding."""
+) -> List[Dict[str, Any]]:
+    """Fetch NEAR model evidence for a caller-provided nonce and no TLS binding."""
 
-    nonce = secrets.token_hex(32)
+    nonce_bytes = decode_hex(nonce, "nonce")
+    if len(nonce_bytes) != 32:
+        raise ValueError(f"nonce must be 32 bytes, got {len(nonce_bytes)}")
     params = {
         "model": model,
         "provider": "near",
@@ -90,35 +91,47 @@ def fetch_model_attestations(
         headers={"x-no-aliasing": "true"},
     )
     attestations = report.get("model_attestations")
-    if not isinstance(attestations, list) or not all(
+    if not isinstance(attestations, list) or not attestations or not all(
         isinstance(attestation, dict) for attestation in attestations
     ):
         raise ValueError("Cloud API model report does not contain model_attestations[]")
-    return attestations, nonce
+    for attestation in attestations:
+        reported_nonce = decode_hex(
+            attestation.get("request_nonce"), "attestation.request_nonce"
+        )
+        if len(reported_nonce) != 32:
+            raise ValueError(
+                "Cloud API attestation request_nonce must be 32 bytes, "
+                f"got {len(reported_nonce)}"
+            )
+        if reported_nonce != nonce_bytes:
+            raise ValueError(
+                "Cloud API attestation request_nonce does not match the requested nonce"
+            )
+    return attestations
 
 
 def find_model_attestation_for_signature(
     attestations: Sequence[Dict[str, Any]],
-    signature: Dict[str, Any],
+    signature: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """Select the one model attestation matching a ``provider_tee`` signer.
+    """Select the one model attestation matching a signature signer.
 
-    This only selects evidence by signer identity. The caller must still pass
-    the selected attestation to ``verify_model_attestation`` before treating
-    it as trusted.
+    This is signer selection only. It neither interprets ``signature_kind``
+    nor verifies the selected evidence.
     """
 
-    if signature.get("signature_kind") != "provider_tee":
-        raise ValueError("Model evidence can only verify a provider_tee signature")
-    matches = [
-        attestation
-        for attestation in attestations
-        if signing_identities_match(attestation, signature)
-    ]
+    matches: List[Dict[str, Any]] = []
+    for attestation in attestations:
+        try:
+            if signing_identities_match(attestation, signature):
+                matches.append(attestation)
+        except (TypeError, ValueError):
+            continue
     if len(matches) != 1:
         raise ValueError(
-            "Cloud API must return exactly one model attestation matching the signature signer; "
-            f"received {len(matches)} matching entries"
+            "Expected exactly one NEAR model attestation for the signature signer; "
+            f"found {len(matches)}"
         )
     return matches[0]
 
@@ -180,11 +193,14 @@ def _fetch_gateway_report_with_peer_spki(
 
 
 def fetch_gateway_attestation(
+    nonce: str,
     signing_algo: Optional[str] = None,
-) -> Tuple[Dict[str, Any], str, Optional[str]]:
-    """Fetch standalone Gateway evidence and the TLS peer that served it."""
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Fetch Gateway evidence for a caller-provided nonce and its TLS peer."""
 
-    nonce = secrets.token_hex(32)
+    nonce_bytes = decode_hex(nonce, "nonce")
+    if len(nonce_bytes) != 32:
+        raise ValueError(f"nonce must be 32 bytes, got {len(nonce_bytes)}")
     params = {"nonce": nonce, "include_tls_fingerprint": "true"}
     if signing_algo is not None:
         params["signing_algo"] = signing_algo
@@ -192,31 +208,16 @@ def fetch_gateway_attestation(
     attestation = report.get("gateway_attestation")
     if not isinstance(attestation, dict):
         raise ValueError("Cloud API Gateway report does not contain gateway_attestation")
-    return attestation, nonce, peer_spki
-
-
-def fetch_model_attestation_for_signature(
-    model: str,
-    signature: Dict[str, Any],
-) -> Tuple[Dict[str, Any], str]:
-    """Fetch model evidence, then select the entry matching ``signature``."""
-
-    signing_algo, _ = signing_identity(signature, "signature")
-    signing_address = signature["signing_address"]
-    attestations, nonce = fetch_model_attestations(
-        model,
-        signing_algo=signing_algo,
-        signing_address=signing_address,
+    reported_nonce = decode_hex(
+        attestation.get("request_nonce"), "attestation.request_nonce"
     )
-    return find_model_attestation_for_signature(attestations, signature), nonce
-
-
-def fetch_gateway_attestation_for_signature(
-    signature: Dict[str, Any],
-) -> Tuple[Dict[str, Any], str, Optional[str]]:
-    """Fetch Gateway evidence for a ``gateway`` signature."""
-
-    if signature.get("signature_kind") != "gateway":
-        raise ValueError("Gateway evidence can only verify a gateway signature")
-    signing_algo, _ = signing_identity(signature, "signature")
-    return fetch_gateway_attestation(signing_algo=signing_algo)
+    if len(reported_nonce) != 32:
+        raise ValueError(
+            "Cloud API attestation request_nonce must be 32 bytes, "
+            f"got {len(reported_nonce)}"
+        )
+    if reported_nonce != nonce_bytes:
+        raise ValueError(
+            "Cloud API attestation request_nonce does not match the requested nonce"
+        )
+    return attestation, peer_spki

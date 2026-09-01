@@ -3,8 +3,8 @@
  * Shared dstack attestation primitives.
  *
  * These functions verify the quote, report-data bindings, measured deployment,
- * and optional GPU evidence. Endpoint-specific flows live in gateway/ and
- * direct/ so their different verification goals remain explicit.
+ * and optional GPU evidence. Scenario files such as completion and
+ * direct_model_attestation keep their different verification goals explicit.
  */
 
 import { Buffer } from 'buffer';
@@ -18,6 +18,12 @@ const INTEL_PCCS_URL =
 const DSTACK_RUNTIME_EVENT_TYPE = 0x08000001;
 
 export type SigningAlgo = 'ecdsa' | 'ed25519';
+
+/** The signer fields used to select matching attestation evidence. */
+export interface SigningIdentity {
+  signingAddress: string;
+  signingAlgo: SigningAlgo;
+}
 
 export interface AttestationBaseInfo {
   intel_quote: string;

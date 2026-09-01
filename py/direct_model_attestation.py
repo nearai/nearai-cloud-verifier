@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TLS Certificate Verification for a NEAR AI Model Endpoint
+Direct Model Attestation Verification for a NEAR AI Model Endpoint
 
 Verifies that a model-serving endpoint's TLS connection terminates inside the TEE
 by checking that the live TLS certificate's SPKI hash is bound into the
@@ -21,8 +21,8 @@ This proves the TLS certificate is held by the TEE — trust comes from the
 hardware attestation, not from Certificate Authority trust chains.
 
 Usage:
-  python3 -m py.direct.model_tls_attestation --url https://your-model.completions.near.ai
-  python3 -m py.direct.model_tls_attestation --url https://your-model.completions.near.ai --signing-algo ed25519
+  python3 -m py.direct_model_attestation --url https://your-model.completions.near.ai
+  python3 -m py.direct_model_attestation --url https://your-model.completions.near.ai --signing-algo ed25519
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
-from py.common.dstack_attestation import (
+from py.utils.attestation import (
     verify_dstack_quote,
     verify_nvidia_evidence,
     decode_hex,
@@ -121,10 +121,10 @@ def fetch_model_attestation_and_spki(
     return attestation, live_spki_hash
 
 
-async def verify_direct_model_tls_attestation(
+async def verify_direct_model_attestation(
     url: str, signing_algo: str = "ecdsa", token: str | None = None
 ) -> None:
-    """Prove a model endpoint's TLS certificate is bound to the TEE."""
+    """Verify a direct model attestation and its endpoint TLS binding."""
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise Exception("URL must use https:// scheme for TLS verification")
@@ -230,7 +230,7 @@ async def verify_direct_model_tls_attestation(
 
 async def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Verify a model endpoint's TLS certificate is bound to the TEE"
+        description="Verify a direct model attestation and its TLS binding"
     )
     parser.add_argument(
         "--url",
@@ -251,12 +251,12 @@ async def main() -> None:
     args = parser.parse_args()
 
     print("========================================")
-    print("🔐 Model TLS Attestation Verification")
+    print("🔐 Direct model attestation verification")
     print("========================================")
     print(f"Target: {args.url}")
     print(f"Signing algorithm: {args.signing_algo}")
 
-    await verify_direct_model_tls_attestation(args.url, args.signing_algo, args.token)
+    await verify_direct_model_attestation(args.url, args.signing_algo, args.token)
 
 
 if __name__ == "__main__":

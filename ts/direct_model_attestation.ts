@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * TLS Certificate Verification for a NEAR AI Model Endpoint
+ * Direct model attestation verification for a NEAR AI model endpoint.
  *
  * Verifies that a model-serving endpoint's TLS connection terminates inside the TEE
  * by checking that the live TLS certificate's SPKI hash is bound into the
@@ -21,8 +21,8 @@
  * hardware attestation, not from Certificate Authority trust chains.
  *
  * Usage:
- *   pnpm run model-tls -- --url https://your-model.completions.near.ai
- *   pnpm run model-tls -- --url https://your-model.completions.near.ai --signing-algo ed25519
+ *   pnpm run direct-model-attestation -- --url https://your-model.completions.near.ai
+ *   pnpm run direct-model-attestation -- --url https://your-model.completions.near.ai --signing-algo ed25519
  */
 
 import * as crypto from 'crypto';
@@ -38,7 +38,7 @@ import {
   verifyAttestationNonce,
   verifyReportDataBindingWithTlsFingerprint,
   type AttestationReport,
-} from '../common/dstack_attestation';
+} from './utils/attestation';
 
 /**
  * Fetch attestation report AND extract the live TLS certificate SPKI hash
@@ -129,9 +129,10 @@ function peerCertificate(socket: tls.TLSSocket): crypto.X509Certificate | undefi
 }
 
 /**
- * Main verification flow: prove that a model endpoint's TLS certificate is bound to the TEE.
+ * Verify a direct model attestation and prove that its TLS certificate is bound
+ * to the model-serving TEE.
  */
-export async function verifyDirectModelTlsAttestation(
+export async function verifyDirectModelAttestation(
   url: string,
   signingAlgo: string = 'ecdsa',
   token?: string,
@@ -235,17 +236,17 @@ async function main(): Promise<void> {
   const token = tokenIndex !== -1 && args[tokenIndex + 1] ? args[tokenIndex + 1] : (process.env.API_KEY || undefined);
 
   if (!url) {
-    console.error('Usage: pnpm run model-tls -- --url https://your-model.completions.near.ai[:port] [--signing-algo ecdsa|ed25519] [--token TOKEN]');
+    console.error('Usage: pnpm run direct-model-attestation -- --url https://your-model.completions.near.ai[:port] [--signing-algo ecdsa|ed25519] [--token TOKEN]');
     process.exit(1);
   }
 
   console.log('========================================');
-  console.log('🔐 Model TLS Attestation Verification');
+  console.log('🔐 Direct model attestation');
   console.log('========================================');
   console.log(`Target: ${url}`);
   console.log(`Signing algorithm: ${signingAlgo}`);
 
-  await verifyDirectModelTlsAttestation(url, signingAlgo, token);
+  await verifyDirectModelAttestation(url, signingAlgo, token);
 }
 
 if (require.main === module) {

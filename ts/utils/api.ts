@@ -11,14 +11,14 @@ import * as https from 'https';
 import * as tls from 'tls';
 import { URL } from 'url';
 
-import type { CompletionSignature } from './completion';
 import {
   type AttestationReport,
   type SigningAlgo,
+  type SigningIdentity,
   normalizeSigningAlgo,
   signingAddressBytes,
   verifyAttestationNonce,
-} from '../common/dstack_attestation';
+} from './attestation';
 
 export type { AttestationReport, SigningAlgo };
 
@@ -38,7 +38,7 @@ export interface FetchModelAttestationsParams {
 
 export interface FindModelAttestationForSignatureParams {
   attestations: readonly AttestationReport[];
-  signature: CompletionSignature;
+  signingIdentity: SigningIdentity;
 }
 
 export interface FetchGatewayAttestationParams {
@@ -117,12 +117,13 @@ async function requestJson(
  * that evidence response. This is intentionally Node-only: browsers do not
  * expose a peer certificate to JavaScript.
  */
-function requestJsonWithPeerSpki(
+async function requestJsonWithPeerSpki(
   url: URL,
   headers: Record<string, string>,
 ): Promise<{ body: unknown; peerSpkiFingerprint?: string }> {
   if (url.protocol !== 'https:') {
-    return requestJson(url, headers).then((body) => ({ body }));
+    const body = await requestJson(url, headers);
+    return ({body});
   }
 
   return new Promise((resolve, reject) => {
@@ -330,25 +331,24 @@ export async function fetchModelAttestations({
 
 /**
  * Select the one NEAR model evidence item whose advertised signer matches a
- * provider-TEE signature. This does not verify the quote or the signature.
+ * signature's signing identity. This does not verify the quote or signature.
  */
 export function findModelAttestationForSignature({
   attestations,
-  signature,
+  signingIdentity,
 }: FindModelAttestationForSignatureParams): AttestationReport {
-  if (signature.kind !== 'provider_tee') {
-    throw new Error('Model evidence can only verify a provider_tee signature');
-  }
-
   const candidates = attestations.filter((attestation) => {
     try {
       return (
-        normalizeSigningAlgo(attestation.signing_algo) === signature.signingAlgo &&
+        normalizeSigningAlgo(attestation.signing_algo) === signingIdentity.signingAlgo &&
         signingAddressBytes(
           attestation.signing_address,
-          signature.signingAlgo,
+          signingIdentity.signingAlgo,
         ).equals(
-          signingAddressBytes(signature.signingAddress, signature.signingAlgo),
+          signingAddressBytes(
+            signingIdentity.signingAddress,
+            signingIdentity.signingAlgo,
+          ),
         )
       );
     } catch {

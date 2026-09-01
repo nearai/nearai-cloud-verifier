@@ -18,7 +18,7 @@ import urllib.request
 BASE_URL = os.environ.get("BASE_URL", "https://cloud-api.near.ai").rstrip("/")
 
 
-def fetch_attestation() -> dict:
+def fetch_gateway_attestation() -> dict:
     """Fetch a Gateway attestation report using the configured API key."""
     api_base = BASE_URL if BASE_URL.endswith("/v1") else f"{BASE_URL}/v1"
     request = urllib.request.Request(
@@ -76,8 +76,8 @@ def fetch_provenance(digest_hex: str) -> tuple[str, str]:
 
 
 def main():
-    print("Fetching attestation from cloud-api.near.ai...")
-    attestation = fetch_attestation()
+    print(f"Fetching Gateway attestation from {BASE_URL}...")
+    attestation = fetch_gateway_attestation()
 
     image_ref, digest_hex = extract_image_digest(attestation)
     print(f"\nImage:   {image_ref}")

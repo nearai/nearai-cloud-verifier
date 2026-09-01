@@ -1,165 +1,82 @@
 # NEAR AI Cloud verifier
 
-Runnable reference implementations for verifying NEAR AI attestation evidence.
-They are organized around the endpoint you are verifying, because a Cloud API
-Gateway and a direct model endpoint make different claims.
+Runnable TypeScript and Python verification examples. Pick one script for the
+claim you want to check; the rest of the repository is shared implementation
+for those examples.
 
-## Choose the endpoint first
-
-| Endpoint family | What the verifier checks | What it does not establish on its own |
-| --- | --- | --- |
-| **NEAR AI Cloud Gateway** (`cloud-api.near.ai`) | Gateway TEE evidence, or model-serving TEE evidence returned through the Gateway. | A relationship to any particular completion. |
-| **Direct model endpoint** (`*.completions.near.ai`) | The model TEE and the TLS peer key observed while fetching its direct report. | Conventional CA/hostname identity for a later connection, or a relationship to a Cloud API completion. |
-| **Direct Compose Manager report** | A recorded Compose Manager deployment action and its hash-pinned compose files. | That the action is the current deployment, or that it produced a response. |
-
-The source tree follows those boundaries:
-
-```text
-common/                  quote, report-data, measurement, and GPU primitives
-gateway/
-  cloud_api              evidence retrieval and selection
-  attestation            Gateway and model deployment verification
-  completion             signature_kind routing and exact-byte signatures
-  deployment_audit       standalone deployment audit CLI
-  deployment_provenance  Gateway image provenance diagnostic (Python)
-direct/
-  model_tls_attestation  direct model TEE/TLS verification
-  compose_manager_attestation  direct recorded-action verification
-examples/                encrypted and OHTTP examples
-```
-
-TypeScript lives in [`ts`](ts); Python lives in [`py`](py). The two trees use
-the same endpoint split and the same high-level verification flow.
-
-## NEAR AI Cloud Gateway
-
-### Audit a deployment
-
-You can independently verify Gateway or model evidence without sending a
-completion. This is useful for checking the quote, nonce freshness, measured
-deployment, signing identity, and (when provided) GPU evidence. Gateway
-evidence additionally binds the TLS peer observed while the evidence was
-fetched.
-
-```bash
-# TypeScript
-pnpm run deployment-audit -- --model deepseek-ai/DeepSeek-V3.1
-pnpm run gateway-tls
-
-# Python, from the repository root
-python3 -m py.gateway.deployment_audit --model deepseek-ai/DeepSeek-V3.1
-python3 -m py.gateway.tls_audit
-```
-
-These are deployment audits. They intentionally do not accept a completion
-ID, request body, response body, or signature, so a successful audit does not
-say anything about a particular chat.
-
-`python3 -m py.gateway.deployment_provenance` is a separate diagnostic that
-looks up the Gateway image digest in GitHub artifact attestations. It is useful
-for release provenance, but is not part of the TEE verification result.
-
-### Verify a completion
-
-To establish a claim about one completion, preserve the exact request and
-response bytes, then fetch its signature. Cloud API returns `signature_kind`;
-the verifier reads that field and chooses exactly one evidence path.
-
-For a `provider_tee` completion, send the original request with a canonical
-model ID and `x-no-aliasing: true`; that model ID is part of the signed text.
-
-```bash
-# TypeScript
-pnpm run chat -- --model deepseek-ai/DeepSeek-V3.1
-
-# Python, from the repository root
-python3 -m py.gateway.completion --model deepseek-ai/DeepSeek-V3.1
-```
-
-| `signature_kind` | Verification path | A successful result establishes | It does not establish |
-| --- | --- | --- | --- |
-| `provider_tee` | Fetch the model attestation selected by the signature signer → verify model evidence → verify the exact-byte model signature. | The model-serving signer signed these exact request/response bytes and is bound to verified model evidence. | Gateway TLS identity. |
-| `gateway` | Fetch Gateway evidence → verify Gateway evidence and the observed TLS peer → verify the exact-byte Gateway signature. | The Gateway signer signed these exact client-visible request/response bytes and is bound to verified Gateway evidence. | That a model TEE executed or generated the response. |
-
-Do not infer the kind from the signed text. It selects a different trust
-boundary and different guarantee, not merely a different signer.
-
-The high-level functions make the two paths visible in code:
-
-```text
-verifyModelAttestation
-  ├─ verifyDstackQuote
-  ├─ verifyReportDataBinding
-  ├─ verifyDstackDeployment
-  └─ verifyNvidiaEvidence
-
-verifyGatewayAttestation
-  ├─ verifyDstackQuote
-  ├─ verifyReportDataBindingWithTlsFingerprint
-  ├─ compare the observed TLS peer fingerprint
-  └─ verifyDstackDeployment
-```
-
-After the corresponding attestation succeeds, `verifyModelResponse` or
-`verifyGatewayResponse` verifies the signature over the original bytes and
-checks that its signer matches the verified evidence. Re-serializing JSON or
-SSE changes the bytes and invalidates this check.
-
-## Direct model endpoint
-
-`model_tls_attestation` requests a report directly from a model endpoint with
-`include_tls_fingerprint=true`. It verifies the quote, the report-data binding
-of signing identity, TLS fingerprint, and nonce, then compares the
-quote-bound fingerprint with the certificate observed on that same TLS
-connection.
-
-```bash
-# TypeScript
-pnpm run model-tls -- --url https://your-model.completions.near.ai
-
-# Python, from the repository root
-python3 -m py.direct.model_tls_attestation \
-  --url https://your-model.completions.near.ai
-```
-
-This checks that the TLS peer key observed while fetching the direct report is
-bound in the verified quote. It does not use conventional CA/hostname
-validation, bind a later connection, or make a claim about a Cloud API
-completion or Gateway response.
-
-## Direct Compose Manager report
-
-`compose_manager_attestation` verifies the nested Compose Manager quote, a
-fresh nonce, the canonical action-log hash, and the hash-pinned compose files
-referenced by the recorded actions.
-
-```bash
-# TypeScript
-pnpm run compose-manager -- --url https://your-model.completions.near.ai
-
-# Python, from the repository root
-python3 -m py.direct.compose_manager_attestation \
-  --url https://your-model.completions.near.ai
-```
-
-It also prints GitHub artifact-attestation lookup links for reported Compose
-Manager images. Those links are diagnostic only. The report is useful
-deployment-transparency evidence, but its action log has no model identity or
-operation outcome: it does not prove what is currently running or bind a
-recorded action to an inference response.
-
-## Install and check
+## Setup
 
 ```bash
 pnpm install
-pnpm test
-pnpm run build
-
 python3 -m pip install -r requirements.txt
-python3 -m unittest discover -s py -t .
-python3 -m compileall -q py
+
+# Required by Cloud API examples
+export API_KEY=sk-your-api-key
 ```
 
-Set `API_KEY` for Cloud API commands. Direct endpoints only need `--token` when
-that endpoint requires authentication. `BASE_URL` overrides the Cloud API base
-URL for the Gateway commands.
+## Choose an attestation example
+
+NEAR AI Cloud exposes Gateway and model attestations separately. A signed
+completion uses one of them according to its `signature_kind`. Every runnable
+example is directly under `ts/` or `py/`. Each `utils/` directory contains
+`attestation` (generic quote and measurement checks), `api` (evidence retrieval
+and selection), and `verifier` (Gateway/model verification).
+
+### NEAR AI Cloud
+
+| What you want to verify | TypeScript | Python |
+| --- | --- | --- |
+| Gateway deployment and the TLS peer that served its attestation | `pnpm run gateway-attestation` | `python3 -m py.gateway_attestation` |
+| Deployment evidence for every instance of a model | `pnpm run model-attestation -- --model deepseek-ai/DeepSeek-V3.1` | `python3 -m py.model_attestation --model deepseek-ai/DeepSeek-V3.1` |
+| A signed completion and the attestation selected by its signature | `pnpm run completion -- --model deepseek-ai/DeepSeek-V3.1` | `python3 -m py.completion --model deepseek-ai/DeepSeek-V3.1` |
+
+### Direct model endpoint
+
+| What you want to verify | TypeScript | Python |
+| --- | --- | --- |
+| A model endpoint's attestation and TLS binding | `pnpm run direct-model-attestation -- --url https://your-model.completions.near.ai` | `python3 -m py.direct_model_attestation --url https://your-model.completions.near.ai` |
+| Compose Manager deployment-action evidence from a model endpoint | `pnpm run direct-compose-manager-attestation -- --url https://your-model.completions.near.ai` | `python3 -m py.direct_compose_manager_attestation --url https://your-model.completions.near.ai` |
+
+Direct endpoints only need `--token` when the endpoint requires authentication.
+`BASE_URL` overrides the Cloud API base URL.
+
+## Verify a signed Cloud completion
+
+`completion` preserves the original request and response bytes, fetches
+the completion signature, then follows its `signature_kind`:
+
+| `signature_kind` | Verification path | Successful verification proves | It does not prove |
+| --- | --- | --- | --- |
+| `provider_tee` | Model evidence → model attestation → model response signature | A model-serving signer bound to verified model evidence signed these exact bytes. | Gateway TLS identity. |
+| `gateway` | Gateway evidence → Gateway attestation and TLS peer → Gateway response signature | A Gateway signer bound to verified Gateway evidence signed these exact client-visible bytes. | That a model TEE generated the response. |
+
+For `provider_tee`, send the original request with a canonical model ID and
+`x-no-aliasing: true`: the model ID is part of the signed text. Do not parse
+and re-serialize the request or response before verification.
+
+A standalone Gateway or model attestation has no completion signature or
+response bytes, so it cannot establish a relationship to a particular chat.
+
+## Verify a direct model attestation
+
+`direct_model_attestation` asks one direct endpoint for a TLS-bound report and
+captures the TLS peer key on that same connection. It compares the peer with
+the key in the verified quote. This is not conventional CA/hostname validation
+and does not bind a later connection or a Cloud API completion.
+
+## Other examples
+
+- `pnpm run encrypted-chat` / `python3 -m py.encrypted_chat`: encrypted Cloud
+  chat clients.
+- `pnpm run ohttp` / `python3 -m py.ohttp_client`: OHTTP transport examples.
+- `python3 -m py.encrypted_agent_loop`: encrypted agent-loop example.
+- `python3 -m py.gateway_provenance`: Gateway image-provenance
+  diagnostic. It is not part of the TEE verification result.
+
+## Check the examples
+
+```bash
+pnpm run build
+
+python3 -m compileall -q py
+```

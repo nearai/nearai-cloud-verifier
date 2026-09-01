@@ -16,10 +16,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
-from py.common.dstack_attestation import (
+from py.utils.attestation import (
     AttestationVerificationError,
     VerificationFailure,
-    verify_attestation_nonce,
     decode_hex,
     verify_dstack_deployment,
     verify_dstack_quote,
@@ -70,13 +69,6 @@ async def verify_model_attestation(
     print("Signing address:", attestation.get("signing_address"))
     print("Signing algorithm:", attestation.get("signing_algo"))
     print("Request nonce:", nonce)
-
-    _record_failure(
-        failures,
-        "attestation request nonce",
-        verify_attestation_nonce(attestation, nonce),
-        "Cloud API request_nonce differs from the nonce sent by this verifier",
-    )
 
     print("\n🔐 Intel TDX quote")
     quote = await verify_dstack_quote(attestation)
@@ -156,13 +148,6 @@ async def verify_gateway_attestation(
     print("Signing address:", attestation.get("signing_address"))
     print("Signing algorithm:", attestation.get("signing_algo"))
     print("Request nonce:", nonce)
-
-    _record_failure(
-        failures,
-        "attestation request nonce",
-        verify_attestation_nonce(attestation, nonce),
-        "Cloud API request_nonce differs from the nonce sent by this verifier",
-    )
 
     print("\n🔐 Intel TDX quote")
     quote = await verify_dstack_quote(attestation)

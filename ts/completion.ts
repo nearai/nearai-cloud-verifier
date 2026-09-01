@@ -19,27 +19,26 @@ import {
   findModelAttestationForSignature,
   fetchGatewayAttestation,
   fetchModelAttestations,
-} from './cloud_api';
+} from './utils/api';
 import {
   type VerifiedGatewayAttestation,
   type VerifiedModelAttestation,
   verifyGatewayAttestation,
   verifyModelAttestation,
-} from './attestation';
+} from './utils/verifier';
 import {
   hexBytes,
   normalizeSigningAlgo,
   signingAddressBytes,
   type SigningAlgo,
-} from '../common/dstack_attestation';
+  type SigningIdentity,
+} from './utils/attestation';
 
 export type SignatureKind = 'provider_tee' | 'gateway';
 
-export interface CompletionSignature {
+export interface CompletionSignature extends SigningIdentity {
   signedText: string;
   signature: string;
-  signingAddress: string;
-  signingAlgo: SigningAlgo;
   kind: SignatureKind;
 }
 
@@ -217,13 +216,19 @@ export async function fetchModelAttestationForSignature({
   nonce,
   signature,
 }: FetchModelAttestationForSignatureParams): Promise<AttestationReport> {
+  if (signature.kind !== 'provider_tee') {
+    throw new Error('Model evidence can only verify a provider_tee signature');
+  }
   const attestations = await fetchModelAttestations({
     model,
     nonce,
     signingAlgo: signature.signingAlgo,
     signingAddress: signature.signingAddress,
   });
-  return findModelAttestationForSignature({ attestations, signature });
+  return findModelAttestationForSignature({
+    attestations,
+    signingIdentity: signature,
+  });
 }
 
 /** Fetch Gateway evidence for a gateway-signed response. */
@@ -388,7 +393,10 @@ export async function verifyCompletion({
       model,
       nonce,
     });
-    const attestation = findModelAttestationForSignature({ attestations, signature });
+    const attestation = findModelAttestationForSignature({
+      attestations,
+      signingIdentity: signature,
+    });
     const verifiedAttestation = await verifyModelAttestation({ attestation, nonce });
     verifyModelResponse({ requestBody, responseBody, signature, verifiedAttestation });
     return;

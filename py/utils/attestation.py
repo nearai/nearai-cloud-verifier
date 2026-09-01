@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Shared dstack quote, binding, deployment, and GPU primitives.
+"""Generic dstack quote, binding, deployment, and GPU primitives.
 
-Endpoint-specific Gateway and direct-endpoint flows live outside this module.
-Keeping those flows separate makes their different verification goals explicit.
+This module verifies evidence that callers already hold. Cloud API retrieval and
+the higher-level Gateway/model flows live in their own utility modules.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import json
 import re
 from dataclasses import dataclass
 from hashlib import sha256, sha384
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import dcap_qvl
 import requests
@@ -57,11 +57,14 @@ def decode_hex(value: object, label: str) -> bytes:
     return bytes.fromhex(normalized)
 
 
-def signing_identity(value: Dict[str, Any], label: str) -> Tuple[str, bytes]:
+def signing_identity(value: Mapping[str, Any], label: str) -> Tuple[str, bytes]:
     """Return a normalized signing algorithm and signer bytes."""
 
     signing_algo = value.get("signing_algo")
-    if not isinstance(signing_algo, str) or signing_algo not in SUPPORTED_SIGNING_ALGOS:
+    if not isinstance(signing_algo, str):
+        raise ValueError(f"{label}.signing_algo must be 'ecdsa' or 'ed25519'")
+    signing_algo = signing_algo.lower()
+    if signing_algo not in SUPPORTED_SIGNING_ALGOS:
         raise ValueError(f"{label}.signing_algo must be 'ecdsa' or 'ed25519'")
     address = decode_hex(value.get("signing_address"), f"{label}.signing_address")
     expected_length = 20 if signing_algo == "ecdsa" else 32
@@ -72,7 +75,9 @@ def signing_identity(value: Dict[str, Any], label: str) -> Tuple[str, bytes]:
     return signing_algo, address
 
 
-def signing_identities_match(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+def signing_identities_match(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> bool:
     """Compare signing identities by decoded bytes, not their hex spelling."""
 
     return signing_identity(left, "left") == signing_identity(right, "right")

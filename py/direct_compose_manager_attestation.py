@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify direct Compose Manager deployment-transparency evidence.
+"""Verify direct Compose Manager attestation evidence.
 
 Compose Manager's nested quote binds ``SHA256(canonical actions JSON) || nonce``.
 Recorded compose actions can also pin a file in ``nearai/cvm-compose-files`` by
@@ -23,7 +23,7 @@ from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 
-from py.common.dstack_attestation import check_event_log, decode_hex, verify_dstack_quote
+from py.utils.attestation import check_event_log, decode_hex, verify_dstack_quote
 
 
 @dataclass(frozen=True)
@@ -270,12 +270,15 @@ async def verify_compose_manager_attestation(
 
 async def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Verify direct Compose Manager deployment-transparency evidence"
+        description="Verify direct Compose Manager attestation evidence"
     )
     parser.add_argument(
         "--url",
         required=True,
-        help="Direct model endpoint, e.g. https://your-model.completions.near.ai",
+        help=(
+            "Direct model endpoint whose report contains compose_manager_attestation, "
+            "e.g. https://your-model.completions.near.ai"
+        ),
     )
     parser.add_argument(
         "--signing-algo",
@@ -290,7 +293,7 @@ async def main() -> None:
     args = parser.parse_args()
 
     print("========================================")
-    print("🔐 Compose Manager deployment transparency")
+    print("🔐 Direct Compose Manager attestation")
     print("========================================")
     print("Target:", args.url)
     await verify_compose_manager_attestation(
