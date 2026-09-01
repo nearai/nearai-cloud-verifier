@@ -12,8 +12,8 @@ import { ethers } from 'ethers';
 import * as nacl from 'tweetnacl';
 import * as ed2curve from 'ed2curve';
 import { xchacha20poly1305 } from '@noble/ciphers/chacha';
-import { verifyChat } from './chat_verifier';
-import type { SigningAlgo } from './model_verifier';
+import { verifyCompletion } from '../gateway/completion';
+import type { SigningAlgo } from '../common/dstack_attestation';
 
 const API_KEY = process.env.API_KEY || '';
 const BASE_URL = process.env.BASE_URL || 'https://cloud-api.near.ai';
@@ -595,7 +595,7 @@ async function encryptedStreamingExample(
         const responseBody = Buffer.concat(responseChunks);
         console.log(`✓ Total response length: ${responseBody.length} bytes`);
         try {
-          await verifyChat({
+          await verifyCompletion({
             id: chatId,
             requestBody: Buffer.from(bodyJson, 'utf8'),
             responseBody,
@@ -807,7 +807,7 @@ async function encryptedNonStreamingExample(
     console.log(`  Response: ${JSON.stringify(payload, null, 2)}`);
   }
 
-  await verifyChat({
+  await verifyCompletion({
     id: chatId,
     requestBody: Buffer.from(bodyJson, 'utf8'),
     responseBody,

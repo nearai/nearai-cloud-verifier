@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import asyncio
 
-from model_verifier import (
+from py.gateway.cloud_api import (
     API_KEY,
     BASE_URL,
-    fetch_gateway_attestation,
-    verify_attestation,
 )
+from py.gateway.deployment_audit import audit_gateway_attestation
 
 
 async def main() -> None:
@@ -29,13 +28,7 @@ async def main() -> None:
     print("========================================")
     print("Gateway endpoint:", BASE_URL)
 
-    gateway, nonce, peer_spki_fingerprint = fetch_gateway_attestation()
-    await verify_attestation(
-        gateway,
-        nonce,
-        require_peer_tls_binding=True,
-        peer_spki_fingerprint=peer_spki_fingerprint,
-    )
+    await audit_gateway_attestation()
 
 
 if __name__ == "__main__":

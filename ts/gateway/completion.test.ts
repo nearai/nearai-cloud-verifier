@@ -12,8 +12,8 @@ import {
   signatureTextFor,
   verifyGatewayResponse,
   verifyModelResponse,
-} from './chat_verifier';
-import { type AttestationReport, fetchModelAttestations } from './model_verifier';
+} from './completion';
+import { type AttestationReport, fetchModelAttestations } from './cloud_api';
 
 const nonce = 'ab'.repeat(32);
 const modelSigningAddress = `0x${'11'.repeat(20)}`;
@@ -173,7 +173,12 @@ test('verifies an ECDSA provider_tee signature against matching model evidence',
   const evidence = attestation(nonce, wallet.address, 'ecdsa') as AttestationReport;
 
   assert.doesNotThrow(() =>
-    verifyModelResponse({ requestBody, responseBody, signature, attestation: evidence }),
+    verifyModelResponse({
+      requestBody,
+      responseBody,
+      signature,
+      verifiedAttestation: { attestation: evidence },
+    }),
   );
   assert.throws(
     () =>
@@ -181,7 +186,7 @@ test('verifies an ECDSA provider_tee signature against matching model evidence',
         requestBody,
         responseBody: Buffer.from('{"id":"different"}'),
         signature,
-        attestation: evidence,
+        verifiedAttestation: { attestation: evidence },
       }),
     /Signature text does not match/,
   );
@@ -208,7 +213,15 @@ test('verifies an Ed25519 gateway signature against matching Gateway evidence', 
   const evidence = attestation(nonce, signingAddress, 'ed25519') as AttestationReport;
 
   assert.doesNotThrow(() =>
-    verifyGatewayResponse({ requestBody, responseBody, signature, attestation: evidence }),
+    verifyGatewayResponse({
+      requestBody,
+      responseBody,
+      signature,
+      verifiedAttestation: {
+        attestation: evidence,
+        peerSpkiFingerprint: '00'.repeat(32),
+      },
+    }),
   );
   assert.throws(
     () =>
@@ -216,9 +229,12 @@ test('verifies an Ed25519 gateway signature against matching Gateway evidence', 
         requestBody,
         responseBody,
         signature,
-        attestation: {
-          ...evidence,
-          signing_address: '33'.repeat(32),
+        verifiedAttestation: {
+          attestation: {
+            ...evidence,
+            signing_address: '33'.repeat(32),
+          },
+          peerSpkiFingerprint: '00'.repeat(32),
         },
       }),
     /Signature signer does not match/,

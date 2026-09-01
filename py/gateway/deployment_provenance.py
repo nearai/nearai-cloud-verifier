@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
-"""
-Extract the deployed cloud-api version from its TDX attestation.
+"""Inspect the deployed Gateway image provenance.
 
-Fetches the attestation report from cloud-api.near.ai, extracts the Docker
-image digest from the attested compose file, then queries GitHub's attestations
-API to find the exact git commit and build run.
+Fetches the Gateway attestation report, extracts the Docker image digest from
+its attested compose file, then queries GitHub's attestations API to find the
+exact git commit and build run. This is a release-provenance diagnostic, not a
+TEE verification step.
 """
 
 import base64
 import json
+import os
 import re
 import subprocess
 import sys
 import urllib.request
 
-BASE_URL = "https://cloud-api.near.ai"
+BASE_URL = os.environ.get("BASE_URL", "https://cloud-api.near.ai").rstrip("/")
 
 
 def fetch_attestation() -> dict:
-    """Fetch attestation report from cloud-api."""
-    with urllib.request.urlopen(f"{BASE_URL}/v1/attestation/report?signing_algo=ecdsa") as resp:
+    """Fetch a Gateway attestation report using the configured API key."""
+    api_base = BASE_URL if BASE_URL.endswith("/v1") else f"{BASE_URL}/v1"
+    request = urllib.request.Request(
+        f"{api_base}/attestation/report?signing_algo=ecdsa"
+    )
+    api_key = os.environ.get("API_KEY")
+    if api_key:
+        request.add_header("Authorization", f"Bearer {api_key}")
+    with urllib.request.urlopen(request) as resp:
         return json.loads(resp.read())
 
 

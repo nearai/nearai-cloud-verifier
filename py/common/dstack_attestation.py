@@ -1,43 +1,22 @@
 #!/usr/bin/env python3
-"""An independent, print-oriented verifier for NEAR AI Cloud evidence.
+"""Shared dstack quote, binding, deployment, and GPU primitives.
 
-This file intentionally does not depend on the SDK. It shows the public Cloud
-API requests and each cryptographic binding in a form that can be read, copied,
-or ported to another language.
-
-It distinguishes two evidence paths:
-
-* model evidence is requested for a model and a signature's model signer;
-* Gateway evidence is requested separately and binds the Gateway TLS peer.
-
-The individual checks print their result so a failed report remains useful for
-diagnosis. ``verify_attestation`` collects those failures and raises at the
-end, rather than reporting success after a failed check.
+Endpoint-specific Gateway and direct-endpoint flows live outside this module.
+Keeping those flows separate makes their different verification goals explicit.
 """
 
 from __future__ import annotations
 
-import argparse
 import base64
-import http.client
 import json
-import os
 import re
-import secrets
-import ssl
 from dataclasses import dataclass
 from hashlib import sha256, sha384
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlencode, urlsplit
 
 import dcap_qvl
 import requests
-from cryptography import x509
-from cryptography.hazmat.primitives import serialization
 
-
-BASE_URL = os.environ.get("BASE_URL", "https://cloud-api.near.ai")
-API_KEY = os.environ.get("API_KEY", "")
 
 GPU_VERIFIER_API = "https://nras.attestation.nvidia.com/v3/attest/gpu"
 SIGSTORE_SEARCH_BASE = "https://search.sigstore.dev/?hash="
@@ -61,163 +40,6 @@ class AttestationVerificationError(RuntimeError):
         self.failures = tuple(failures)
         summary = "; ".join(f"{failure.check}: {failure.detail}" for failure in failures)
         super().__init__(f"Attestation verification failed ({summary})")
-
-
-def _cloud_api_url(path: str) -> str:
-    """Return one Cloud API URL while accepting a BASE_URL ending in /v1."""
-
-    base = BASE_URL.rstrip("/")
-    if base.endswith("/v1"):
-        return f"{base}/{path.lstrip('/')}"
-    return f"{base}/v1/{path.lstrip('/')}"
-
-
-def _authorization_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    headers = {} if extra is None else dict(extra)
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
-    return headers
-
-
-def _request_json(
-    path: str,
-    params: Dict[str, str],
-    headers: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
-    """Fetch one JSON Cloud API response and reject non-object envelopes."""
-
-    response = requests.get(
-        _cloud_api_url(path),
-        params=params,
-        headers=_authorization_headers(headers),
-        timeout=30,
-    )
-    response.raise_for_status()
-    value = response.json()
-    if not isinstance(value, dict):
-        raise ValueError(f"{path} returned {type(value).__name__}, expected a JSON object")
-    return value
-
-
-def fetch_model_attestations(
-    model: str,
-    signing_algo: Optional[str] = None,
-    signing_address: Optional[str] = None,
-) -> Tuple[List[Dict[str, Any]], str]:
-    """Fetch NEAR model evidence with a fresh nonce and no TLS binding.
-
-    ``provider=near`` scopes this public model-evidence path to NEAR's own
-    model fleet. ``x-no-aliasing`` rejects aliases rather than resolving them,
-    so callers must supply the canonical model ID used in the completion.
-    """
-
-    nonce = secrets.token_hex(32)
-    params = {
-        "model": model,
-        "provider": "near",
-        "nonce": nonce,
-        "include_tls_fingerprint": "false",
-    }
-    if signing_algo is not None:
-        params["signing_algo"] = signing_algo
-    if signing_address is not None:
-        params["signing_address"] = signing_address
-    report = _request_json(
-        "attestation/report",
-        params,
-        headers={"x-no-aliasing": "true"},
-    )
-    attestations = report.get("model_attestations")
-    if not isinstance(attestations, list) or not all(
-        isinstance(attestation, dict) for attestation in attestations
-    ):
-        raise ValueError("Cloud API model report does not contain model_attestations[]")
-    return attestations, nonce
-
-
-def _peer_spki_fingerprint(certificate_der: bytes) -> str:
-    """SHA-256 of the TLS certificate's SubjectPublicKeyInfo DER bytes."""
-
-    certificate = x509.load_der_x509_certificate(certificate_der)
-    spki_der = certificate.public_key().public_bytes(
-        serialization.Encoding.DER,
-        serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    return sha256(spki_der).hexdigest()
-
-
-def _fetch_gateway_report_with_peer_spki(
-    params: Dict[str, str]
-) -> Tuple[Dict[str, Any], Optional[str]]:
-    """Fetch Gateway evidence and retain the TLS peer from that same request.
-
-    ``requests`` hides the connection after a response is read. The
-    standard-library HTTPS connection keeps the certificate observable long
-    enough to bind it to this exact evidence request.
-    """
-
-    url = urlsplit(_cloud_api_url("attestation/report"))
-    if url.scheme != "https" or not url.hostname:
-        # Local HTTP is useful for development, but cannot provide the peer
-        # certificate needed for the production Gateway TLS check.
-        return _request_json("attestation/report", params), None
-
-    path = url.path or "/"
-    query = urlencode(params)
-    if url.query:
-        query = f"{url.query}&{query}"
-    if query:
-        path = f"{path}?{query}"
-
-    connection = http.client.HTTPSConnection(
-        url.hostname,
-        url.port or 443,
-        context=ssl.create_default_context(),
-        timeout=30,
-    )
-    try:
-        connection.connect()
-        socket = connection.sock
-        if socket is None:
-            raise RuntimeError("HTTPS connection did not expose a TLS socket")
-        certificate_der = socket.getpeercert(binary_form=True)
-        if not certificate_der:
-            raise RuntimeError("TLS peer did not provide a certificate")
-        peer_spki = _peer_spki_fingerprint(certificate_der)
-
-        connection.request("GET", path, headers=_authorization_headers())
-        response = connection.getresponse()
-        body = response.read()
-        if not 200 <= response.status < 300:
-            rendered = body.decode("utf-8", "replace")
-            raise RuntimeError(f"Cloud API returned HTTP {response.status}: {rendered}")
-        value = json.loads(body)
-        if not isinstance(value, dict):
-            raise ValueError("attestation/report returned a non-object JSON value")
-        return value, peer_spki
-    finally:
-        connection.close()
-
-
-def fetch_gateway_attestation(
-    signing_algo: Optional[str] = None,
-) -> Tuple[Dict[str, Any], str, Optional[str]]:
-    """Fetch standalone Gateway evidence and its observed TLS peer SPKI.
-
-    Gateway evidence is selected by its signing algorithm only. No model,
-    provider, or ``signing_address`` query parameter is sent here: those select
-    model evidence, not a Gateway identity.
-    """
-
-    nonce = secrets.token_hex(32)
-    params = {"nonce": nonce, "include_tls_fingerprint": "true"}
-    if signing_algo is not None:
-        params["signing_algo"] = signing_algo
-    report, peer_spki = _fetch_gateway_report_with_peer_spki(params)
-    attestation = report.get("gateway_attestation")
-    if not isinstance(attestation, dict):
-        raise ValueError("Cloud API Gateway report does not contain gateway_attestation")
-    return attestation, nonce, peer_spki
 
 
 def decode_hex(value: object, label: str) -> bytes:
@@ -256,50 +78,6 @@ def signing_identities_match(left: Dict[str, Any], right: Dict[str, Any]) -> boo
     return signing_identity(left, "left") == signing_identity(right, "right")
 
 
-def fetch_model_attestation_for_signature(
-    model: str,
-    signature: Dict[str, Any],
-) -> Tuple[Dict[str, Any], str]:
-    """Fetch exactly one model attestation for a ``provider_tee`` signature."""
-
-    if signature.get("signature_kind") != "provider_tee":
-        raise ValueError("Model evidence can only verify a provider_tee signature")
-    signing_algo, _ = signing_identity(signature, "signature")
-    signing_address = signature["signing_address"]
-    attestations, nonce = fetch_model_attestations(
-        model,
-        signing_algo=signing_algo,
-        # Preserve the signature's public spelling (including ECDSA's 0x
-        # prefix) when it is forwarded to the Cloud API model selector.
-        signing_address=signing_address,
-    )
-    matches = [
-        attestation
-        for attestation in attestations
-        if signing_identities_match(attestation, signature)
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            "Cloud API must return exactly one model attestation matching the signature signer; "
-            f"received {len(matches)} matching entries"
-        )
-    return matches[0], nonce
-
-
-def fetch_gateway_attestation_for_signature(
-    signature: Dict[str, Any],
-) -> Tuple[Dict[str, Any], str, Optional[str]]:
-    """Fetch Gateway evidence for a ``gateway`` signature and bind its signer."""
-
-    if signature.get("signature_kind") != "gateway":
-        raise ValueError("Gateway evidence can only verify a gateway signature")
-    signing_algo, _ = signing_identity(signature, "signature")
-    attestation, nonce, peer_spki = fetch_gateway_attestation(signing_algo=signing_algo)
-    if not signing_identities_match(attestation, signature):
-        raise ValueError("Gateway attestation signer does not match the response signature signer")
-    return attestation, nonce, peer_spki
-
-
 def fetch_nvidia_verification(payload: Dict[str, Any]) -> Any:
     """Submit GPU evidence to NVIDIA NRAS for verification."""
 
@@ -333,7 +111,7 @@ def _report_data_bytes(intel_result: Dict[str, Any]) -> bytes:
     return _quote_field_bytes(intel_result, "reportdata")
 
 
-def check_reported_nonce(attestation: Dict[str, Any], request_nonce: str) -> bool:
+def verify_attestation_nonce(attestation: Dict[str, Any], request_nonce: str) -> bool:
     """Check Cloud API's echoed request_nonce before inspecting the quote."""
 
     actual = attestation.get("request_nonce")
@@ -345,15 +123,14 @@ def check_reported_nonce(attestation: Dict[str, Any], request_nonce: str) -> boo
     return matches
 
 
-def check_report_data(
+def _check_report_data(
     attestation: Dict[str, Any],
     request_nonce: str,
     intel_result: Optional[Dict[str, Any]],
     *,
     require_tls_fingerprint: bool = False,
-    require_advertised_report_data: bool = False,
 ) -> Dict[str, bool]:
-    """Verify API and quote report-data, signer/TLS, and nonce bindings."""
+    """Verify quote report-data, signer/TLS, and nonce bindings."""
 
     failed = {
         "report_data_matches_quote": False,
@@ -375,13 +152,11 @@ def check_report_data(
         return failed
 
     if "report_data" not in attestation:
-        # Model provider reports may omit this convenience copy. The verified
-        # quote is still the source of truth; Gateway reports requested with
-        # include_tls_fingerprint=true must expose it.
-        advertised_matches = not require_advertised_report_data
-        print("API report_data is present:", False)
-        if require_advertised_report_data:
-            print("API report_data matches verified quote:", False)
+        # This JSON field is a convenience copy. The verified quote is the
+        # source of truth, and direct endpoints need not expose the copy.
+        advertised_matches = True
+        print("JSON report_data is present:", False)
+        print("Using report_data from the verified quote directly.")
     else:
         advertised = attestation["report_data"]
         try:
@@ -390,10 +165,10 @@ def check_report_data(
         except ValueError as error:
             advertised_matches = False
             print("Could not decode attestation.report_data:", error)
-        print("API report_data matches verified quote:", advertised_matches)
+        print("JSON report_data matches verified quote:", advertised_matches)
         if not advertised_matches:
             if isinstance(advertised, str):
-                print("  API value:   ", advertised.removeprefix("0x"))
+                print("  JSON value:  ", advertised.removeprefix("0x"))
             print("  quote value: ", report_data.hex())
 
     try:
@@ -440,7 +215,32 @@ def check_report_data(
     }
 
 
-def check_gpu(attestation: Dict[str, Any], request_nonce: str) -> Dict[str, Any]:
+def verify_report_data_binding(
+    attestation: Dict[str, Any],
+    request_nonce: str,
+    intel_result: Optional[Dict[str, Any]],
+) -> Dict[str, bool]:
+    """Verify signer and nonce report-data binding without TLS evidence."""
+
+    return _check_report_data(attestation, request_nonce, intel_result)
+
+
+def verify_report_data_binding_with_tls_fingerprint(
+    attestation: Dict[str, Any],
+    request_nonce: str,
+    intel_result: Optional[Dict[str, Any]],
+) -> Dict[str, bool]:
+    """Verify signer, TLS fingerprint, and nonce binding from the quote."""
+
+    return _check_report_data(
+        attestation,
+        request_nonce,
+        intel_result,
+        require_tls_fingerprint=True,
+    )
+
+
+def verify_nvidia_evidence(attestation: Dict[str, Any], request_nonce: str) -> Dict[str, Any]:
     """Verify optional NVIDIA evidence and bind it to the client nonce."""
 
     raw_payload = attestation.get("nvidia_payload")
@@ -521,7 +321,7 @@ def _quote_hex(value: Any, label: str) -> str:
     raise ValueError(f"{label} is not a byte sequence")
 
 
-async def check_tdx_quote(attestation: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+async def verify_dstack_quote(attestation: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Verify an Intel TDX quote and retain the measurements used below."""
 
     try:
@@ -710,7 +510,6 @@ def check_app_compose_measurement(
     if not isinstance(app_compose, str):
         print("Compose measurement is present:", False)
         return {"mrconfig_matches": False}
-
     print("\nDocker compose manifest measured by the enclave:")
     try:
         compose_document = json.loads(app_compose)
@@ -737,247 +536,14 @@ def check_app_compose_measurement(
         return {"mrconfig_matches": False}
 
 
-def _record_failure(
-    failures: List[VerificationFailure], check: str, passed: bool, detail: str
-) -> None:
-    if not passed:
-        failures.append(VerificationFailure(check, detail))
+def verify_dstack_deployment(
+    attestation: Dict[str, Any], intel_result: Optional[Dict[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    """Verify the event-log replay and compose measurement of a dstack deployment."""
 
-
-async def verify_attestation(
-    attestation: Dict[str, Any],
-    request_nonce: str,
-    verify_model: bool = False,
-    *,
-    require_peer_tls_binding: bool = False,
-    peer_spki_fingerprint: Optional[str] = None,
-    expected_signer: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Run all applicable checks, then fail if any security check failed."""
-
-    failures: List[VerificationFailure] = []
-    print("\n🔐 Attestation")
-    print("Request nonce:", request_nonce)
-    if isinstance(attestation.get("signing_address"), str):
-        print("Signing address:", attestation["signing_address"])
-
-    _record_failure(
-        failures,
-        "attestation request nonce",
-        check_reported_nonce(attestation, request_nonce),
-        "Cloud API request_nonce differs from the nonce sent by this verifier",
-    )
-
-    print("\n🔐 Intel TDX quote")
-    intel_result = await check_tdx_quote(attestation)
-    quote_valid = intel_result is not None and intel_result.get("verified") is True
-    _record_failure(
-        failures,
-        "Intel TDX quote",
-        quote_valid,
-        "quote did not verify with an accepted TCB status",
-    )
-    debug_disabled = intel_result is not None and intel_result.get("debug_enabled") is False
-    _record_failure(
-        failures,
-        "TDX debug configuration",
-        debug_disabled,
-        "quote enables debug mode or did not expose TD attributes",
-    )
-
-    print("\n🔐 TDX report data")
-    report_data = check_report_data(
-        attestation,
-        request_nonce,
-        intel_result,
-        require_tls_fingerprint=require_peer_tls_binding,
-        require_advertised_report_data=require_peer_tls_binding,
-    )
-    _record_failure(
-        failures,
-        "API report_data",
-        report_data["report_data_matches_quote"],
-        "Cloud API report_data does not equal report_data in the verified quote",
-    )
-    _record_failure(
-        failures,
-        "signer report-data binding",
-        report_data["binds_signer"],
-        "verified quote does not bind the advertised signer and TLS fingerprint",
-    )
-    _record_failure(
-        failures,
-        "quote nonce binding",
-        report_data["embeds_nonce"],
-        "verified quote does not embed this verifier's nonce",
-    )
-
-    print("\n🔐 RTMR3 event log")
-    event_log = check_event_log(attestation, intel_result)
-    _record_failure(
-        failures,
-        "RTMR3 event-log replay",
-        event_log["replay_matches"],
-        "event log does not replay to RTMR3 from the verified quote",
-    )
-
-    print("\n🔐 Compose measurement")
-    compose = check_app_compose_measurement(attestation, intel_result)
-    _record_failure(
-        failures,
-        "app_compose MRCONFIGID binding",
-        compose["mrconfig_matches"],
-        "app_compose is not bound to MRCONFIGID from the verified quote",
-    )
-
-    if expected_signer is not None:
-        try:
-            signer_matches = signing_identities_match(attestation, expected_signer)
-        except ValueError as error:
-            signer_matches = False
-            print("Attestation signer matches response signer:", False)
-            print("  error:", error)
-        else:
-            print("Attestation signer matches response signer:", signer_matches)
-        _record_failure(
-            failures,
-            "response signer binding",
-            signer_matches,
-            "attestation signing identity differs from the response signature",
-        )
-
-    if require_peer_tls_binding:
-        try:
-            declared = decode_hex(
-                attestation.get("tls_cert_fingerprint"),
-                "attestation.tls_cert_fingerprint",
-            )
-            peer = decode_hex(peer_spki_fingerprint, "observed TLS peer SPKI")
-            peer_matches = len(declared) == 32 and declared == peer
-        except ValueError as error:
-            peer_matches = False
-            print("Observed TLS peer matches attested fingerprint:", False)
-            print("  error:", error)
-        else:
-            print("Observed TLS peer matches attested fingerprint:", peer_matches)
-            if not peer_matches:
-                print("  attested:", declared.hex())
-                print("  observed:", peer.hex())
-        _record_failure(
-            failures,
-            "Gateway peer TLS binding",
-            peer_matches,
-            "TLS peer for the evidence request differs from the quote-bound fingerprint",
-        )
-
-    if verify_model:
-        print("\n🔐 GPU attestation")
-        gpu = check_gpu(attestation, request_nonce)
-        _record_failure(
-            failures,
-            "GPU evidence",
-            gpu["verified"],
-            "provided NVIDIA evidence is malformed, stale, or rejected by NRAS",
-        )
-
-    try:
-        show_image_digest_lookup_links(attestation)
-    except Exception as error:
-        # Image lookup is a diagnostic convenience, not a substitute for the
-        # quote/measurement verification chain above.
-        print("Image digest lookup failed (diagnostic only):", error)
-
-    if failures:
-        print("\n✗ Attestation verification summary")
-        for failure in failures:
-            print(f"  - {failure.check}: {failure.detail}")
-        raise AttestationVerificationError(failures)
-    print("\n✓ Attestation verification passed")
-    return intel_result
-
-
-async def verify_gateway_tls_binding(
-    signing_algo: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Fetch Gateway evidence plus the peer TLS binding for that request.
-
-    Gateway evidence is selected only by signing algorithm. Its signer is
-    discovered from the verified evidence; callers do not supply a model or a
-    signing address to this endpoint.
-    """
-
-    attestation, nonce, peer_spki = fetch_gateway_attestation(signing_algo=signing_algo)
-    print("========================================")
-    print("🔐 Gateway attestation")
-    print("========================================")
-    return await verify_attestation(
-        attestation,
-        nonce,
-        require_peer_tls_binding=True,
-        peer_spki_fingerprint=peer_spki,
-    )
-
-
-async def main() -> int:
-    parser = argparse.ArgumentParser(description="Verify NEAR AI Cloud TEE evidence")
-    parser.add_argument("--model", default="deepseek-ai/DeepSeek-V3.1")
-    parser.add_argument(
-        "--signing-algo",
-        choices=sorted(SUPPORTED_SIGNING_ALGOS),
-        help="Request a specific algorithm; omit to use the Cloud API default.",
-    )
-    args = parser.parse_args()
-
-    failures: List[VerificationFailure] = []
-
-    print("========================================")
-    print("🔐 Gateway attestation")
-    print("========================================")
-    try:
-        gateway, gateway_nonce, peer_spki = fetch_gateway_attestation(args.signing_algo)
-        await verify_attestation(
-            gateway,
-            gateway_nonce,
-            require_peer_tls_binding=True,
-            peer_spki_fingerprint=peer_spki,
-        )
-    except (AttestationVerificationError, requests.RequestException, ValueError, RuntimeError) as error:
-        print("Gateway verification failed:", error)
-        failures.append(VerificationFailure("Gateway attestation", str(error)))
-
-    print("\n========================================")
-    print("🔐 Model attestations")
-    print("========================================")
-    try:
-        model_attestations, model_nonce = fetch_model_attestations(
-            args.model, signing_algo=args.signing_algo
-        )
-        if not model_attestations:
-            raise ValueError("Cloud API returned no model attestations")
-        for index, model_attestation in enumerate(model_attestations, start=1):
-            print(f"\n--- Model attestation #{index} ---")
-            try:
-                await verify_attestation(
-                    model_attestation, model_nonce, verify_model=True
-                )
-            except AttestationVerificationError as error:
-                failures.append(
-                    VerificationFailure(f"model attestation #{index}", str(error))
-                )
-    except (requests.RequestException, ValueError, RuntimeError) as error:
-        print("Model evidence fetch or verification failed:", error)
-        failures.append(VerificationFailure("model attestations", str(error)))
-
-    if failures:
-        print("\n✗ Overall verification failed")
-        for failure in failures:
-            print(f"  - {failure.check}: {failure.detail}")
-        return 1
-    print("\n✓ All requested attestations passed")
-    return 0
-
-
-if __name__ == "__main__":
-    import asyncio
-
-    raise SystemExit(asyncio.run(main()))
+    deployment = {
+        "event_log": check_event_log(attestation, intel_result),
+        "compose": check_app_compose_measurement(attestation, intel_result),
+    }
+    show_image_digest_lookup_links(attestation)
+    return deployment

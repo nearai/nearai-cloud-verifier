@@ -9,9 +9,9 @@
  *
  * Run:
  *   export API_KEY=sk-...
- *   npx tsx ts/ohttp_client.ts                          # all examples
- *   npx tsx ts/ohttp_client.ts --model anthropic/claude-haiku-4-5
- *   npx tsx ts/ohttp_client.ts --verify-attestation    # check key is TEE-attested
+ *   npx tsx ts/examples/ohttp_client.ts                          # all examples
+ *   npx tsx ts/examples/ohttp_client.ts --model anthropic/claude-haiku-4-5
+ *   npx tsx ts/examples/ohttp_client.ts --verify-attestation    # check key is TEE-attested
  */
 
 import * as crypto from 'crypto';

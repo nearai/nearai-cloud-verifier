@@ -46,16 +46,16 @@ Usage
 -----
 
     export API_KEY=sk-...
-    python3 py/encrypted_agent_loop_verifier.py --model zai-org/GLM-5.1-FP8
+    python3 -m py.examples.encrypted_agent_loop --model zai-org/GLM-5.1-FP8
 
     # Custom prompt:
-    python3 py/encrypted_agent_loop_verifier.py \
+    python3 -m py.examples.encrypted_agent_loop \
         --model zai-org/GLM-5.1-FP8 \
         --prompt 'What was the most recent SpaceX launch? Use web_context_search.'
 
     # Against staging:
     BASE_URL=https://cloud-stg-api.near.ai \
-        python3 py/encrypted_agent_loop_verifier.py --model zai-org/GLM-5.1-FP8
+        python3 -m py.examples.encrypted_agent_loop --model zai-org/GLM-5.1-FP8
 
 The script exits 0 on a clean agent-loop completion, 1 otherwise.
 """

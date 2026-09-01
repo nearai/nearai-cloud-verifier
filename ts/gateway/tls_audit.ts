@@ -7,7 +7,7 @@
  * not compare an unrelated follow-up connection or a tls_certificate copy.
  */
 
-import { verifyGatewayTlsBinding } from './model_verifier';
+import { auditGatewayAttestation } from './deployment_audit';
 
 function cloudApiBaseUrl(): string {
   return process.env.BASE_URL || 'https://cloud-api.near.ai';
@@ -23,7 +23,7 @@ async function main(): Promise<void> {
   console.log('========================================');
   console.log('Gateway endpoint:', cloudApiBaseUrl());
 
-  await verifyGatewayTlsBinding();
+  await auditGatewayAttestation();
 }
 
 if (require.main === module) {

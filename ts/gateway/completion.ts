@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Verify a signed NEAR AI Cloud chat completion without using the SDK.
+ * Verify a signed NEAR AI Cloud completion.
  *
  * A Cloud API signature is explicitly either model-serving (`provider_tee`) or
  * Gateway (`gateway`) evidence. The kind selects both the signed text and the
@@ -16,11 +16,21 @@ import { ethers } from 'ethers';
 import {
   type AttestationReport,
   type FetchedGatewayAttestation,
-  type SigningAlgo,
   fetchGatewayAttestation,
   fetchModelAttestation,
-  verifyAttestation,
-} from './model_verifier';
+} from './cloud_api';
+import {
+  type VerifiedGatewayAttestation,
+  type VerifiedModelAttestation,
+  verifyGatewayAttestation,
+  verifyModelAttestation,
+} from './attestation';
+import {
+  hexBytes,
+  normalizeSigningAlgo,
+  signingAddressBytes,
+  type SigningAlgo,
+} from '../common/dstack_attestation';
 
 export type SignatureKind = 'provider_tee' | 'gateway';
 
@@ -59,17 +69,17 @@ export interface VerifyModelResponseParams {
   requestBody: Uint8Array;
   responseBody: Uint8Array;
   signature: CompletionSignature;
-  attestation: AttestationReport;
+  verifiedAttestation: VerifiedModelAttestation;
 }
 
 export interface VerifyGatewayResponseParams {
   requestBody: Uint8Array;
   responseBody: Uint8Array;
   signature: CompletionSignature;
-  attestation: AttestationReport;
+  verifiedAttestation: VerifiedGatewayAttestation;
 }
 
-export interface VerifyChatParams {
+export interface VerifyCompletionParams {
   id: string;
   requestBody: Uint8Array;
   responseBody: Uint8Array;
@@ -128,44 +138,8 @@ function requireString(value: unknown, label: string): string {
   return value;
 }
 
-function normalizeSigningAlgo(value: string): SigningAlgo {
-  const normalized = value.toLowerCase();
-  if (normalized === 'ecdsa' || normalized === 'ed25519') {
-    return normalized;
-  }
-  throw new Error(
-    `Unsupported signing algorithm ${JSON.stringify(value)}; expected ecdsa or ed25519`,
-  );
-}
-
 function sha256Bytes(value: Uint8Array): string {
   return crypto.createHash('sha256').update(value).digest('hex');
-}
-
-function hexBytes(value: string, label: string): Buffer {
-  const normalized = value.replace(/^0x/i, '');
-  if (
-    normalized.length === 0 ||
-    normalized.length % 2 !== 0 ||
-    !/^[0-9a-fA-F]+$/.test(normalized)
-  ) {
-    throw new Error(`${label} must be hexadecimal bytes`);
-  }
-  return Buffer.from(normalized, 'hex');
-}
-
-function signingAddressBytes(
-  signingAddress: string,
-  signingAlgo: SigningAlgo,
-): Buffer {
-  const bytes = hexBytes(signingAddress, 'signing_address');
-  const expectedLength = signingAlgo === 'ecdsa' ? 20 : 32;
-  if (bytes.length !== expectedLength) {
-    throw new Error(
-      `signing_address for ${signingAlgo} must be ${expectedLength} bytes, got ${bytes.length}`,
-    );
-  }
-  return bytes;
 }
 
 /**
@@ -337,12 +311,12 @@ function verifySignatureAndEvidence(
   }
 }
 
-/** Verify a model-serving signature against the selected model evidence. */
+/** Verify a model-serving signature against already-verified model evidence. */
 export function verifyModelResponse({
   requestBody,
   responseBody,
   signature,
-  attestation,
+  verifiedAttestation,
 }: VerifyModelResponseParams): void {
   if (signature.kind !== 'provider_tee') {
     throw new Error('verifyModelResponse requires a provider_tee signature');
@@ -355,16 +329,16 @@ export function verifyModelResponse({
       responseBody,
       model: modelFromRequest(requestBody),
     }),
-    attestation,
+    verifiedAttestation.attestation,
   );
 }
 
-/** Verify a gateway signature against the selected Gateway evidence. */
+/** Verify a Gateway signature against already-verified Gateway evidence. */
 export function verifyGatewayResponse({
   requestBody,
   responseBody,
   signature,
-  attestation,
+  verifiedAttestation,
 }: VerifyGatewayResponseParams): void {
   if (signature.kind !== 'gateway') {
     throw new Error('verifyGatewayResponse requires a gateway signature');
@@ -372,7 +346,7 @@ export function verifyGatewayResponse({
   verifySignatureAndEvidence(
     signature,
     signatureTextFor({ kind: 'gateway', requestBody, responseBody }),
-    attestation,
+    verifiedAttestation.attestation,
   );
 }
 
@@ -392,13 +366,13 @@ function modelFromRequest(requestBody: Uint8Array): string {
  * Verify the signature and evidence for one exact response. requestBody and
  * responseBody must be the bytes sent and received on the wire.
  */
-export async function verifyChat({
+export async function verifyCompletion({
   id,
   requestBody,
   responseBody,
   label,
   signingAlgo,
-}: VerifyChatParams): Promise<void> {
+}: VerifyCompletionParams): Promise<void> {
   console.log(`\n========================================\n${label}\n========================================`);
   const signature = await fetchSignature({ id, signingAlgo });
   console.log('Signature kind:', signature.kind);
@@ -413,27 +387,22 @@ export async function verifyChat({
       nonce,
       signature,
     });
-    await verifyAttestation({
-      attestation,
-      requestNonce: nonce,
-      kind: 'model',
-    });
-    verifyModelResponse({ requestBody, responseBody, signature, attestation });
+    const verifiedAttestation = await verifyModelAttestation({ attestation, nonce });
+    verifyModelResponse({ requestBody, responseBody, signature, verifiedAttestation });
     return;
   }
 
   const gateway = await fetchGatewayAttestationForSignature({ nonce, signature });
-  await verifyAttestation({
+  const verifiedAttestation = await verifyGatewayAttestation({
     attestation: gateway.attestation,
-    requestNonce: nonce,
-    kind: 'gateway',
+    nonce,
     peerSpkiFingerprint: gateway.peerSpkiFingerprint,
   });
   verifyGatewayResponse({
     requestBody,
     responseBody,
     signature,
-    attestation: gateway.attestation,
+    verifiedAttestation,
   });
 }
 
@@ -526,7 +495,7 @@ async function runExample({ model, stream, signingAlgo }: RunExampleParams): Pro
       `Cloud API returned HTTP ${response.statusCode}: ${response.body.toString('utf8')}`,
     );
   }
-  await verifyChat({
+  await verifyCompletion({
     id: completionId(response.body, stream),
     requestBody,
     responseBody: response.body,

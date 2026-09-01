@@ -21,8 +21,8 @@ This proves the TLS certificate is held by the TEE — trust comes from the
 hardware attestation, not from Certificate Authority trust chains.
 
 Usage:
-  python3 py/model_tls_verifier.py --url https://your-model.completions.near.ai
-  python3 py/model_tls_verifier.py --url https://your-model.completions.near.ai --signing-algo ed25519
+  python3 -m py.direct.model_tls_attestation --url https://your-model.completions.near.ai
+  python3 -m py.direct.model_tls_attestation --url https://your-model.completions.near.ai --signing-algo ed25519
 """
 
 from __future__ import annotations
@@ -41,14 +41,12 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
-from model_verifier import (
-    check_event_log,
-    check_tdx_quote,
-    check_gpu,
+from py.common.dstack_attestation import (
+    verify_dstack_quote,
+    verify_nvidia_evidence,
     decode_hex,
-    signing_identity,
-    check_app_compose_measurement,
-    show_image_digest_lookup_links,
+    verify_dstack_deployment,
+    verify_report_data_binding_with_tls_fingerprint,
 )
 
 
@@ -112,77 +110,13 @@ def fetch_model_attestation_and_spki(
     if resp.status != 200:
         raise Exception(f"HTTP {resp.status}: {body.decode()}")
 
-    # cloud-api returns a wrapper object:
-    #   { "gateway_attestation": { ... quote fields ..., "tls_cert_fingerprint": ... }, ... }
-    # Use gateway_attestation for verification. Keep backward-compat if a flat object is returned.
-    response = json.loads(body)
-    if not isinstance(response, dict):
+    attestation = json.loads(body)
+    if not isinstance(attestation, dict):
         raise ValueError("Attestation endpoint returned a non-object JSON value")
-    if isinstance(response.get("gateway_attestation"), dict):
-        attestation = response["gateway_attestation"]
-    else:
-        attestation = response
     return attestation, live_spki_hash
 
 
-def check_report_data_with_tls(
-    attestation: dict, request_nonce: str, intel_result: dict | None
-) -> dict:
-    """Verify TDX report data binds signing address, TLS fingerprint, and nonce.
-
-    Report data layout (64 bytes):
-      [0..32]  = SHA256(signing_address_bytes || cert_fingerprint_bytes)
-      [32..64] = nonce
-    """
-    if intel_result is None or intel_result.get("verified") is not True:
-        raise RuntimeError("Intel TDX quote did not verify with an accepted TCB status")
-
-    report_data = decode_hex(
-        intel_result["quote"]["body"]["reportdata"],
-        "verified quote report_data",
-    )
-    if len(report_data) != 64:
-        raise ValueError("verified quote report_data must be 64 bytes")
-    _, signing_address_bytes = signing_identity(attestation, "attestation")
-
-    embedded_first_32 = report_data[:32]
-    embedded_nonce = report_data[32:]
-
-    # Verify first 32 bytes: SHA256(signing_address || cert_fingerprint)
-    cert_fp_bytes = decode_hex(
-        attestation.get("tls_cert_fingerprint"),
-        "attestation.tls_cert_fingerprint",
-    )
-    if len(cert_fp_bytes) != 32:
-        raise ValueError("attestation.tls_cert_fingerprint must be 32 bytes")
-    expected = sha256(signing_address_bytes + cert_fp_bytes).digest()
-
-    binds_address_and_tls = embedded_first_32 == expected
-    print("Report data binds signing address + TLS fingerprint:", binds_address_and_tls)
-    if not binds_address_and_tls:
-        print("  expected:", expected.hex())
-        print("  actual:  ", embedded_first_32.hex())
-
-    # Verify last 32 bytes: nonce
-    request_nonce_bytes = decode_hex(request_nonce, "request nonce")
-    embeds_nonce = len(request_nonce_bytes) == 32 and embedded_nonce == request_nonce_bytes
-    print("Report data embeds request nonce:", embeds_nonce)
-    if not embeds_nonce:
-        print("  expected:", request_nonce)
-        print("  actual:  ", embedded_nonce.hex())
-
-    if not binds_address_and_tls or not embeds_nonce:
-        raise RuntimeError(
-            "Quote report_data does not bind the signer, TLS fingerprint, and nonce"
-        )
-
-    return {
-        "binds_address_and_tls": binds_address_and_tls,
-        "embeds_nonce": embeds_nonce,
-    }
-
-
-async def verify_model_tls_attestation(
+async def verify_direct_model_tls_attestation(
     url: str, signing_algo: str = "ecdsa", token: str | None = None
 ) -> None:
     """Prove a model endpoint's TLS certificate is bound to the TEE."""
@@ -229,7 +163,7 @@ async def verify_model_tls_attestation(
 
     # 3. Verify Intel TDX quote
     print("\n🔐 Intel TDX quote")
-    intel_result = await check_tdx_quote(attestation)
+    intel_result = await verify_dstack_quote(attestation)
     if intel_result is None or intel_result.get("verified") is not True:
         raise RuntimeError("Intel TDX quote did not verify with an accepted TCB status")
     if intel_result.get("debug_enabled") is not False:
@@ -237,13 +171,27 @@ async def verify_model_tls_attestation(
 
     # 4. Verify report data binds signing address + TLS fingerprint + nonce
     print("\n🔐 TDX report data (TLS mode)")
-    check_report_data_with_tls(attestation, request_nonce, intel_result)
+    report_data = verify_report_data_binding_with_tls_fingerprint(
+        attestation,
+        request_nonce,
+        intel_result,
+    )
+    if not report_data["binds_signer"] or not report_data["embeds_nonce"]:
+        raise RuntimeError(
+            "Quote report_data does not bind the signer, TLS fingerprint, and nonce"
+        )
 
     # 5. Compare live certificate SPKI hash (from step 2) with attested fingerprint
     print("\n🔐 Live TLS certificate")
     print("Live certificate SPKI hash:", live_spki_hash)
 
-    tls_match = live_spki_hash.lower() == tls_cert_fingerprint.lower()
+    tls_match = decode_hex(
+        live_spki_hash,
+        "live TLS certificate SPKI fingerprint",
+    ) == decode_hex(
+        tls_cert_fingerprint,
+        "attestation.tls_cert_fingerprint",
+    )
     print("Live SPKI matches attested fingerprint:", tls_match)
     if not tls_match:
         print("  attested:", tls_cert_fingerprint)
@@ -253,20 +201,18 @@ async def verify_model_tls_attestation(
     # 6. GPU attestation
     print("\n🔐 GPU attestation")
     if attestation.get("nvidia_payload"):
-        gpu = check_gpu(attestation, request_nonce)
+        gpu = verify_nvidia_evidence(attestation, request_nonce)
         if gpu.get("verified") is not True:
             raise RuntimeError("Provided NVIDIA GPU evidence did not verify")
     else:
         print("No nvidia_payload in attestation; skipping GPU check.")
 
     # 7. Measured deployment
-    event_log = check_event_log(attestation, intel_result)
-    if event_log.get("replay_matches") is not True:
+    deployment = verify_dstack_deployment(attestation, intel_result)
+    if deployment["event_log"].get("replay_matches") is not True:
         raise RuntimeError("Event log does not replay to RTMR3 from the verified quote")
-    compose = check_app_compose_measurement(attestation, intel_result)
-    if compose.get("mrconfig_matches") is not True:
+    if deployment["compose"].get("mrconfig_matches") is not True:
         raise RuntimeError("MRCONFIGID does not bind the attested app_compose")
-    show_image_digest_lookup_links(attestation)
 
 
 async def main() -> None:
@@ -297,7 +243,7 @@ async def main() -> None:
     print(f"Target: {args.url}")
     print(f"Signing algorithm: {args.signing_algo}")
 
-    await verify_model_tls_attestation(args.url, args.signing_algo, args.token)
+    await verify_direct_model_tls_attestation(args.url, args.signing_algo, args.token)
 
 
 if __name__ == "__main__":

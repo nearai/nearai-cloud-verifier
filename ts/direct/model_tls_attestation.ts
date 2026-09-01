@@ -31,15 +31,13 @@ import * as tls from 'tls';
 import { Buffer } from 'buffer';
 
 import {
-  checkTdxQuote,
-  checkGpu,
-  checkEventLog,
-  checkAppComposeMeasurement,
-  showImageDigestLookupLinks,
-  IntelResult,
-  AttestationApiReport,
-  AttestationReport,
-} from './model_verifier';
+  hexBytesOfLength,
+  verifyDstackQuote,
+  verifyDstackDeployment,
+  verifyNvidiaEvidence,
+  verifyReportDataBindingWithTlsFingerprint,
+  type AttestationReport,
+} from '../common/dstack_attestation';
 
 /**
  * Fetch attestation report AND extract the live TLS certificate SPKI hash
@@ -94,15 +92,7 @@ function fetchModelAttestationAndSpki(
         }
         try {
           const parsed = JSON.parse(body) as unknown;
-          // Prefer wrapped cloud-api shape { gateway_attestation, ... }, but stay
-          // compatible with older flat responses that return the attestation directly.
-          let attestation: AttestationReport | undefined;
-          const maybeWrapped = parsed as Partial<AttestationApiReport> | undefined;
-          if (maybeWrapped && typeof maybeWrapped === 'object' && maybeWrapped.gateway_attestation) {
-            attestation = maybeWrapped.gateway_attestation as AttestationReport;
-          } else {
-            attestation = parsed as AttestationReport;
-          }
+          const attestation = parsed as AttestationReport;
           resolve({ attestation, liveSpkiHash });
         } catch (e) {
           reject(new Error(`Failed to parse attestation response: ${body}`));
@@ -124,69 +114,13 @@ function fetchModelAttestationAndSpki(
 }
 
 /**
- * Verify that the TDX report data binds the signing address, TLS certificate
- * fingerprint, and request nonce.
- *
- * Report data layout (64 bytes):
- *   [0..32]  = SHA256(signing_address_bytes || cert_fingerprint_bytes)
- *   [32..64] = nonce
- */
-function checkReportDataWithTls(
-  attestation: AttestationReport,
-  requestNonce: string,
-  intelResult: IntelResult,
-): { binds_address_and_tls: boolean; embeds_nonce: boolean } {
-  const reportDataHex = intelResult.quote.body.reportdata;
-  const reportData = Buffer.from(reportDataHex.replace('0x', ''), 'hex');
-  const signingAlgo = (attestation.signing_algo || 'ecdsa').toLowerCase();
-
-  // Parse signing address bytes
-  let signingAddressBytes: Buffer;
-  if (signingAlgo === 'ecdsa') {
-    signingAddressBytes = Buffer.from(attestation.signing_address.replace('0x', ''), 'hex');
-  } else {
-    signingAddressBytes = Buffer.from(attestation.signing_address, 'hex');
-  }
-
-  const embeddedFirst32 = reportData.subarray(0, 32);
-  const embeddedNonce = reportData.subarray(32);
-
-  // Verify first 32 bytes: SHA256(signing_address || cert_fingerprint)
-  const certFpBytes = Buffer.from(attestation.tls_cert_fingerprint!, 'hex');
-  const expected = crypto.createHash('sha256')
-    .update(signingAddressBytes)
-    .update(certFpBytes)
-    .digest();
-
-  const bindsAddressAndTls = embeddedFirst32.equals(expected);
-  console.log('Report data binds signing address + TLS fingerprint:', bindsAddressAndTls);
-  if (!bindsAddressAndTls) {
-    console.log('  expected:', expected.toString('hex'));
-    console.log('  actual:  ', embeddedFirst32.toString('hex'));
-  }
-
-  // Verify last 32 bytes: nonce
-  const embedsNonce = embeddedNonce.toString('hex') === requestNonce;
-  console.log('Report data embeds request nonce:', embedsNonce);
-  if (!embedsNonce) {
-    console.log('  expected:', requestNonce);
-    console.log('  actual:  ', embeddedNonce.toString('hex'));
-  }
-
-  if (!bindsAddressAndTls || !embedsNonce) {
-    throw new Error('Quote report_data does not bind the signer, TLS fingerprint, and nonce');
-  }
-
-  return {
-    binds_address_and_tls: bindsAddressAndTls,
-    embeds_nonce: embedsNonce,
-  };
-}
-
-/**
  * Main verification flow: prove that a model endpoint's TLS certificate is bound to the TEE.
  */
-async function verifyModelTlsAttestation(url: string, signingAlgo: string = 'ecdsa', token?: string): Promise<void> {
+export async function verifyDirectModelTlsAttestation(
+  url: string,
+  signingAlgo: string = 'ecdsa',
+  token?: string,
+): Promise<void> {
   const parsed = new URL(url);
   if (parsed.protocol !== 'https:') {
     throw new Error('URL must use https:// scheme for TLS verification');
@@ -225,17 +159,31 @@ async function verifyModelTlsAttestation(url: string, signingAlgo: string = 'ecd
 
   // 3. Verify Intel TDX quote
   console.log('\n🔐 Intel TDX quote');
-  const intelResult = await checkTdxQuote(attestation);
+  const intelResult = await verifyDstackQuote(attestation);
 
   // 4. Verify report data binds signing address + TLS fingerprint + nonce
   console.log('\n🔐 TDX report data (TLS mode)');
-  checkReportDataWithTls(attestation, requestNonce, intelResult);
+  verifyReportDataBindingWithTlsFingerprint({
+    attestation,
+    requestNonce,
+    intelResult,
+  });
 
   // 5. Compare live certificate SPKI hash (from step 2) with attested fingerprint
   console.log('\n🔐 Live TLS certificate');
   console.log('Live certificate SPKI hash:', liveSpkiHash);
 
-  const tlsMatch = liveSpkiHash === attestation.tls_cert_fingerprint;
+  const tlsMatch = hexBytesOfLength(
+    liveSpkiHash,
+    32,
+    'live TLS certificate SPKI fingerprint',
+  ).equals(
+    hexBytesOfLength(
+      attestation.tls_cert_fingerprint,
+      32,
+      'attestation.tls_cert_fingerprint',
+    ),
+  );
   console.log('Live SPKI matches attested fingerprint:', tlsMatch);
   if (!tlsMatch) {
     console.log('  attested:', attestation.tls_cert_fingerprint);
@@ -246,15 +194,13 @@ async function verifyModelTlsAttestation(url: string, signingAlgo: string = 'ecd
   // 6. GPU attestation (optional; cloud-api gateway has no GPU)
   console.log('\n🔐 GPU attestation');
   if (attestation.nvidia_payload) {
-    await checkGpu({ attestation, requestNonce });
+    await verifyNvidiaEvidence({ attestation, requestNonce });
   } else {
     console.log('No nvidia_payload in attestation; skipping GPU check.');
   }
 
-  // 7. Compose and Sigstore
-  checkEventLog(attestation, intelResult);
-  checkAppComposeMeasurement(attestation, intelResult);
-  await showImageDigestLookupLinks(attestation);
+  // 7. Measured deployment
+  await verifyDstackDeployment({ attestation, intelResult });
 }
 
 async function main(): Promise<void> {
@@ -280,7 +226,7 @@ async function main(): Promise<void> {
   console.log(`Target: ${url}`);
   console.log(`Signing algorithm: ${signingAlgo}`);
 
-  await verifyModelTlsAttestation(url, signingAlgo, token);
+  await verifyDirectModelTlsAttestation(url, signingAlgo, token);
 }
 
 if (require.main === module) {

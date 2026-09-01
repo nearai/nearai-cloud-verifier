@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
 from nacl import bindings
 
-from chat_verifier import verify_chat
+from py.gateway.completion import verify_completion
 
 API_KEY = os.environ.get("API_KEY", "")
 BASE_URL = os.environ.get("BASE_URL", "https://cloud-api.near.ai")
@@ -431,7 +431,7 @@ async def encrypted_streaming_example(model, signing_algo="ecdsa"):
     print(f"✓ Total response length: {len(response_body)} bytes")
     if chat_id is None:
         raise ValueError("Streaming response did not contain a completion id")
-    await verify_chat(
+    await verify_completion(
         chat_id,
         request_body,
         response_body,
@@ -542,7 +542,7 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
         finish_reason = choice.get("finish_reason", "unknown")
         print(f"✓ Finish reason: {finish_reason}")
         if finish_reason == "length":
-            print(f"  ⚠ Response was truncated due to max_tokens limit")
+            print("  ⚠ Response was truncated due to max_tokens limit")
 
     decryption_failures = []
 
@@ -596,16 +596,16 @@ async def encrypted_non_streaming_example(model, signing_algo="ecdsa"):
                     print(f"\n✓ Reasoning (alt) ({len(reasoning_alt)} characters):")
                     print(f"  {reasoning_alt}")
             else:
-                print(f"\n⚠ No content field found in decrypted fields")
+                print("\n⚠ No content field found in decrypted fields")
         else:
-            print(f"\n⚠ No encrypted fields found to decrypt")
+            print("\n⚠ No encrypted fields found to decrypt")
             print(f"  Message keys: {list(message.keys())}")
             print(f"  Message: {json.dumps(message, indent=2)}")
     else:
         print("✗ No choices in response")
         print(f"  Response: {json.dumps(payload, indent=2)}")
 
-    await verify_chat(
+    await verify_completion(
         chat_id,
         request_body,
         response_body,

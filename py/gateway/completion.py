@@ -28,16 +28,25 @@ import requests
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
-from model_verifier import (
-    API_KEY,
-    BASE_URL,
+from py.common.dstack_attestation import (
     AttestationVerificationError,
     VerificationFailure,
     decode_hex,
+    signing_identities_match,
+    signing_identity,
+)
+from py.gateway.attestation import (
+    VerifiedGatewayAttestation,
+    VerifiedModelAttestation,
+    verify_gateway_attestation,
+    verify_model_attestation,
+)
+from py.gateway.cloud_api import (
+    API_KEY,
+    cloud_api_headers,
+    cloud_api_url,
     fetch_gateway_attestation_for_signature,
     fetch_model_attestation_for_signature,
-    signing_identity,
-    verify_attestation,
 )
 
 
@@ -51,20 +60,6 @@ class ResponseVerificationError(RuntimeError):
         self.failures = tuple(failures)
         summary = "; ".join(f"{failure.check}: {failure.detail}" for failure in failures)
         super().__init__(f"Response verification failed ({summary})")
-
-
-def _cloud_api_url(path: str) -> str:
-    base = BASE_URL.rstrip("/")
-    if base.endswith("/v1"):
-        return f"{base}/{path.lstrip('/')}"
-    return f"{base}/v1/{path.lstrip('/')}"
-
-
-def _headers(content_type: bool = False) -> Dict[str, str]:
-    headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
-    if content_type:
-        headers["Content-Type"] = "application/json"
-    return headers
 
 
 def _as_bytes(value: Union[bytes, str], label: str) -> bytes:
@@ -96,9 +91,9 @@ def fetch_signature(
 
     params = {} if signing_algo is None else {"signing_algo": signing_algo}
     response = requests.get(
-        _cloud_api_url(f"signature/{quote(completion_id, safe='')}"),
+        cloud_api_url(f"signature/{quote(completion_id, safe='')}"),
         params=params,
-        headers=_headers(),
+        headers=cloud_api_headers(),
         timeout=30,
     )
     response.raise_for_status()
@@ -230,6 +225,55 @@ def verify_response_signature(
     return failures
 
 
+def _response_signer_failures(
+    signature: Dict[str, Any], attestation: Dict[str, Any]
+) -> List[VerificationFailure]:
+    try:
+        matches = signing_identities_match(signature, attestation)
+    except ValueError as error:
+        print("Attestation signer matches signature:", False)
+        print("  error:", error)
+        matches = False
+    else:
+        print("Attestation signer matches signature:", matches)
+    return [] if matches else [
+        VerificationFailure(
+            "response signer binding",
+            "attestation signing identity differs from the response signature",
+        )
+    ]
+
+
+def verify_model_response(
+    signature: Dict[str, Any],
+    request_body: bytes,
+    response_body: bytes,
+    verified_attestation: VerifiedModelAttestation,
+) -> List[VerificationFailure]:
+    """Verify a ``provider_tee`` response against verified model evidence."""
+
+    if _require_signature_kind(signature) != "provider_tee":
+        raise ValueError("verify_model_response requires a provider_tee signature")
+    return verify_response_signature(signature, request_body, response_body) + _response_signer_failures(
+        signature, verified_attestation.attestation
+    )
+
+
+def verify_gateway_response(
+    signature: Dict[str, Any],
+    request_body: bytes,
+    response_body: bytes,
+    verified_attestation: VerifiedGatewayAttestation,
+) -> List[VerificationFailure]:
+    """Verify a ``gateway`` response against verified Gateway evidence."""
+
+    if _require_signature_kind(signature) != "gateway":
+        raise ValueError("verify_gateway_response requires a gateway signature")
+    return verify_response_signature(signature, request_body, response_body) + _response_signer_failures(
+        signature, verified_attestation.attestation
+    )
+
+
 def _append_attestation_failures(
     failures: List[VerificationFailure], error: AttestationVerificationError
 ) -> None:
@@ -237,7 +281,7 @@ def _append_attestation_failures(
         failures.append(VerificationFailure(f"attestation: {failure.check}", failure.detail))
 
 
-async def verify_chat(
+async def verify_completion(
     chat_id: str,
     request_body: Union[bytes, str],
     response_body: Union[bytes, str],
@@ -260,31 +304,38 @@ async def verify_chat(
     signature = fetch_signature(chat_id, signing_algo=signing_algo)
     print(json.dumps(signature, indent=2))
     kind = _require_signature_kind(signature)
-    failures.extend(verify_response_signature(signature, request_bytes, response_bytes))
-
     try:
         if kind == "provider_tee":
             print("\n🔐 Model attestation for provider_tee signature")
             attestation, nonce = fetch_model_attestation_for_signature(
                 _model_from_request(request_bytes), signature
             )
-            await verify_attestation(
-                attestation,
-                nonce,
-                verify_model=True,
-                expected_signer=signature,
+            verified_attestation = await verify_model_attestation(attestation, nonce)
+            failures.extend(
+                verify_model_response(
+                    signature,
+                    request_bytes,
+                    response_bytes,
+                    verified_attestation,
+                )
             )
         else:
             print("\n🔐 Gateway attestation for gateway signature")
             attestation, nonce, peer_spki = fetch_gateway_attestation_for_signature(
                 signature
             )
-            await verify_attestation(
+            verified_attestation = await verify_gateway_attestation(
                 attestation,
                 nonce,
-                require_peer_tls_binding=True,
-                peer_spki_fingerprint=peer_spki,
-                expected_signer=signature,
+                peer_spki,
+            )
+            failures.extend(
+                verify_gateway_response(
+                    signature,
+                    request_bytes,
+                    response_bytes,
+                    verified_attestation,
+                )
             )
     except AttestationVerificationError as error:
         _append_attestation_failures(failures, error)
@@ -331,9 +382,9 @@ def _post_completion(request_body: bytes, streaming: bool) -> bytes:
     """Return exactly the bytes emitted by the Cloud API response body."""
 
     response = requests.post(
-        _cloud_api_url("chat/completions"),
+        cloud_api_url("chat/completions"),
         headers={
-            **_headers(content_type=True),
+            **cloud_api_headers({"Content-Type": "application/json"}),
             "Accept-Encoding": "identity",
             "x-no-aliasing": "true",
         },
@@ -357,7 +408,7 @@ async def streaming_example(model: str, signing_algo: Optional[str] = None) -> N
     request_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
     response_body = _post_completion(request_body, streaming=True)
     chat_id = _completion_id_from_stream(response_body)
-    await verify_chat(
+    await verify_completion(
         chat_id,
         request_body,
         response_body,
@@ -376,7 +427,7 @@ async def non_streaming_example(model: str, signing_algo: Optional[str] = None) 
     request_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
     response_body = _post_completion(request_body, streaming=False)
     chat_id = _completion_id_from_json(response_body)
-    await verify_chat(
+    await verify_completion(
         chat_id,
         request_body,
         response_body,

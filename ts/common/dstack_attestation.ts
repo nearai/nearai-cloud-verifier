@@ -1,17 +1,14 @@
 #!/usr/bin/env node
 /**
- * A readable, independent verifier for NEAR AI Cloud attestations.
+ * Shared dstack attestation primitives.
  *
- * This file intentionally does not depend on the SDK. It shows the checks a
- * client performs against the public Cloud API response: quote verification,
- * nonce and signer binding, measured deployment, and optional GPU evidence.
+ * These functions verify the quote, report-data bindings, measured deployment,
+ * and optional GPU evidence. Endpoint-specific flows live in gateway/ and
+ * direct/ so their different verification goals remain explicit.
  */
 
 import { Buffer } from 'buffer';
 import * as crypto from 'crypto';
-import * as https from 'https';
-import * as tls from 'tls';
-import { URL } from 'url';
 import { js_get_collateral, js_verify } from '@phala/dcap-qvl-node';
 
 const GPU_VERIFIER_API = 'https://nras.attestation.nvidia.com/v3/attest/gpu';
@@ -43,13 +40,6 @@ export interface AttestationBaseInfo {
 
 export interface AttestationReport extends AttestationBaseInfo {}
 
-export interface AttestationApiReport {
-  gateway_attestation?: AttestationReport;
-  model_attestations?: AttestationReport[];
-  tls_certificate?: string;
-  [key: string]: unknown;
-}
-
 export interface IntelResult {
   quote: {
     body: {
@@ -67,62 +57,20 @@ export interface IntelResult {
   message?: string;
 }
 
-export interface ReportDataResult {
-  binds_address: true;
-  embeds_nonce: true;
-  tls_fingerprint_bound: boolean;
-}
-
 export interface GpuResult {
   status: 'not_provided' | 'verified';
   verdict?: 'PASS';
 }
 
-export interface FetchModelAttestationParams {
-  model: string;
-  nonce: string;
-  signingAlgo: SigningAlgo;
-  signingAddress: string;
-}
-
-export interface FetchModelAttestationsParams {
-  model: string;
-  nonce: string;
-  signingAlgo?: SigningAlgo;
-}
-
-export interface FetchGatewayAttestationParams {
-  nonce: string;
-  signingAlgo?: SigningAlgo;
-}
-
-export interface FetchedGatewayAttestation {
-  attestation: AttestationReport;
-  peerSpkiFingerprint?: string;
-}
-
-export interface CheckReportDataParams {
+export interface VerifyReportDataBindingParams {
   attestation: AttestationReport;
   requestNonce: string;
   intelResult: IntelResult;
-  requireTlsFingerprint?: boolean;
 }
 
-export interface CheckGpuParams {
+export interface VerifyNvidiaEvidenceParams {
   attestation: AttestationReport;
   requestNonce: string;
-}
-
-export interface VerifyAttestationParams {
-  attestation: AttestationReport;
-  requestNonce: string;
-  kind: 'model' | 'gateway';
-  peerSpkiFingerprint?: string;
-}
-
-export interface VerifyGatewayTlsBindingParams {
-  nonce?: string;
-  signingAlgo?: SigningAlgo;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -134,27 +82,6 @@ type EventLogEntry = {
   event_type: number;
   imr: number;
 };
-
-function cloudApiBaseUrl(): string {
-  return process.env.BASE_URL || 'https://cloud-api.near.ai';
-}
-
-function cloudApiHeaders(extra: Record<string, string> = {}): Record<string, string> {
-  const apiKey = process.env.API_KEY;
-  return {
-    'Accept-Encoding': 'identity',
-    ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-    ...extra,
-  };
-}
-
-function attestationReportUrl(query: Record<string, string>): URL {
-  const url = new URL('/v1/attestation/report', cloudApiBaseUrl());
-  for (const [name, value] of Object.entries(query)) {
-    url.searchParams.set(name, value);
-  }
-  return url;
-}
 
 function asRecord(value: unknown, label: string): JsonRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -170,7 +97,7 @@ function requireString(value: unknown, label: string): string {
   return value;
 }
 
-function normalizeSigningAlgo(value: string): SigningAlgo {
+export function normalizeSigningAlgo(value: string): SigningAlgo {
   const normalized = value.toLowerCase();
   if (normalized === 'ecdsa' || normalized === 'ed25519') {
     return normalized;
@@ -186,7 +113,7 @@ function stripHexPrefix(value: string): string {
     : value;
 }
 
-function hexBytes(value: string, label: string): Buffer {
+export function hexBytes(value: string, label: string): Buffer {
   const normalized = stripHexPrefix(value);
   if (
     normalized.length === 0 ||
@@ -198,7 +125,7 @@ function hexBytes(value: string, label: string): Buffer {
   return Buffer.from(normalized, 'hex');
 }
 
-function hexBytesOfLength(value: string, byteLength: number, label: string): Buffer {
+export function hexBytesOfLength(value: string, byteLength: number, label: string): Buffer {
   const bytes = hexBytes(value, label);
   if (bytes.length !== byteLength) {
     throw new Error(`${label} must be ${byteLength} bytes, got ${bytes.length}`);
@@ -206,7 +133,7 @@ function hexBytesOfLength(value: string, byteLength: number, label: string): Buf
   return bytes;
 }
 
-function signingAddressBytes(
+export function signingAddressBytes(
   signingAddress: string,
   signingAlgo: SigningAlgo,
 ): Buffer {
@@ -222,167 +149,7 @@ function paddedSigningAddress(
   return Buffer.concat([address, Buffer.alloc(32 - address.length)]);
 }
 
-async function requestJson(
-  url: URL,
-  headers: Record<string, string>,
-): Promise<unknown> {
-  const response = await fetch(url, { headers });
-  const body = await response.text();
-  if (!response.ok) {
-    throw new Error(`Cloud API returned HTTP ${response.status}: ${body}`);
-  }
-  try {
-    return JSON.parse(body);
-  } catch (cause) {
-    throw new Error(
-      `Cloud API returned invalid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
-    );
-  }
-}
-
-/**
- * Fetch JSON and, for HTTPS, capture the SPKI fingerprint of the TLS peer that
- * served that exact response. Browsers do not expose peer certificates to
- * JavaScript, so this is deliberately a Node-only helper.
- */
-function requestJsonWithPeerSpki(
-  url: URL,
-  headers: Record<string, string>,
-): Promise<{ body: unknown; peerSpkiFingerprint?: string }> {
-  if (url.protocol !== 'https:') {
-    return requestJson(url, headers).then((body) => ({ body }));
-  }
-
-  return new Promise((resolve, reject) => {
-    const request = https.request(
-      {
-        protocol: url.protocol,
-        hostname: url.hostname,
-        port: url.port || 443,
-        path: `${url.pathname}${url.search}`,
-        method: 'GET',
-        headers,
-        timeout: 30_000,
-      },
-      (response) => {
-        let peerSpkiFingerprint: string | undefined;
-        try {
-          const socket = response.socket as tls.TLSSocket;
-          const certificate = socket.getPeerX509Certificate();
-          if (certificate) {
-            const spkiDer = certificate.publicKey.export({
-              type: 'spki',
-              format: 'der',
-            });
-            peerSpkiFingerprint = crypto
-              .createHash('sha256')
-              .update(spkiDer)
-              .digest('hex');
-          }
-        } catch (cause) {
-          reject(
-            new Error(
-              `Could not read the TLS peer certificate: ${cause instanceof Error ? cause.message : String(cause)}`,
-            ),
-          );
-          response.resume();
-          return;
-        }
-
-        const chunks: Buffer[] = [];
-        response.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
-        response.on('error', reject);
-        response.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8');
-          if ((response.statusCode ?? 500) < 200 || (response.statusCode ?? 500) >= 300) {
-            reject(new Error(`Cloud API returned HTTP ${response.statusCode}: ${text}`));
-            return;
-          }
-          try {
-            resolve({ body: JSON.parse(text), peerSpkiFingerprint });
-          } catch (cause) {
-            reject(
-              new Error(
-                `Cloud API returned invalid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
-              ),
-            );
-          }
-        });
-      },
-    );
-    request.on('error', reject);
-    request.on('timeout', () => {
-      request.destroy(new Error('Cloud API request timed out'));
-    });
-    request.end();
-  });
-}
-
-function parseAttestation(value: unknown, label: string): AttestationReport {
-  const record = asRecord(value, label);
-  const info = asRecord(record.info, `${label}.info`);
-  if (
-    record.nvidia_payload !== undefined &&
-    record.nvidia_payload !== null &&
-    typeof record.nvidia_payload !== 'string'
-  ) {
-    throw new Error(`${label}.nvidia_payload must be a string or null`);
-  }
-  if (
-    record.tls_cert_fingerprint !== undefined &&
-    record.tls_cert_fingerprint !== null &&
-    typeof record.tls_cert_fingerprint !== 'string'
-  ) {
-    throw new Error(`${label}.tls_cert_fingerprint must be a string or null`);
-  }
-  return {
-    intel_quote: requireString(record.intel_quote, `${label}.intel_quote`),
-    signing_address: requireString(record.signing_address, `${label}.signing_address`),
-    signing_algo: requireString(record.signing_algo, `${label}.signing_algo`),
-    info: {
-      tcb_info: info.tcb_info as AttestationBaseInfo['info']['tcb_info'],
-    },
-    ...(typeof record.event_log === 'string' || Array.isArray(record.event_log)
-      ? { event_log: record.event_log }
-      : {}),
-    ...(typeof record.report_data === 'string' ? { report_data: record.report_data } : {}),
-    ...(typeof record.request_nonce === 'string'
-      ? { request_nonce: record.request_nonce }
-      : {}),
-    ...(record.nvidia_payload === null || typeof record.nvidia_payload === 'string'
-      ? { nvidia_payload: record.nvidia_payload }
-      : {}),
-    ...(record.tls_cert_fingerprint === null || typeof record.tls_cert_fingerprint === 'string'
-      ? { tls_cert_fingerprint: record.tls_cert_fingerprint }
-      : {}),
-    ...(typeof record.model_name === 'string' ? { model_name: record.model_name } : {}),
-  };
-}
-
-function parseAttestationApiReport(value: unknown): AttestationApiReport {
-  const record = asRecord(value, 'Cloud API attestation response');
-  const report: AttestationApiReport = {};
-  if (record.gateway_attestation !== undefined) {
-    report.gateway_attestation = parseAttestation(
-      record.gateway_attestation,
-      'gateway_attestation',
-    );
-  }
-  if (record.model_attestations !== undefined) {
-    if (!Array.isArray(record.model_attestations)) {
-      throw new Error('model_attestations must be an array when present');
-    }
-    report.model_attestations = record.model_attestations.map((item, index) =>
-      parseAttestation(item, `model_attestations[${index}]`),
-    );
-  }
-  if (typeof record.tls_certificate === 'string') {
-    report.tls_certificate = record.tls_certificate;
-  }
-  return report;
-}
-
-function assertNonceEcho(attestation: AttestationReport, nonce: string): void {
+export function verifyAttestationNonce(attestation: AttestationReport, nonce: string): void {
   const reportedNonce = hexBytesOfLength(
     requireString(attestation.request_nonce, 'attestation.request_nonce'),
     32,
@@ -394,112 +161,6 @@ function assertNonceEcho(attestation: AttestationReport, nonce: string): void {
   if (!matches) {
     throw new Error('Cloud API attestation request_nonce does not match the requested nonce');
   }
-}
-
-/** Fetch exactly the NEAR model evidence bound to a completion signature. */
-export async function fetchModelAttestation({
-  model,
-  nonce,
-  signingAlgo,
-  signingAddress,
-}: FetchModelAttestationParams): Promise<AttestationReport> {
-  const report = parseAttestationApiReport(
-    await requestJson(
-      attestationReportUrl({
-        model,
-        nonce,
-        signing_algo: signingAlgo,
-        signing_address: signingAddress,
-        provider: 'near',
-        include_tls_fingerprint: 'false',
-      }),
-      cloudApiHeaders({ 'x-no-aliasing': 'true' }),
-    ),
-  );
-  const candidates = (report.model_attestations ?? []).filter((attestation) => {
-    try {
-      return (
-        normalizeSigningAlgo(attestation.signing_algo) === signingAlgo &&
-        signingAddressBytes(attestation.signing_address, signingAlgo).equals(
-          signingAddressBytes(signingAddress, signingAlgo),
-        )
-      );
-    } catch {
-      return false;
-    }
-  });
-
-  if (candidates.length !== 1) {
-    throw new Error(
-      `Expected exactly one NEAR model attestation for the signature signer; found ${candidates.length}`,
-    );
-  }
-  const attestation = candidates[0]!;
-  assertNonceEcho(attestation, nonce);
-  return attestation;
-}
-
-/**
- * Fetch every NEAR model evidence item Cloud API returns for a model audit.
- * This does not connect an attestation to a particular completion signature.
- */
-export async function fetchModelAttestations({
-  model,
-  nonce,
-  signingAlgo,
-}: FetchModelAttestationsParams): Promise<AttestationReport[]> {
-  const query: Record<string, string> = {
-    model,
-    nonce,
-    provider: 'near',
-    include_tls_fingerprint: 'false',
-  };
-  if (signingAlgo !== undefined) query.signing_algo = signingAlgo;
-  const report = parseAttestationApiReport(
-    await requestJson(
-      attestationReportUrl(query),
-      cloudApiHeaders({ 'x-no-aliasing': 'true' }),
-    ),
-  );
-  const attestations = report.model_attestations ?? [];
-  if (attestations.length === 0) {
-    throw new Error('Cloud API response does not contain model_attestations');
-  }
-  for (const attestation of attestations) {
-    assertNonceEcho(attestation, nonce);
-  }
-  return attestations;
-}
-
-/**
- * Fetch Gateway evidence with TLS fingerprint binding enabled. The returned
- * peerSpkiFingerprint is observed from the HTTPS connection that served the
- * evidence response, not from any completion request.
- */
-export async function fetchGatewayAttestation({
-  nonce,
-  signingAlgo,
-}: FetchGatewayAttestationParams): Promise<FetchedGatewayAttestation> {
-  const query: Record<string, string> = {
-    nonce,
-    include_tls_fingerprint: 'true',
-  };
-  if (signingAlgo !== undefined) query.signing_algo = signingAlgo;
-  const response = await requestJsonWithPeerSpki(
-    attestationReportUrl(query),
-    cloudApiHeaders(),
-  );
-  const report = parseAttestationApiReport(response.body);
-  if (!report.gateway_attestation) {
-    throw new Error('Cloud API response does not contain gateway_attestation');
-  }
-  assertNonceEcho(report.gateway_attestation, nonce);
-  return {
-    attestation: report.gateway_attestation,
-    ...(response.peerSpkiFingerprint
-      ? { peerSpkiFingerprint: response.peerSpkiFingerprint }
-      : {}),
-  };
 }
 
 /** Submit GPU evidence to NVIDIA NRAS. */
@@ -565,7 +226,7 @@ function quoteTd10(rawResult: unknown): JsonRecord {
 }
 
 /** Verify the Intel quote and expose its authenticated measurements. */
-export async function checkTdxQuote(
+export async function verifyDstackQuote(
   attestation: AttestationBaseInfo,
 ): Promise<IntelResult> {
   const rawQuote = hexBytes(attestation.intel_quote, 'intel_quote');
@@ -625,16 +286,16 @@ export async function checkTdxQuote(
 }
 
 /**
- * Verify the quote's signer/nonce binding. The quote is the source of truth;
- * report_data in JSON is checked only as a consistency copy.
+ * Read the quote's authenticated report data and verify its nonce binding.
+ * If the endpoint also exposes report_data in JSON, check it only as a
+ * convenience copy against the verified quote. Direct endpoints need not
+ * expose that copy.
  */
-export function checkReportData({
+function verifiedReportData({
   attestation,
   requestNonce,
   intelResult,
-  requireTlsFingerprint = false,
-}: CheckReportDataParams): ReportDataResult {
-  assertNonceEcho(attestation, requestNonce);
+}: VerifyReportDataBindingParams): Buffer {
   const quoteReportData = hexBytesOfLength(
     intelResult.quote.body.reportdata,
     64,
@@ -661,36 +322,31 @@ export function checkReportData({
     }
   }
 
+  return quoteReportData;
+}
+
+/**
+ * Verify the two-part report-data layout used when no TLS fingerprint is
+ * requested: padded signing address || request nonce.
+ */
+export function verifyReportDataBinding({
+  attestation,
+  requestNonce,
+  intelResult,
+}: VerifyReportDataBindingParams): void {
+  const quoteReportData = verifiedReportData({
+    attestation,
+    requestNonce,
+    intelResult,
+  });
+
   const signingAlgo = normalizeSigningAlgo(attestation.signing_algo);
   const firstHalf = quoteReportData.subarray(0, 32);
   const fingerprint = attestation.tls_cert_fingerprint;
   if (fingerprint !== undefined && fingerprint !== null) {
-    const fingerprintBytes = hexBytesOfLength(
-      fingerprint,
-      32,
-      'attestation.tls_cert_fingerprint',
+    throw new Error(
+      'Attestation includes tls_cert_fingerprint; verify it with verifyReportDataBindingWithTlsFingerprint',
     );
-    const expected = crypto
-      .createHash('sha256')
-      .update(signingAddressBytes(attestation.signing_address, signingAlgo))
-      .update(fingerprintBytes)
-      .digest();
-    const matches = firstHalf.equals(expected);
-    console.log('Quote report_data binds signing address + TLS fingerprint:', matches);
-    if (!matches) {
-      throw new Error(
-        'Quote report_data does not bind the signing address and declared TLS fingerprint',
-      );
-    }
-    return {
-      binds_address: true,
-      embeds_nonce: true,
-      tls_fingerprint_bound: true,
-    };
-  }
-
-  if (requireTlsFingerprint) {
-    throw new Error('Gateway attestation is missing tls_cert_fingerprint');
   }
 
   const expected = paddedSigningAddress(attestation.signing_address, signingAlgo);
@@ -699,11 +355,47 @@ export function checkReportData({
   if (!matches) {
     throw new Error('Quote report_data does not bind the signing address');
   }
-  return {
-    binds_address: true,
-    embeds_nonce: true,
-    tls_fingerprint_bound: false,
-  };
+}
+
+/**
+ * Verify the three-part report-data layout used when TLS binding is requested:
+ * SHA-256(signing address || TLS SPKI fingerprint) || request nonce.
+ * Returns the quote-bound fingerprint for the caller to compare with a live
+ * TLS peer from the same evidence request.
+ */
+export function verifyReportDataBindingWithTlsFingerprint({
+  attestation,
+  requestNonce,
+  intelResult,
+}: VerifyReportDataBindingParams): string {
+  const quoteReportData = verifiedReportData({
+    attestation,
+    requestNonce,
+    intelResult,
+  });
+  const fingerprint = requireString(
+    attestation.tls_cert_fingerprint,
+    'attestation.tls_cert_fingerprint',
+  );
+  const fingerprintBytes = hexBytesOfLength(
+    fingerprint,
+    32,
+    'attestation.tls_cert_fingerprint',
+  );
+  const signingAlgo = normalizeSigningAlgo(attestation.signing_algo);
+  const expected = crypto
+    .createHash('sha256')
+    .update(signingAddressBytes(attestation.signing_address, signingAlgo))
+    .update(fingerprintBytes)
+    .digest();
+  const matches = quoteReportData.subarray(0, 32).equals(expected);
+  console.log('Quote report_data binds signing address + TLS fingerprint:', matches);
+  if (!matches) {
+    throw new Error(
+      'Quote report_data does not bind the signing address and declared TLS fingerprint',
+    );
+  }
+  return fingerprint;
 }
 
 function decodeJwtPayload(jwt: string): JsonRecord {
@@ -724,10 +416,10 @@ function decodeJwtPayload(jwt: string): JsonRecord {
 }
 
 /** Verify model GPU evidence when the provider included it. */
-export async function checkGpu({
+export async function verifyNvidiaEvidence({
   attestation,
   requestNonce,
-}: CheckGpuParams): Promise<GpuResult> {
+}: VerifyNvidiaEvidenceParams): Promise<GpuResult> {
   const payloadText = attestation.nvidia_payload;
   if (payloadText === undefined || payloadText === null || payloadText === '') {
     console.log('GPU evidence: not provided');
@@ -941,135 +633,18 @@ export async function showImageDigestLookupLinks(
 }
 
 /**
- * Verify one Cloud API evidence item. Each failed condition throws, so a
- * printed false result can never be followed by a successful verification.
+ * Verify the measured dstack deployment after its quote has been verified.
+ * The event log and app-compose manifest are both bound to quote measurements.
  */
-export async function verifyAttestation({
+export async function verifyDstackDeployment({
   attestation,
-  requestNonce,
-  kind,
-  peerSpkiFingerprint,
-}: VerifyAttestationParams): Promise<void> {
-  console.log(`\n🔐 ${kind === 'gateway' ? 'Gateway' : 'Model'} attestation`);
-  console.log('Signing address:', attestation.signing_address);
-  console.log('Signing algorithm:', attestation.signing_algo);
-  console.log('Request nonce:', requestNonce);
-
-  console.log('\n🔐 Intel TDX quote');
-  const intelResult = await checkTdxQuote(attestation);
-
-  console.log('\n🔐 Quote bindings');
-  checkReportData({
-    attestation,
-    requestNonce,
-    intelResult,
-    requireTlsFingerprint: kind === 'gateway',
-  });
-
-  if (kind === 'gateway') {
-    if (!peerSpkiFingerprint) {
-      throw new Error(
-        'Gateway verification needs the TLS peer fingerprint observed while fetching its attestation',
-      );
-    }
-    const declared = hexBytesOfLength(
-      requireString(
-        attestation.tls_cert_fingerprint,
-        'gateway_attestation.tls_cert_fingerprint',
-      ),
-      32,
-      'gateway_attestation.tls_cert_fingerprint',
-    );
-    const peer = hexBytesOfLength(
-      peerSpkiFingerprint,
-      32,
-      'observed TLS peer SPKI fingerprint',
-    );
-    const matches = declared.equals(peer);
-    console.log('Observed TLS peer SPKI matches attested fingerprint:', matches);
-    if (!matches) {
-      throw new Error('Observed TLS peer SPKI fingerprint does not match gateway attestation');
-    }
-  }
-
+  intelResult,
+}: {
+  attestation: AttestationBaseInfo;
+  intelResult: IntelResult;
+}): Promise<void> {
   console.log('\n🔐 Measured deployment');
   checkEventLog(attestation, intelResult);
   checkAppComposeMeasurement(attestation, intelResult);
-
-  if (kind === 'model') {
-    console.log('\n🔐 GPU evidence');
-    await checkGpu({ attestation, requestNonce });
-  }
-
   await showImageDigestLookupLinks(attestation);
-}
-
-/** Fetch and verify Gateway evidence, including the live TLS peer binding. */
-export async function verifyGatewayTlsBinding({
-  nonce = crypto.randomBytes(32).toString('hex'),
-  signingAlgo,
-}: VerifyGatewayTlsBindingParams = {}): Promise<void> {
-  const gateway = await fetchGatewayAttestation({ nonce, signingAlgo });
-  await verifyAttestation({
-    attestation: gateway.attestation,
-    requestNonce: nonce,
-    kind: 'gateway',
-    peerSpkiFingerprint: gateway.peerSpkiFingerprint,
-  });
-}
-
-async function main(): Promise<void> {
-  const args = process.argv.slice(2);
-  const modelIndex = args.indexOf('--model');
-  const model =
-    modelIndex !== -1 && args[modelIndex + 1]
-      ? args[modelIndex + 1]
-      : 'deepseek-ai/DeepSeek-V3.1';
-  const algoIndex = args.indexOf('--signing-algo');
-  const signingAlgo =
-    algoIndex !== -1 && args[algoIndex + 1]
-      ? normalizeSigningAlgo(args[algoIndex + 1]!)
-      : undefined;
-
-  if (!process.env.API_KEY) {
-    throw new Error('API_KEY is required to fetch Cloud API attestations');
-  }
-
-  console.log('========================================');
-  console.log('NEAR AI Cloud attestation walkthrough');
-  console.log('========================================');
-
-  const gatewayNonce = crypto.randomBytes(32).toString('hex');
-  const gateway = await fetchGatewayAttestation({
-    nonce: gatewayNonce,
-    signingAlgo,
-  });
-  await verifyAttestation({
-    attestation: gateway.attestation,
-    requestNonce: gatewayNonce,
-    kind: 'gateway',
-    peerSpkiFingerprint: gateway.peerSpkiFingerprint,
-  });
-
-  const modelNonce = crypto.randomBytes(32).toString('hex');
-  const modelAttestations = await fetchModelAttestations({
-    model,
-    nonce: modelNonce,
-    signingAlgo,
-  });
-  for (const [index, attestation] of modelAttestations.entries()) {
-    console.log(`\n========================================\nModel attestation ${index + 1}\n========================================`);
-    await verifyAttestation({
-      attestation,
-      requestNonce: modelNonce,
-      kind: 'model',
-    });
-  }
-}
-
-if (require.main === module) {
-  main().catch((error) => {
-    console.error('\nVerification failed:', error instanceof Error ? error.message : error);
-    process.exitCode = 1;
-  });
 }
