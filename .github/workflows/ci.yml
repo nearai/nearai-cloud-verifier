@@ -34,8 +34,13 @@ jobs:
       - name: Build TypeScript verifier
         run: pnpm build
 
-      - name: Test TypeScript verifier
-        run: pnpm test
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: python3 -m pip install -r requirements.txt
 
       - name: Check Python syntax
-        run: python3 -m compileall py version_verifier.py
+        run: python3 -m compileall py

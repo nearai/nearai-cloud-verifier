@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-TLS Certificate Verification for NEAR AI Inference Proxy
+Direct Model Attestation Verification for a NEAR AI Model Endpoint
 
-Verifies that an inference proxy's TLS connection terminates inside the TEE
+Verifies that a model-serving endpoint's TLS connection terminates inside the TEE
 by checking that the live TLS certificate's SPKI hash is bound into the
 Intel TDX attestation quote.
 
 How it works:
-  1. Connects to the inference proxy and fetches an attestation report with
+  1. Connects to the model endpoint and fetches an attestation report with
      `include_tls_fingerprint=true`. This causes the proxy to include its
      TLS certificate's SPKI hash in the TDX report data.
   2. Verifies the Intel TDX quote via dcap-qvl.
@@ -21,9 +21,11 @@ This proves the TLS certificate is held by the TEE — trust comes from the
 hardware attestation, not from Certificate Authority trust chains.
 
 Usage:
-  python3 py/tls_verifier.py --url https://proxy.example.com:8443
-  python3 py/tls_verifier.py --url https://proxy.example.com --signing-algo ed25519
+  python3 -m py.direct_model_attestation --url https://your-model.completions.near.ai
+  python3 -m py.direct_model_attestation --url https://your-model.completions.near.ai --signing-algo ed25519
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
@@ -31,7 +33,6 @@ import http.client
 import json
 import os
 import secrets
-import socket
 import ssl
 from hashlib import sha256
 from urllib.parse import urlparse
@@ -40,18 +41,20 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
-from model_verifier import (
-    check_tdx_quote,
-    check_gpu,
-    show_compose,
-    show_sigstore_provenance,
+from py.utils.attestation import (
+    verify_dstack_quote,
+    verify_nvidia_evidence,
+    decode_hex,
+    verify_dstack_deployment,
+    verify_attestation_nonce,
+    verify_report_data_binding_with_tls_fingerprint,
 )
 
 
 def _compute_spki_hash(cert_der: bytes) -> str:
     """Compute SHA-256 of a certificate's SPKI DER encoding.
 
-    Matches the inference proxy's ``compute_spki_hash()`` — hashes the
+    Matches the model endpoint's ``compute_spki_hash()`` — hashes the
     SubjectPublicKeyInfo (not the full certificate), making the hash stable
     across certificate renewals that reuse the same key.
     """
@@ -63,7 +66,7 @@ def _compute_spki_hash(cert_der: bytes) -> str:
     return sha256(spki_der).hexdigest()
 
 
-def fetch_attestation_and_spki(
+def fetch_model_attestation_and_spki(
     hostname: str,
     port: int,
     nonce: str,
@@ -82,94 +85,46 @@ def fetch_attestation_and_spki(
     context.verify_mode = ssl.CERT_NONE  # Trust comes from TEE binding, not CA
 
     conn = http.client.HTTPSConnection(hostname, port, context=context, timeout=60)
-    conn.connect()
+    try:
+        conn.connect()
+        socket = conn.sock
+        if socket is None:
+            raise RuntimeError("TLS connection did not expose a socket")
 
-    # Extract live SPKI hash from this TLS session
-    cert_der = conn.sock.getpeercert(binary_form=True)
-    if not cert_der:
+        # Extract the certificate before sending the evidence request, from
+        # this same TLS connection that will serve the response.
+        cert_der = socket.getpeercert(binary_form=True)
+        if not cert_der:
+            raise RuntimeError("Failed to get certificate from server")
+        live_spki_hash = _compute_spki_hash(cert_der)
+
+        path = (
+            f"/v1/attestation/report"
+            f"?include_tls_fingerprint=true&nonce={nonce}&signing_algo={signing_algo}"
+        )
+        headers = {"Host": hostname}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        conn.request("GET", path, headers=headers)
+        resp = conn.getresponse()
+        body = resp.read()
+    finally:
         conn.close()
-        raise Exception("Failed to get certificate from server")
-    live_spki_hash = _compute_spki_hash(cert_der)
-
-    # Make the attestation request over the same connection
-    path = (
-        f"/v1/attestation/report"
-        f"?include_tls_fingerprint=true&nonce={nonce}&signing_algo={signing_algo}"
-    )
-    headers = {"Host": hostname}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    conn.request("GET", path, headers=headers)
-    resp = conn.getresponse()
-    body = resp.read()
-    conn.close()
 
     if resp.status != 200:
         raise Exception(f"HTTP {resp.status}: {body.decode()}")
 
-    # cloud-api returns a wrapper object:
-    #   { "gateway_attestation": { ... quote fields ..., "tls_cert_fingerprint": ... }, ... }
-    # Use gateway_attestation for verification. Keep backward-compat if a flat object is returned.
-    response = json.loads(body)
-    if isinstance(response, dict) and isinstance(response.get("gateway_attestation"), dict):
-        attestation = response["gateway_attestation"]
-    else:
-        attestation = response
+    attestation = json.loads(body)
+    if not isinstance(attestation, dict):
+        raise ValueError("Attestation endpoint returned a non-object JSON value")
     return attestation, live_spki_hash
 
 
-def check_report_data_with_tls(
-    attestation: dict, request_nonce: str, intel_result: dict
-) -> dict:
-    """Verify TDX report data binds signing address, TLS fingerprint, and nonce.
-
-    Report data layout (64 bytes):
-      [0..32]  = SHA256(signing_address_bytes || cert_fingerprint_bytes)
-      [32..64] = nonce
-    """
-    report_data_hex = intel_result["quote"]["body"]["reportdata"]
-    report_data = bytes.fromhex(report_data_hex.removeprefix("0x"))
-    signing_algo = attestation.get("signing_algo", "ecdsa").lower()
-
-    # Parse signing address bytes
-    if signing_algo == "ecdsa":
-        signing_address_bytes = bytes.fromhex(
-            attestation["signing_address"].removeprefix("0x")
-        )
-    else:
-        signing_address_bytes = bytes.fromhex(attestation["signing_address"])
-
-    embedded_first_32 = report_data[:32]
-    embedded_nonce = report_data[32:]
-
-    # Verify first 32 bytes: SHA256(signing_address || cert_fingerprint)
-    cert_fp_bytes = bytes.fromhex(attestation["tls_cert_fingerprint"])
-    expected = sha256(signing_address_bytes + cert_fp_bytes).digest()
-
-    binds_address_and_tls = embedded_first_32 == expected
-    print("Report data binds signing address + TLS fingerprint:", binds_address_and_tls)
-    if not binds_address_and_tls:
-        print("  expected:", expected.hex())
-        print("  actual:  ", embedded_first_32.hex())
-
-    # Verify last 32 bytes: nonce
-    embeds_nonce = embedded_nonce.hex() == request_nonce
-    print("Report data embeds request nonce:", embeds_nonce)
-    if not embeds_nonce:
-        print("  expected:", request_nonce)
-        print("  actual:  ", embedded_nonce.hex())
-
-    return {
-        "binds_address_and_tls": binds_address_and_tls,
-        "embeds_nonce": embeds_nonce,
-    }
-
-
-async def verify_tls_attestation(
+async def verify_direct_model_attestation(
     url: str, signing_algo: str = "ecdsa", token: str | None = None
 ) -> None:
-    """Main verification: prove a proxy's TLS cert is bound to the TEE."""
+    """Verify a direct model attestation and its endpoint TLS binding."""
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise Exception("URL must use https:// scheme for TLS verification")
@@ -185,14 +140,23 @@ async def verify_tls_attestation(
     #    This avoids round-robin mismatches when multiple backends share a domain.
     print(f"\nFetching attestation from {hostname}:{port} (single TLS connection) ...")
     attestation, live_spki_hash = await asyncio.to_thread(
-        fetch_attestation_and_spki, hostname, port, request_nonce, signing_algo, token
+        fetch_model_attestation_and_spki,
+        hostname,
+        port,
+        request_nonce,
+        signing_algo,
+        token,
     )
+    if not verify_attestation_nonce(attestation, request_nonce):
+        raise RuntimeError(
+            "Attestation request_nonce does not match the nonce sent by this verifier"
+        )
 
     tls_cert_fingerprint = attestation.get("tls_cert_fingerprint")
     if not tls_cert_fingerprint:
         raise Exception(
             "Attestation report does not include tls_cert_fingerprint. "
-            "The proxy may not be configured to expose a TLS certificate fingerprint."
+            "The model endpoint may not be configured to expose a TLS certificate fingerprint."
         )
 
     # Extract model name from attestation (self-reported by the proxy inside the TEE)
@@ -208,42 +172,70 @@ async def verify_tls_attestation(
 
     # 3. Verify Intel TDX quote
     print("\n🔐 Intel TDX quote")
-    intel_result = await check_tdx_quote(attestation)
+    intel_result = await verify_dstack_quote(attestation)
+    if intel_result is None or intel_result.get("verified") is not True:
+        raise RuntimeError("Intel TDX quote did not verify with an accepted TCB status")
+    if intel_result.get("debug_enabled") is not False:
+        raise RuntimeError("Intel TDX quote enables debug mode")
 
     # 4. Verify report data binds signing address + TLS fingerprint + nonce
     print("\n🔐 TDX report data (TLS mode)")
-    check_report_data_with_tls(attestation, request_nonce, intel_result)
+    report_data = verify_report_data_binding_with_tls_fingerprint(
+        attestation,
+        request_nonce,
+        intel_result,
+    )
+    if not report_data["report_data_matches_quote"]:
+        raise RuntimeError(
+            "Attestation report_data does not match report_data in the verified quote"
+        )
+    if not report_data["binds_signer"] or not report_data["embeds_nonce"]:
+        raise RuntimeError(
+            "Quote report_data does not bind the signer, TLS fingerprint, and nonce"
+        )
 
     # 5. Compare live certificate SPKI hash (from step 2) with attested fingerprint
     print("\n🔐 Live TLS certificate")
     print("Live certificate SPKI hash:", live_spki_hash)
 
-    tls_match = live_spki_hash == tls_cert_fingerprint
+    tls_match = decode_hex(
+        live_spki_hash,
+        "live TLS certificate SPKI fingerprint",
+    ) == decode_hex(
+        tls_cert_fingerprint,
+        "attestation.tls_cert_fingerprint",
+    )
     print("Live SPKI matches attested fingerprint:", tls_match)
     if not tls_match:
         print("  attested:", tls_cert_fingerprint)
         print("  live:    ", live_spki_hash)
+        raise RuntimeError("Live TLS SPKI fingerprint does not match the attestation")
 
     # 6. GPU attestation
     print("\n🔐 GPU attestation")
     if attestation.get("nvidia_payload"):
-        check_gpu(attestation, request_nonce)
+        gpu = verify_nvidia_evidence(attestation, request_nonce)
+        if gpu.get("verified") is not True:
+            raise RuntimeError("Provided NVIDIA GPU evidence did not verify")
     else:
-        print("No nvidia_payload in attestation (gateway without GPU); skipping GPU check.")
+        print("No nvidia_payload in attestation; skipping GPU check.")
 
-    # 7. Compose and Sigstore
-    show_compose(attestation, intel_result)
-    show_sigstore_provenance(attestation)
+    # 7. Measured deployment
+    deployment = verify_dstack_deployment(attestation, intel_result)
+    if deployment["event_log"].get("replay_matches") is not True:
+        raise RuntimeError("Event log does not replay to RTMR3 from the verified quote")
+    if deployment["compose"].get("mrconfig_matches") is not True:
+        raise RuntimeError("MRCONFIGID does not bind the attested app_compose")
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Verify an inference proxy's TLS certificate is bound to the TEE"
+        description="Verify a direct model attestation and its TLS binding"
     )
     parser.add_argument(
         "--url",
         required=True,
-        help="HTTPS URL of the inference proxy (e.g. https://proxy.example.com:8443)",
+        help="HTTPS URL of the model endpoint (e.g. https://your-model.completions.near.ai)",
     )
     parser.add_argument(
         "--signing-algo",
@@ -259,12 +251,12 @@ async def main() -> None:
     args = parser.parse_args()
 
     print("========================================")
-    print("🔐 TLS Attestation Verification")
+    print("🔐 Direct model attestation verification")
     print("========================================")
     print(f"Target: {args.url}")
     print(f"Signing algorithm: {args.signing_algo}")
 
-    await verify_tls_attestation(args.url, args.signing_algo, args.token)
+    await verify_direct_model_attestation(args.url, args.signing_algo, args.token)
 
 
 if __name__ == "__main__":

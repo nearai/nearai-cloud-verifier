@@ -8,9 +8,9 @@ Implements from scratch using only the `cryptography` package:
 
 Run:
     export API_KEY=sk-...
-    python3 py/ohttp_client.py                                # all examples
-    python3 py/ohttp_client.py --model anthropic/claude-haiku-4-5
-    python3 py/ohttp_client.py --verify-attestation           # check key is TEE-attested
+    python3 -m py.ohttp_client                                # all examples
+    python3 -m py.ohttp_client --model anthropic/claude-haiku-4-5
+    python3 -m py.ohttp_client --verify-attestation           # check key is TEE-attested
 
 OHTTP privacy guarantee: the NEAR AI server sees only an encrypted HPKE blob; it
 cannot link your request to your IP address or API key. The HPKE key is generated
@@ -25,7 +25,6 @@ import os
 import secrets
 import struct
 from dataclasses import dataclass
-from hashlib import sha256
 from typing import Iterator
 
 import requests

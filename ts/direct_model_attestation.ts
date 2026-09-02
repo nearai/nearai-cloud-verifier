@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * TLS Certificate Verification for NEAR AI Inference Proxy
+ * Direct model attestation verification for a NEAR AI model endpoint.
  *
- * Verifies that an inference proxy's TLS connection terminates inside the TEE
+ * Verifies that a model-serving endpoint's TLS connection terminates inside the TEE
  * by checking that the live TLS certificate's SPKI hash is bound into the
  * Intel TDX attestation quote.
  *
  * How it works:
- *   1. Connects to the inference proxy and fetches an attestation report with
+ *   1. Connects to the model endpoint and fetches an attestation report with
  *      `include_tls_fingerprint=true`. This causes the proxy to include its
  *      TLS certificate's SPKI hash in the TDX report data.
  *   2. Verifies the Intel TDX quote via dcap-qvl.
@@ -21,8 +21,8 @@
  * hardware attestation, not from Certificate Authority trust chains.
  *
  * Usage:
- *   pnpm run tls -- --url https://proxy.example.com:8443
- *   pnpm run tls -- --url https://proxy.example.com --signing-algo ed25519
+ *   pnpm run direct-model-attestation -- --url https://your-model.completions.near.ai
+ *   pnpm run direct-model-attestation -- --url https://your-model.completions.near.ai --signing-algo ed25519
  */
 
 import * as crypto from 'crypto';
@@ -31,14 +31,14 @@ import * as tls from 'tls';
 import { Buffer } from 'buffer';
 
 import {
-  checkTdxQuote,
-  checkGpu,
-  showCompose,
-  showSigstoreProvenance,
-  IntelResult,
-  AttestationApiReport,
-  AttestationReport,
-} from './model_verifier';
+  hexBytesOfLength,
+  verifyDstackQuote,
+  verifyDstackDeployment,
+  verifyNvidiaEvidence,
+  verifyAttestationNonce,
+  verifyReportDataBindingWithTlsFingerprint,
+  type AttestationReport,
+} from './utils/attestation';
 
 /**
  * Fetch attestation report AND extract the live TLS certificate SPKI hash
@@ -48,7 +48,7 @@ import {
  * backend, avoiding mismatches caused by DNS round-robin or load-balancer
  * routing between multiple backends.
  */
-function fetchAttestationAndSpki(
+function fetchModelAttestationAndSpki(
   hostname: string,
   port: number,
   nonce: string,
@@ -70,11 +70,14 @@ function fetchAttestationAndSpki(
       headers,
       rejectUnauthorized: false, // Trust comes from TEE binding, not CA
       servername: hostname,
+      // The observed peer certificate must belong to the connection that
+      // served this report, rather than an agent-reused socket.
+      agent: false,
       timeout: 60000,
     }, (res) => {
       // Extract live SPKI hash from this TLS session
       const tlsSocket = res.socket as tls.TLSSocket;
-      const cert = tlsSocket.getPeerX509Certificate();
+      const cert = peerCertificate(tlsSocket);
       if (!cert) {
         reject(new Error('Failed to get certificate from server'));
         return;
@@ -93,15 +96,7 @@ function fetchAttestationAndSpki(
         }
         try {
           const parsed = JSON.parse(body) as unknown;
-          // Prefer wrapped cloud-api shape { gateway_attestation, ... }, but stay
-          // compatible with older flat responses that return the attestation directly.
-          let attestation: AttestationReport | undefined;
-          const maybeWrapped = parsed as Partial<AttestationApiReport> | undefined;
-          if (maybeWrapped && typeof maybeWrapped === 'object' && maybeWrapped.gateway_attestation) {
-            attestation = maybeWrapped.gateway_attestation as AttestationReport;
-          } else {
-            attestation = parsed as AttestationReport;
-          }
+          const attestation = parsed as AttestationReport;
           resolve({ attestation, liveSpkiHash });
         } catch (e) {
           reject(new Error(`Failed to parse attestation response: ${body}`));
@@ -122,66 +117,26 @@ function fetchAttestationAndSpki(
   });
 }
 
-/**
- * Verify that the TDX report data binds the signing address, TLS certificate
- * fingerprint, and request nonce.
- *
- * Report data layout (64 bytes):
- *   [0..32]  = SHA256(signing_address_bytes || cert_fingerprint_bytes)
- *   [32..64] = nonce
- */
-function checkReportDataWithTls(
-  attestation: AttestationReport,
-  requestNonce: string,
-  intelResult: IntelResult,
-): { binds_address_and_tls: boolean; embeds_nonce: boolean } {
-  const reportDataHex = intelResult.quote.body.reportdata;
-  const reportData = Buffer.from(reportDataHex.replace('0x', ''), 'hex');
-  const signingAlgo = (attestation.signing_algo || 'ecdsa').toLowerCase();
-
-  // Parse signing address bytes
-  let signingAddressBytes: Buffer;
-  if (signingAlgo === 'ecdsa') {
-    signingAddressBytes = Buffer.from(attestation.signing_address.replace('0x', ''), 'hex');
-  } else {
-    signingAddressBytes = Buffer.from(attestation.signing_address, 'hex');
+/** Fall back to the raw peer certificate when Node did not retain X509 state. */
+function peerCertificate(socket: tls.TLSSocket): crypto.X509Certificate | undefined {
+  const certificate = socket.getPeerX509Certificate();
+  if (certificate !== undefined) {
+    return certificate;
   }
 
-  const embeddedFirst32 = reportData.subarray(0, 32);
-  const embeddedNonce = reportData.subarray(32);
-
-  // Verify first 32 bytes: SHA256(signing_address || cert_fingerprint)
-  const certFpBytes = Buffer.from(attestation.tls_cert_fingerprint!, 'hex');
-  const expected = crypto.createHash('sha256')
-    .update(signingAddressBytes)
-    .update(certFpBytes)
-    .digest();
-
-  const bindsAddressAndTls = embeddedFirst32.equals(expected);
-  console.log('Report data binds signing address + TLS fingerprint:', bindsAddressAndTls);
-  if (!bindsAddressAndTls) {
-    console.log('  expected:', expected.toString('hex'));
-    console.log('  actual:  ', embeddedFirst32.toString('hex'));
-  }
-
-  // Verify last 32 bytes: nonce
-  const embedsNonce = embeddedNonce.toString('hex') === requestNonce;
-  console.log('Report data embeds request nonce:', embedsNonce);
-  if (!embedsNonce) {
-    console.log('  expected:', requestNonce);
-    console.log('  actual:  ', embeddedNonce.toString('hex'));
-  }
-
-  return {
-    binds_address_and_tls: bindsAddressAndTls,
-    embeds_nonce: embedsNonce,
-  };
+  const peer = socket.getPeerCertificate(true);
+  return peer.raw === undefined ? undefined : new crypto.X509Certificate(peer.raw);
 }
 
 /**
- * Main verification flow: prove that a proxy's TLS cert is bound to the TEE.
+ * Verify a direct model attestation and prove that its TLS certificate is bound
+ * to the model-serving TEE.
  */
-async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', token?: string): Promise<void> {
+export async function verifyDirectModelAttestation(
+  url: string,
+  signingAlgo: string = 'ecdsa',
+  token?: string,
+): Promise<void> {
   const parsed = new URL(url);
   if (parsed.protocol !== 'https:') {
     throw new Error('URL must use https:// scheme for TLS verification');
@@ -196,14 +151,18 @@ async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', 
   // 2. Fetch attestation report AND live SPKI hash from the same TLS connection.
   //    This avoids round-robin mismatches when multiple backends share a domain.
   console.log(`\nFetching attestation from ${hostname}:${port} (single TLS connection) ...`);
-  const { attestation, liveSpkiHash } = await fetchAttestationAndSpki(
+  const { attestation, liveSpkiHash } = await fetchModelAttestationAndSpki(
     hostname, port, requestNonce, signingAlgo, token,
   );
+
+  // Check the response's untrusted convenience echo before spending work on
+  // quote verification. Freshness is still established by quote report_data.
+  verifyAttestationNonce(attestation, requestNonce);
 
   if (!attestation.tls_cert_fingerprint) {
     throw new Error(
       'Attestation report does not include tls_cert_fingerprint. ' +
-      'The proxy may not be configured to expose a TLS certificate fingerprint.'
+      'The model endpoint may not be configured to expose a TLS certificate fingerprint.'
     );
   }
 
@@ -220,34 +179,48 @@ async function verifyTlsAttestation(url: string, signingAlgo: string = 'ecdsa', 
 
   // 3. Verify Intel TDX quote
   console.log('\n🔐 Intel TDX quote');
-  const intelResult = await checkTdxQuote(attestation);
+  const intelResult = await verifyDstackQuote(attestation);
 
   // 4. Verify report data binds signing address + TLS fingerprint + nonce
   console.log('\n🔐 TDX report data (TLS mode)');
-  checkReportDataWithTls(attestation, requestNonce, intelResult);
+  verifyReportDataBindingWithTlsFingerprint({
+    attestation,
+    requestNonce,
+    intelResult,
+  });
 
   // 5. Compare live certificate SPKI hash (from step 2) with attested fingerprint
   console.log('\n🔐 Live TLS certificate');
   console.log('Live certificate SPKI hash:', liveSpkiHash);
 
-  const tlsMatch = liveSpkiHash === attestation.tls_cert_fingerprint;
+  const tlsMatch = hexBytesOfLength(
+    liveSpkiHash,
+    32,
+    'live TLS certificate SPKI fingerprint',
+  ).equals(
+    hexBytesOfLength(
+      attestation.tls_cert_fingerprint,
+      32,
+      'attestation.tls_cert_fingerprint',
+    ),
+  );
   console.log('Live SPKI matches attested fingerprint:', tlsMatch);
   if (!tlsMatch) {
     console.log('  attested:', attestation.tls_cert_fingerprint);
     console.log('  live:    ', liveSpkiHash);
+    throw new Error('Live TLS SPKI fingerprint does not match the attestation');
   }
 
   // 6. GPU attestation (optional; cloud-api gateway has no GPU)
   console.log('\n🔐 GPU attestation');
   if (attestation.nvidia_payload) {
-    await checkGpu(attestation, requestNonce);
+    await verifyNvidiaEvidence({ attestation, requestNonce });
   } else {
-    console.log('No nvidia_payload in attestation (gateway without GPU); skipping GPU check.');
+    console.log('No nvidia_payload in attestation; skipping GPU check.');
   }
 
-  // 7. Compose and Sigstore
-  showCompose(attestation, intelResult);
-  await showSigstoreProvenance(attestation);
+  // 7. Measured deployment
+  await verifyDstackDeployment({ attestation, intelResult });
 }
 
 async function main(): Promise<void> {
@@ -263,17 +236,17 @@ async function main(): Promise<void> {
   const token = tokenIndex !== -1 && args[tokenIndex + 1] ? args[tokenIndex + 1] : (process.env.API_KEY || undefined);
 
   if (!url) {
-    console.error('Usage: pnpm run tls -- --url https://proxy.example.com[:port] [--signing-algo ecdsa|ed25519] [--token TOKEN]');
+    console.error('Usage: pnpm run direct-model-attestation -- --url https://your-model.completions.near.ai[:port] [--signing-algo ecdsa|ed25519] [--token TOKEN]');
     process.exit(1);
   }
 
   console.log('========================================');
-  console.log('🔐 TLS Attestation Verification');
+  console.log('🔐 Direct model attestation');
   console.log('========================================');
   console.log(`Target: ${url}`);
   console.log(`Signing algorithm: ${signingAlgo}`);
 
-  await verifyTlsAttestation(url, signingAlgo, token);
+  await verifyDirectModelAttestation(url, signingAlgo, token);
 }
 
 if (require.main === module) {

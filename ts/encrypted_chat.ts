@@ -11,13 +11,23 @@ import { URL } from 'url';
 import { ethers } from 'ethers';
 import * as nacl from 'tweetnacl';
 import * as ed2curve from 'ed2curve';
-import {
-  verifyChat,
-} from './chat_verifier';
+import { xchacha20poly1305 } from '@noble/ciphers/chacha';
+import { verifyCompletion } from './completion';
+import type { SigningAlgo } from './utils/attestation';
 
 const API_KEY = process.env.API_KEY || '';
 const BASE_URL = process.env.BASE_URL || 'https://cloud-api.near.ai';
 const MAX_TOKENS = 100;
+
+function cloudApiUrl(path: string): URL {
+  const baseUrl = BASE_URL.replace(/\/+$/, '');
+  const base = baseUrl.endsWith('/v1') ? `${baseUrl}/` : `${baseUrl}/v1/`;
+  return new URL(path.replace(/^\//, ''), base);
+}
+
+function encryptionVersionHeader(signingAlgo: SigningAlgo): Record<string, string> {
+  return signingAlgo === 'ed25519' ? { 'X-Encryption-Version': '2' } : {};
+}
 
 interface ChatCompletionRequest {
   model: string;
@@ -41,7 +51,10 @@ interface ChatCompletionResponse {
 /**
  * Make HTTP request and return JSON response
  */
-async function makeRequest(url: string, options: any = {}): Promise<any> {
+async function makeRequest(
+  url: string,
+  options: any = {},
+): Promise<{ value: any; body: Buffer }> {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
     const isHttps = urlObj.protocol === 'https:';
@@ -57,11 +70,13 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
     };
 
     const req = client.request(requestOptions, (res) => {
-      let data = '';
+      const chunks: Buffer[] = [];
       res.on('data', (chunk) => {
-        data += chunk;
+        chunks.push(Buffer.from(chunk));
       });
       res.on('end', () => {
+        const body = Buffer.concat(chunks);
+        const data = body.toString('utf8');
         if (res.statusCode && res.statusCode >= 400) {
           try {
             const errorDetail = JSON.parse(data);
@@ -78,7 +93,7 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
           return;
         }
         try {
-          resolve(JSON.parse(data));
+          resolve({ value: JSON.parse(data), body });
         } catch (error) {
           reject(new Error(`Failed to parse JSON response: ${error}`));
         }
@@ -101,10 +116,21 @@ async function makeRequest(url: string, options: any = {}): Promise<any> {
 /**
  * Fetch model public key from attestation report
  */
-async function fetchModelPublicKey(model: string, signingAlgo: string = 'ecdsa'): Promise<string> {
-  const url = `${BASE_URL}/v1/attestation/report?model=${encodeURIComponent(model)}&signing_algo=${encodeURIComponent(signingAlgo)}`;
-  const headers = { Authorization: `Bearer ${API_KEY}` };
-  const report = await makeRequest(url, { headers });
+async function fetchModelPublicKey(
+  model: string,
+  signingAlgo: SigningAlgo = 'ecdsa',
+): Promise<string> {
+  const url = cloudApiUrl('attestation/report');
+  url.searchParams.set('model', model);
+  url.searchParams.set('provider', 'near');
+  url.searchParams.set('signing_algo', signingAlgo);
+  url.searchParams.set('include_tls_fingerprint', 'false');
+  const headers = {
+    Authorization: `Bearer ${API_KEY}`,
+    'Accept-Encoding': 'identity',
+    'x-no-aliasing': 'true',
+  };
+  const { value: report } = await makeRequest(url.toString(), { headers });
 
   if (report.model_attestations && Array.isArray(report.model_attestations)) {
     for (const attestation of report.model_attestations) {
@@ -134,7 +160,7 @@ function generateEcdsaKeyPair(): { privateKey: string; publicKey: string; wallet
 
 /**
  * Generate Ed25519 key pair
- * Returns Ed25519 keys (not X25519) - these can be converted to X25519 for Box encryption
+ * Returns Ed25519 keys; the v2 E2EE flow converts them to X25519 for ECDH.
  */
 function generateEd25519KeyPair(): { privateKey: Uint8Array; publicKey: string; keyPair: nacl.SignKeyPair } {
   const keyPair = nacl.sign.keyPair();
@@ -162,6 +188,36 @@ function hkdf(ikm: Buffer, salt: Buffer | null, info: Buffer, length: number): B
   hmac.update(info);
   hmac.update(Buffer.from([0x01])); // Counter byte
   return hmac.digest().slice(0, length);
+}
+
+function ed25519V2Key(sharedSecret: Uint8Array): Buffer {
+  return hkdf(
+    Buffer.from(sharedSecret),
+    null,
+    Buffer.from('ed25519_encryption'),
+    32,
+  );
+}
+
+function ed25519PublicKeyToX25519(publicKeyHex: string): Uint8Array {
+  const publicKey = Buffer.from(publicKeyHex, 'hex');
+  if (publicKey.length !== 32) {
+    throw new Error(`Ed25519 public key must be 32 bytes, got ${publicKey.length}`);
+  }
+  const converted = ed2curve.convertPublicKey(new Uint8Array(publicKey));
+  if (!converted) {
+    throw new Error('Failed to convert Ed25519 public key to X25519');
+  }
+  return converted;
+}
+
+function ed25519SecretKeyToX25519(privateKey: Uint8Array): Uint8Array {
+  const signingKey = nacl.sign.keyPair.fromSeed(privateKey.subarray(0, 32));
+  const converted = ed2curve.convertSecretKey(signingKey.secretKey);
+  if (!converted) {
+    throw new Error('Failed to convert Ed25519 private key to X25519');
+  }
+  return converted;
 }
 
 /**
@@ -268,84 +324,58 @@ function decryptEcdsa(encryptedData: Buffer, privateKey: string): Buffer {
 }
 
 /**
- * Encrypt data using Ed25519 public key (via X25519 + ChaCha20-Poly1305)
+ * Encrypt data using the Ed25519 E2EE v2 protocol.
+ *
+ * It converts the recipient's Ed25519 key to X25519, then uses X25519 ECDH,
+ * HKDF-SHA256, and XChaCha20-Poly1305. The wire format is
+ * [ephemeral X25519 public key][24-byte nonce][ciphertext + tag].
  */
 function encryptEd25519(data: Buffer, publicKeyHex: string): Buffer {
-  const publicKeyBytes = Buffer.from(publicKeyHex, 'hex');
-  if (publicKeyBytes.length !== 32) {
-    throw new Error(`Ed25519 public key must be 32 bytes, got ${publicKeyBytes.length}`);
-  }
-
-  // Convert Ed25519 public key to X25519 public key using ed2curve
-  const ed25519PublicKey = new Uint8Array(publicKeyBytes);
-  const x25519PublicKey = ed2curve.convertPublicKey(ed25519PublicKey);
-  
-  if (!x25519PublicKey) {
-    throw new Error('Failed to convert Ed25519 public key to X25519');
-  }
-
-  // Generate ephemeral key pair
-  const ephemeralKeyPair = nacl.box.keyPair();
-
-  // Encrypt using Box
+  const recipientPublicKey = ed25519PublicKeyToX25519(publicKeyHex);
+  const ephemeralSecretKey = nacl.randomBytes(32);
+  const ephemeralPublicKey = nacl.scalarMult.base(ephemeralSecretKey);
+  const key = ed25519V2Key(
+    nacl.scalarMult(ephemeralSecretKey, recipientPublicKey),
+  );
   const nonce = nacl.randomBytes(24);
-  const encrypted = nacl.box(data, nonce, x25519PublicKey, ephemeralKeyPair.secretKey);
-
-  // Format: [ephemeral_public_key (32 bytes)][nonce (24 bytes)][ciphertext]
+  const encrypted = xchacha20poly1305(key, nonce).encrypt(data);
   return Buffer.concat([
-    Buffer.from(ephemeralKeyPair.publicKey),
+    Buffer.from(ephemeralPublicKey),
     Buffer.from(nonce),
     Buffer.from(encrypted)
   ]);
 }
 
 /**
- * Decrypt data using Ed25519 private key
+ * Decrypt data using the Ed25519 E2EE v2 protocol.
  */
 function decryptEd25519(encryptedData: Buffer, privateKey: Uint8Array): Buffer {
   if (encryptedData.length < 72) {
     throw new Error('Encrypted data too short');
   }
 
-  // Extract components
   const ephemeralPublicKey = encryptedData.slice(0, 32);
   const nonce = encryptedData.slice(32, 56);
   const ciphertext = encryptedData.slice(56);
-
-  // Convert Ed25519 private key to X25519 using ed2curve
-  // The private key should be 32 bytes (seed) or 64 bytes (seed + public key)
-  const seed = privateKey.slice(0, 32);
-  const signingKeyPair = nacl.sign.keyPair.fromSeed(seed);
-  
-  // Convert Ed25519 secret key to X25519 secret key
-  const x25519SecretKey = ed2curve.convertSecretKey(signingKeyPair.secretKey);
-  
-  if (!x25519SecretKey) {
-    throw new Error('Failed to convert Ed25519 private key to X25519');
-  }
-
-  // Create X25519 keypair from the converted secret key
-  const x25519KeyPair = nacl.box.keyPair.fromSecretKey(x25519SecretKey);
-
-  // Decrypt using Box
-  const decrypted = nacl.box.open(
-    new Uint8Array(ciphertext),
-    new Uint8Array(nonce),
-    new Uint8Array(ephemeralPublicKey),
-    x25519KeyPair.secretKey
+  const key = ed25519V2Key(
+    nacl.scalarMult(
+      ed25519SecretKeyToX25519(privateKey),
+      new Uint8Array(ephemeralPublicKey),
+    ),
   );
-
-  if (!decrypted) {
-    throw new Error('Decryption failed');
-  }
-
-  return Buffer.from(decrypted);
+  return Buffer.from(
+    xchacha20poly1305(key, new Uint8Array(nonce)).decrypt(ciphertext),
+  );
 }
 
 /**
  * Encrypt message content
  */
-function encryptMessageContent(messageContent: string, modelPublicKey: string, signingAlgo: string): string {
+function encryptMessageContent(
+  messageContent: string,
+  modelPublicKey: string,
+  signingAlgo: SigningAlgo,
+): string {
   const data = Buffer.from(messageContent, 'utf-8');
   let encrypted: Buffer;
   if (signingAlgo === 'ecdsa') {
@@ -361,7 +391,11 @@ function encryptMessageContent(messageContent: string, modelPublicKey: string, s
 /**
  * Decrypt message content
  */
-function decryptMessageContent(encryptedHex: string, clientPrivateKey: any, signingAlgo: string): string {
+function decryptMessageContent(
+  encryptedHex: string,
+  clientPrivateKey: any,
+  signingAlgo: SigningAlgo,
+): string {
   const encryptedData = Buffer.from(encryptedHex, 'hex');
   let decrypted: Buffer;
   if (signingAlgo === 'ecdsa') {
@@ -377,7 +411,10 @@ function decryptMessageContent(encryptedHex: string, clientPrivateKey: any, sign
 /**
  * Encrypted streaming example
  */
-async function encryptedStreamingExample(model: string, signingAlgo: string = 'ecdsa'): Promise<void> {
+async function encryptedStreamingExample(
+  model: string,
+  signingAlgo: SigningAlgo = 'ecdsa',
+): Promise<void> {
   console.log(`\n${'='.repeat(60)}`);
   console.log(`Encrypted Streaming Example (${signingAlgo.toUpperCase()})`);
   console.log(`${'='.repeat(60)}`);
@@ -432,7 +469,7 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
   const bodyJson = JSON.stringify(body);
 
   return new Promise((resolve, reject) => {
-    const urlObj = new URL(`${BASE_URL}/v1/chat/completions`);
+    const urlObj = cloudApiUrl('chat/completions');
     const isHttps = urlObj.protocol === 'https:';
     const client = isHttps ? https : http;
 
@@ -446,7 +483,10 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
         'Authorization': `Bearer ${API_KEY}`,
         'X-Signing-Algo': signingAlgo,
         'X-Client-Pub-Key': clientPubKey,
-        'X-Model-Pub-Key': modelPubKey
+        'X-Model-Pub-Key': modelPubKey,
+        'Accept-Encoding': 'identity',
+        'x-no-aliasing': 'true',
+        ...encryptionVersionHeader(signingAlgo),
       },
       timeout: 30000
     };
@@ -472,16 +512,19 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
       }
 
       let buffer = '';
-      let responseText = '';
+      const responseChunks: Buffer[] = [];
       let chatId: string | null = null;
       let decryptedContent = '';
+      const decryptionFailures: string[] = [];
 
       console.log(`✓ Request sent successfully (HTTP ${res.statusCode || 200})`);
       console.log('\nReceiving stream...');
 
       res.on('data', (chunk) => {
-        buffer += chunk.toString();
-        responseText += chunk.toString();
+        const chunkBytes = Buffer.from(chunk);
+        const chunkText = chunkBytes.toString('utf8');
+        responseChunks.push(chunkBytes);
+        buffer += chunkText;
 
         let newlineIndex;
         while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
@@ -508,19 +551,30 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
             }
           }
 
-          // Try to decrypt content
+          // Content and reasoning fields are independently encrypted in every
+          // streaming event.
           if (line.startsWith('data: {') && !line.includes('[DONE]')) {
             try {
               const data = JSON.parse(line.substring(6));
               if (data.choices && data.choices.length > 0) {
                 const delta = data.choices[0].delta;
-                if (delta && delta.content) {
+                for (const field of ['content', 'reasoning_content', 'reasoning']) {
+                  const encryptedField = delta?.[field];
+                  if (typeof encryptedField !== 'string' || encryptedField.length === 0) {
+                    continue;
+                  }
                   try {
-                    const decryptedChunk = decryptMessageContent(delta.content, clientPrivKey, signingAlgo);
-                    decryptedContent += decryptedChunk;
-                    process.stdout.write(`  Decrypted chunk: ${decryptedChunk}\n`);
-                  } catch (e) {
-                    // Decryption failed, might be plain text
+                    const decryptedChunk = decryptMessageContent(
+                      encryptedField,
+                      clientPrivKey,
+                      signingAlgo,
+                    );
+                    if (field === 'content') decryptedContent += decryptedChunk;
+                    process.stdout.write(`  Decrypted ${field} chunk: ${decryptedChunk}\n`);
+                  } catch (error) {
+                    const detail = error instanceof Error ? error.message : String(error);
+                    console.log(`✗ Failed to decrypt ${field}: ${detail}`);
+                    decryptionFailures.push(`${field}: ${detail}`);
                   }
                 }
               }
@@ -538,9 +592,21 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
           return;
         }
         console.log(`\n\n✓ Complete decrypted response: ${decryptedContent}`);
-        console.log(`✓ Total response length: ${responseText.length} bytes`);
+        const responseBody = Buffer.concat(responseChunks);
+        console.log(`✓ Total response length: ${responseBody.length} bytes`);
         try {
-          await verifyChat(chatId, bodyJson, responseText, `Encrypted Streaming (${signingAlgo.toUpperCase()})`, model);
+          await verifyCompletion({
+            id: chatId,
+            requestBody: Buffer.from(bodyJson, 'utf8'),
+            responseBody,
+            label: `Encrypted Streaming (${signingAlgo.toUpperCase()})`,
+            signingAlgo,
+          });
+          if (decryptionFailures.length > 0) {
+            throw new Error(
+              `Could not decrypt ${decryptionFailures.length} encrypted stream field(s): ${decryptionFailures.join('; ')}`,
+            );
+          }
           resolve();
         } catch (error) {
           reject(error);
@@ -566,7 +632,10 @@ async function encryptedStreamingExample(model: string, signingAlgo: string = 'e
 /**
  * Encrypted non-streaming example
  */
-async function encryptedNonStreamingExample(model: string, signingAlgo: string = 'ecdsa'): Promise<void> {
+async function encryptedNonStreamingExample(
+  model: string,
+  signingAlgo: SigningAlgo = 'ecdsa',
+): Promise<void> {
   console.log(`\n${'='.repeat(60)}`);
   console.log(`Encrypted Non-Streaming Example (${signingAlgo.toUpperCase()})`);
   console.log(`${'='.repeat(60)}`);
@@ -621,18 +690,24 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
   const bodyJson = JSON.stringify(body);
 
   let response: any;
+  let responseBody: Buffer;
   try {
-    response = await makeRequest(`${BASE_URL}/v1/chat/completions`, {
+    const result = await makeRequest(cloudApiUrl('chat/completions').toString(), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${API_KEY}`,
         'X-Signing-Algo': signingAlgo,
         'X-Client-Pub-Key': clientPubKey,
-        'X-Model-Pub-Key': modelPubKey
+        'X-Model-Pub-Key': modelPubKey,
+        'Accept-Encoding': 'identity',
+        'x-no-aliasing': 'true',
+        ...encryptionVersionHeader(signingAlgo),
       },
       body: bodyJson
     });
+    response = result.value;
+    responseBody = result.body;
     console.log(`✓ Request sent successfully`);
   } catch (error: any) {
     console.log(`✗ Request failed: ${error}`);
@@ -668,6 +743,7 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
   }
 
   // Decrypt response content (including all encrypted fields)
+  const decryptionFailures: string[] = [];
   if (payload.choices && payload.choices.length > 0) {
     const message = payload.choices[0].message;
 
@@ -684,8 +760,10 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
               decryptedFields[field] = decryptedValue;
               console.log(`✓ Decrypted ${field} (${decryptedValue.length} chars)`);
             } catch (error) {
-              console.log(`✗ Failed to decrypt ${field}: ${error}`);
+              const detail = error instanceof Error ? error.message : String(error);
+              console.log(`✗ Failed to decrypt ${field}: ${detail}`);
               console.log(`  Encrypted ${field} (first 100 chars): ${fieldValue.substring(0, 100)}`);
+              decryptionFailures.push(`${field}: ${detail}`);
             }
           } else {
             // Not encrypted, just plain text
@@ -729,7 +807,18 @@ async function encryptedNonStreamingExample(model: string, signingAlgo: string =
     console.log(`  Response: ${JSON.stringify(payload, null, 2)}`);
   }
 
-  await verifyChat(chatId, bodyJson, JSON.stringify(response), `Encrypted Non-Streaming (${signingAlgo.toUpperCase()})`, model);
+  await verifyCompletion({
+    id: chatId,
+    requestBody: Buffer.from(bodyJson, 'utf8'),
+    responseBody,
+    label: `Encrypted Non-Streaming (${signingAlgo.toUpperCase()})`,
+    signingAlgo,
+  });
+  if (decryptionFailures.length > 0) {
+    throw new Error(
+      `Could not decrypt ${decryptionFailures.length} encrypted response field(s): ${decryptionFailures.join('; ')}`,
+    );
+  }
 }
 
 /**
@@ -740,7 +829,14 @@ async function main(): Promise<void> {
   const modelIndex = args.indexOf('--model');
   const model = modelIndex !== -1 && args[modelIndex + 1] ? args[modelIndex + 1] : 'deepseek-ai/DeepSeek-V3.1';
   const signingAlgoIndex = args.indexOf('--signing-algo');
-  const signingAlgo = signingAlgoIndex !== -1 && args[signingAlgoIndex + 1] ? args[signingAlgoIndex + 1] : 'ecdsa';
+  const requestedSigningAlgo =
+    signingAlgoIndex !== -1 && args[signingAlgoIndex + 1]
+      ? args[signingAlgoIndex + 1]
+      : 'ecdsa';
+  if (requestedSigningAlgo !== 'ecdsa' && requestedSigningAlgo !== 'ed25519') {
+    throw new Error('Unsupported signing algorithm; expected ecdsa or ed25519');
+  }
+  const signingAlgo: SigningAlgo = requestedSigningAlgo;
   const testBoth = args.includes('--test-both');
 
   if (!API_KEY) {
@@ -779,4 +875,3 @@ export {
   encryptedStreamingExample,
   encryptedNonStreamingExample,
 };
-

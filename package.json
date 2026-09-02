@@ -1,20 +1,19 @@
 {
   "name": "nearai-cloud-verifier",
   "version": "0.1.0",
-  "description": "NEAR AI Cloud Verifier",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "description": "Runnable NEAR AI Cloud verification examples",
   "scripts": {
     "build": "tsc",
-    "chat": "tsx ts/chat_verifier.ts",
-    "encrypted-chat": "tsx ts/encrypted_chat_verifier.ts",
-    "model": "tsx ts/model_verifier.ts",
-    "domain": "tsx ts/domain_verifier.ts",
-    "tls": "tsx ts/tls_verifier.ts",
-    "ohttp": "tsx ts/ohttp_client.ts",
-    "test": "tsx --test ts/*.test.ts"
+    "completion": "tsx ts/completion.ts",
+    "encrypted-chat": "tsx ts/encrypted_chat.ts",
+    "gateway-attestation": "tsx ts/gateway_attestation.ts",
+    "model-attestation": "tsx ts/model_attestation.ts",
+    "direct-model-attestation": "tsx ts/direct_model_attestation.ts",
+    "direct-compose-manager-attestation": "tsx ts/direct_compose_manager_attestation.ts",
+    "ohttp": "tsx ts/ohttp_client.ts"
   },
   "dependencies": {
+    "@noble/ciphers": "^1.3.0",
     "@phala/dcap-qvl-node": "^0.3.3",
     "ed2curve": "^0.3.0",
     "ethers": "^5.7.2",
