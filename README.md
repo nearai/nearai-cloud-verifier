@@ -27,7 +27,7 @@ and selection), and `verifier` (Gateway/model verification).
 | What you want to verify | TypeScript | Python |
 | --- | --- | --- |
 | Gateway deployment and the TLS peer that served its attestation | `pnpm run gateway-attestation` | `python3 -m py.gateway_attestation` |
-| Deployment evidence for every instance of a model | `pnpm run model-attestation -- --model deepseek-ai/DeepSeek-V3.1` | `python3 -m py.model_attestation --model deepseek-ai/DeepSeek-V3.1` |
+| Deployment evidence for the requested model | `pnpm run model-attestation -- --model deepseek-ai/DeepSeek-V3.1` | `python3 -m py.model_attestation --model deepseek-ai/DeepSeek-V3.1` |
 | A signed completion and the attestation selected by its signature | `pnpm run completion -- --model deepseek-ai/DeepSeek-V3.1` | `python3 -m py.completion --model deepseek-ai/DeepSeek-V3.1` |
 
 ### Direct model endpoint
